@@ -1,0 +1,22 @@
+AMIX file: /usr/sys/master.d/kernel.c
+
+1. Add the initialization declaration near the other driver declarations:
+
+extern void zz9000init();
+
+2. Add the function to init_tbl[] after the other hardware drivers:
+
+	zz9000init,
+
+3. Add character-driver declarations before cdevsw[]:
+
+extern int zz9000open(),zz9000close(),zz9000read(),zz9000write();
+extern int zz9000ioctl(),zz9000mmap();
+
+4. Add this cdevsw[] entry at major 49:
+
+zz9000open,zz9000close,zz9000read,zz9000write,zz9000ioctl,
+		zz9000mmap,ND,ND,ND,ND,notty,nostr,nullflag,	/*49=zz9000*/
+
+The tested development tree uses major 47 for Hydra, 48 for random, 49 for
+ZZ9000, and 50 for sad. Verify your own table before assigning major 49.

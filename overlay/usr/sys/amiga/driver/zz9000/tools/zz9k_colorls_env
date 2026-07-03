@@ -1,0 +1,10 @@
+# ZZ9000 console color defaults for colorls.
+#
+# Source this from .profile, .bashrc, or another interactive shell startup file:
+#     . /usr/amiga/bin/zz9k_colorls_env
+#
+# Optional bash/ksh-style convenience:
+#     alias ls='/usr/amiga/bin/colorls'
+
+LS_COLORS='di=34:ex=32:ln=36:ch=33:bd=33:so=35:pi=33:*.c=36:*.h=35:*.s=36:*.o=90:*.a=90:*.sh=32:*.patch=35:*.rej=31:*.log=33'
+export LS_COLORS

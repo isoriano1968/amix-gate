@@ -1,0 +1,30 @@
+#!/bin/sh
+#
+# zz9k_console - late userland glue for the AMIX ZZ9000 console redirect.
+#
+# This must run after the normal AMIX console and filesystems are alive.
+# It deliberately does not participate in early kernel boot.
+
+DEV=${ZZ9K_DEV-/dev/zz9000}
+ZZ9K_TEST=${ZZ9K_TEST-/usr/amiga/bin/zz9k_test}
+
+case "$1" in
+''|start|redirect)
+	$ZZ9K_TEST $DEV redirect
+	;;
+
+stop|native|capture)
+	$ZZ9K_TEST $DEV noconsole
+	;;
+
+test)
+	$ZZ9K_TEST $DEV consoletest
+	;;
+
+*)
+	echo "usage: zz9k_console [start|stop|test]"
+	exit 2
+	;;
+esac
+
+exit $?
