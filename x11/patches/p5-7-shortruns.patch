@@ -1,0 +1,62 @@
+P-5 fix 2, follow-up: short runs keep the 16-bit loop (build-tree patch
+against isoriano1968/x11r6.3-amix cb61a21, applied after p5-6-stores32.patch).
+
+p5-6's alignment work costs more than it saves on runs of a few pixels:
+on the rig, s6 -> s7 lost 7-17 % on x11perf -dot, -rect1, -line10 and
+-line100 while long runs gained 2-2.7x.  fillRun, copyRun and copyRunBack
+now take the plain 16-bit loop below RUN_SHORT (4) pixels.  Rig, s7 -> s8:
+-rect1 +5.4 %, -line10 +4.5 %, -dot +6 % (within spread); -rect100 and
+-scroll100 unchanged.  An inline call-site variant measured no further gain
+and was not kept.  Host check: the three helpers against 16-bit reference
+loops, 200000 random runs, 0 failures (ASan).
+
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
+@@ -52,6 +52,14 @@
+ */
+ #define RUN_ODD(p)  (((unsigned long)(p)) & 2)
+ 
++/*
++** Below this many pixels the alignment work costs more than the longs save:
++** dots, 1x1 rectangles and short line spans (x11perf -dot/-rect1/-line10
++** lost 10-17 % to the 32-bit path on the rig), so short runs keep the plain
++** 16-bit loop.
++*/
++#define RUN_SHORT   4
++
+ /* Fill w pixels with one colour. */
+ static void
+ fillRun(dst, pixel, w)
+@@ -63,8 +71,11 @@
+     unsigned long *l;
+     int            n;
+ 
+-    if (w <= 0)
++    if (w < RUN_SHORT) {
++        while (w-- > 0)
++            *dst++ = pixel;
+         return;
++    }
+     if (RUN_ODD(dst)) {
+         *dst++ = pixel;
+         w--;
+@@ -87,9 +98,7 @@
+     unsigned long *ld, *ls;
+     int            n;
+ 
+-    if (w <= 0)
+-        return;
+-    if (RUN_ODD(dst) != RUN_ODD(src)) {
++    if (w < RUN_SHORT || RUN_ODD(dst) != RUN_ODD(src)) {
+         while (w-- > 0)
+             *dst++ = *src++;
+         return;
+@@ -120,7 +129,7 @@
+         return;
+     dst += w;                       /* one past the last pixel */
+     src += w;
+-    if (RUN_ODD(dst) != RUN_ODD(src)) {
++    if (w < RUN_SHORT || RUN_ODD(dst) != RUN_ODD(src)) {
+         while (w-- > 0)
+             *--dst = *--src;
+         return;

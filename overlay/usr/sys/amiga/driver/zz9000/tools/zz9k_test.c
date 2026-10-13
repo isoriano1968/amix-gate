@@ -4,19 +4,27 @@
 
 #include <sys/types.h>
 #include <sys/mman.h>
+#include <sys/time.h>
+#include <sys/resource.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <stdlib.h>
 #include "../zz9000.h"
+
+extern int getrlimit(), setrlimit();
 
 static void draw_bars();
 static void draw_bars32();
+static int write_bars();
 static void print_z2_expected();
 static int print_autocon();
 static void print_regs();
+static void print_regs_z3660();
 static unsigned short test_mode_id();
 static int parse_resolution();
 static int streq();
+static void zz9k_hold();
 
 static void
 print_z2_expected()
@@ -50,6 +58,8 @@ unsigned short height;
     if (width == 2560 && height == 1440) return ZZ9K_MODE_2560x1440;
     if (width == 640 && height == 400) return ZZ9K_MODE_640x400;
     if (width == 1920 && height == 800) return ZZ9K_MODE_1920x800;
+    if (width == 1280 && height == 800) return ZZ9K_Z3660_MODE_1280x800;
+    if (width == 1920 && height == 1200) return ZZ9K_Z3660_MODE_1920x1200;
     return 0xffff;
 }
 
@@ -87,6 +97,34 @@ unsigned short *height;
         *height = 800;
         return 1;
     }
+    if (s[0] == '1' && s[1] == '9' && s[2] == '2' && s[3] == '0' &&
+        s[4] == 'x' && s[5] == '1' && s[6] == '0' && s[7] == '8' &&
+        s[8] == '0' && s[9] == 0) {
+        *width = 1920;
+        *height = 1080;
+        return 1;
+    }
+    if (s[0] == '1' && s[1] == '2' && s[2] == '8' && s[3] == '0' &&
+        s[4] == 'x' && s[5] == '8' && s[6] == '0' && s[7] == '0' &&
+        s[8] == 0) {
+        *width = 1280;
+        *height = 800;
+        return 1;
+    }
+    if (s[0] == '1' && s[1] == '9' && s[2] == '2' && s[3] == '0' &&
+        s[4] == 'x' && s[5] == '1' && s[6] == '2' && s[7] == '0' &&
+        s[8] == '0' && s[9] == 0) {
+        *width = 1920;
+        *height = 1200;
+        return 1;
+    }
+    if (s[0] == '2' && s[1] == '5' && s[2] == '6' && s[3] == '0' &&
+        s[4] == 'x' && s[5] == '1' && s[6] == '4' && s[7] == '4' &&
+        s[8] == '0' && s[9] == 0) {
+        *width = 2560;
+        *height = 1440;
+        return 1;
+    }
     if (s[0] == '1' && s[1] == '0' && s[2] == '2' && s[3] == '4' &&
         s[4] == 'x' && s[5] == '7' && s[6] == '6' && s[7] == '8' &&
         s[8] == 0) {
@@ -119,6 +157,31 @@ char *b;
         ++b;
     }
     return *a == 0 && *b == 0;
+}
+
+/*
+ * Hold the picture on screen.  Interactive by default (a newline restores),
+ * but ZZ9K_HOLD=<seconds> makes it non-interactive: hold that many seconds
+ * and return, 0 to return at once.  Anything driven from a script or over a
+ * connection whose stdin never reaches end of file wants ZZ9K_HOLD.
+ */
+static void
+zz9k_hold(what)
+char *what;
+{
+    char *v;
+    int secs;
+
+    v = (char *)getenv("ZZ9K_HOLD");
+    if (v) {
+        secs = atoi(v);
+        printf("%s holding %d s (ZZ9K_HOLD)\n", what, secs);
+        if (secs > 0)
+            sleep(secs);
+        return;
+    }
+    printf("%s Press return to restore capture: ", what);
+    (void)getchar();
 }
 
 static int
@@ -166,6 +229,31 @@ int fd;
         perror("  VCAP_MODE");
     printf("\n");
 }
+/*
+ * The Z3660 row (GETINFO zorro 3, product 1) has a 32-bit register file
+ * from 0x100; GETREG returns the 16-bit lane at the given offset, and its
+ * MODE register is write-only.
+ */
+static void
+print_regs_z3660(fd)
+int fd;
+{
+    unsigned short v;
+
+    printf("Safe Z3660 register reads (32-bit registers, low lanes):\n");
+    if (getreg(fd, ZZ9K_Z3660_REG_FW_VERSION + 2, &v) == 0)
+        printf("  FW_VERSION    @0x%04x = 0x%04x\n",
+            ZZ9K_Z3660_REG_FW_VERSION, v);
+    else
+        perror("  FW_VERSION");
+    if (getreg(fd, ZZ9K_Z3660_REG_FW_BETA + 2, &v) == 0)
+        printf("  FW_BETA       @0x%04x = 0x%04x\n", ZZ9K_Z3660_REG_FW_BETA, v);
+    else
+        perror("  FW_BETA");
+    printf("  MODE is write-only on the Z3660; no readback\n");
+    printf("\n");
+}
+
 static void
 draw_bars(base, width, height)
 char *base;
@@ -232,6 +320,41 @@ int height;
     }
 }
 
+/*
+ * The bars through write(2) instead of the mapping: the kernel copies each
+ * row into the framebuffer from its own address space.  For a kernel whose
+ * user device mappings are unproven (see zz9k_maptest).
+ */
+static int
+write_bars(fd, fb_offset, width, height)
+int fd;
+unsigned long fb_offset;
+int width, height;
+{
+    static unsigned short row[2560];
+    int x, y;
+    unsigned short color;
+
+    for (y = 0; y < height; ++y) {
+        if (y < height / 2) {
+            if (y < height / 6) color = 0x0000;
+            else if (y < (height * 2) / 6) color = 0xf800;
+            else color = 0xffe0;
+        } else {
+            if (y < height / 2 + height / 8) color = 0xf800;
+            else if (y < height - height / 8) color = 0xffe0;
+            else color = 0xf800;
+        }
+        for (x = 0; x < width; ++x)
+            row[x] = color;
+        if (lseek(fd, (long)(fb_offset + (unsigned long)y * width * 2), 0) == -1L)
+            return -1;
+        if (write(fd, (char *)row, width * 2) != width * 2)
+            return -1;
+    }
+    return 0;
+}
+
 static int
 print_autocon(fd)
 int fd;
@@ -293,8 +416,10 @@ char **argv;
     unsigned short mode_reg;
     unsigned short requested_mode;
     unsigned short mode_id;
-    unsigned long test_bytes;
+    unsigned long test_bytes, need;
     unsigned short test_bpp;
+    struct rlimit rl;
+    int rwbars;
 
     devname = "/dev/zz9000";
     if (argc > 1)
@@ -315,15 +440,13 @@ char **argv;
             printf("Only ZZ9000-Z3/product 4 is present. AMIX driver requires Z2/product 3.\n");
         else
             printf("No ZZ9000 autocon entry found.\n");
-        printf("Skipping kernel probe and framebuffer tests.\n");
-        close(fd);
-        return 1;
+        printf("Asking the kernel driver anyway (it may know a board the table does not).\n");
     }
 
     rc = ioctl(fd, ZZ9KIOC_PROBE, 0);
     if (rc < 0) {
         perror("ZZ9KIOC_PROBE");
-        printf("ZZ9000 Zorro II product 3 was not found. No framebuffer test run.\n");
+        printf("No supported board was found. No framebuffer test run.\n");
         printf("If the table shows ZZ9000-Z3/product 4, reconfigure the card for Zorro II.\n");
         close(fd);
         return 1;
@@ -340,6 +463,7 @@ char **argv;
         info.base, info.board_size, info.fb_offset, info.fb_size,
         info.hw_version, info.fw_version, info.width, info.height,
         info.color_mode);
+    printf("zz9000: zorro %u product 0x%02x\n", info.zorro, info.product);
     rc = ioctl(fd, ZZ9KIOC_GETFBINFO, &fbi);
     if (rc == 0) {
         printf("fbinfo: %ux%u depth %u bpp %u stride %u offset 0x%lx size 0x%lx\n",
@@ -352,7 +476,10 @@ char **argv;
     } else
         perror("ZZ9KIOC_GETFBINFO");
 
-    print_regs(fd);
+    if (info.zorro == 3 && info.product == 1)
+        print_regs_z3660(fd);
+    else
+        print_regs(fd);
 
     if (argc > 2 && streq(argv[2], "console")) {
         rc = ioctl(fd, ZZ9KIOC_CONSOLE, ZZ9K_CONSOLE_ENABLE);
@@ -364,8 +491,7 @@ char **argv;
         rc = ioctl(fd, ZZ9KIOC_CONSOLE, ZZ9K_CONSOLE_TEST);
         if (rc < 0)
             perror("ZZ9KIOC_CONSOLE test");
-        printf("ZZ9000 console enabled. Press return to disable: ");
-        (void)getchar();
+        zz9k_hold("ZZ9000 console enabled.");
         rc = ioctl(fd, ZZ9KIOC_CONSOLE, ZZ9K_CONSOLE_DISABLE);
         if (rc < 0)
             perror("ZZ9KIOC_CONSOLE disable");
@@ -410,7 +536,7 @@ char **argv;
         mode.color_mode = ZZ9K_COLOR_16BIT565;
         mode.scale_mode = 0;
         if (argc > 3 && !parse_resolution(argv[3], &mode.width, &mode.height)) {
-            printf("Unsupported blit resolution '%s'. Try 1920x800, 1600x1200, 1280x1024, 1280x720, 1024x768, 800x600, or 640x480.\n",
+            printf("Unsupported blit resolution '%s'. Try 1920x1080, 1920x800, 1600x1200, 1280x1024, 1280x800, 1280x720, 1024x768, 800x600, or 640x480.\n",
                 argv[3]);
             close(fd);
             return 1;
@@ -459,9 +585,8 @@ char **argv;
         rc = ioctl(fd, ZZ9KIOC_SETSWITCH, ZZ9K_SWITCH_RTG);
         if (rc < 0)
             perror("ZZ9KIOC_SETSWITCH RTG");
-        printf("ZZ9000 blitter test active at %ux%u. Press return to restore capture: ",
-            mode.width, mode.height);
-        (void)getchar();
+        printf("ZZ9000 blitter test active at %ux%u.\n", mode.width, mode.height);
+        zz9k_hold("ZZ9000 blitter test active.");
         rc = ioctl(fd, ZZ9KIOC_SETSWITCH, ZZ9K_SWITCH_CAPTURE);
         if (rc < 0)
             perror("ZZ9KIOC_SETSWITCH CAPTURE");
@@ -474,8 +599,9 @@ char **argv;
     mode.color_mode = ZZ9K_COLOR_16BIT565;
     if (argc > 2 && argv[2][0] == '3' && argv[2][1] == '2')
         mode.color_mode = ZZ9K_COLOR_32BIT;
+    rwbars = (argc > 2 && streq(argv[2], "rw"));
     if (argc > 3 && !parse_resolution(argv[3], &mode.width, &mode.height)) {
-        printf("Unsupported test resolution '%s'. Try 1600x1200, 1920x800, 1280x1024, 1280x720, 1024x768, 800x600, or 640x480.\n",
+        printf("Unsupported test resolution '%s'. Try 1920x1080, 1600x1200, 1920x800, 1280x1024, 1280x800, 1280x720, 1024x768, 800x600, or 640x480.\n",
             argv[3]);
         close(fd);
         return 1;
@@ -506,17 +632,55 @@ char **argv;
         close(fd);
         return 1;
     }
-    if (getreg(fd, ZZ9K_REG_MODE, &mode_reg) == 0)
+    if (info.zorro == 3 && info.product == 1)
+        printf("MODE readback skipped (write-only on the Z3660)\n");
+    else if (getreg(fd, ZZ9K_REG_MODE, &mode_reg) == 0)
         printf("MODE readback after SETMODE = 0x%04x\n", mode_reg);
     rc = ioctl(fd, ZZ9KIOC_GETINFO, &info);
     if (rc == 0)
         printf("Driver mode after SETMODE: mode %u %ux%u color %u\n",
             info.mode, info.width, info.height, info.color_mode);
 
+    if (rwbars) {
+        if (write_bars(fd, info.fb_offset, mode.width, mode.height) < 0) {
+            perror("write");
+            close(fd);
+            return 1;
+        }
+        rc = ioctl(fd, ZZ9KIOC_SETSWITCH, ZZ9K_SWITCH_RTG);
+        if (rc < 0)
+            perror("ZZ9KIOC_SETSWITCH RTG");
+        zz9k_hold("RTG test pattern active (drawn through write(2), no mapping).");
+        rc = ioctl(fd, ZZ9KIOC_SETSWITCH, ZZ9K_SWITCH_CAPTURE);
+        if (rc < 0)
+            perror("ZZ9KIOC_SETSWITCH CAPTURE");
+        close(fd);
+        return 0;
+    }
+
+    /*
+     * The mapping counts against the process VM limit, whose default (16 MB)
+     * is below a large framebuffer; raise the soft limit towards the hard one.
+     */
+    if (getrlimit(RLIMIT_VMEM, &rl) == 0) {
+        need = info.board_size + 0x800000;
+        if ((unsigned long)rl.rlim_cur < need) {
+            rl.rlim_cur = need;
+            if ((unsigned long)rl.rlim_max < need)
+                rl.rlim_cur = rl.rlim_max;
+            (void)setrlimit(RLIMIT_VMEM, &rl);
+        }
+    }
     board = (char *)mmap((caddr_t)0, info.board_size,
         PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if ((long)board == -1) {
         perror("mmap");
+        printf("Cannot map 0x%lx bytes of board window. If errno is ENOMEM, raise the\n",
+            info.board_size);
+        printf("process VM limit first (e.g. ulimit -v 131072); the default is 16 MB.\n");
+        rc = ioctl(fd, ZZ9KIOC_SETSWITCH, ZZ9K_SWITCH_CAPTURE);
+        if (rc < 0)
+            perror("ZZ9KIOC_SETSWITCH CAPTURE");
         close(fd);
         return 1;
     }
@@ -531,8 +695,7 @@ char **argv;
     if (rc < 0)
         perror("ZZ9KIOC_SETSWITCH RTG");
 
-    printf("RTG test pattern active. Press return to restore capture: ");
-    (void)getchar();
+    zz9k_hold("RTG test pattern active.");
 
     rc = ioctl(fd, ZZ9KIOC_SETSWITCH, ZZ9K_SWITCH_CAPTURE);
     if (rc < 0)

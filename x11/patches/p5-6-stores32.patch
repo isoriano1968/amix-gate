@@ -1,0 +1,202 @@
+P-5 fix 2: 32-bit stores in the fill, copy and span loops (build-tree patch
+against isoriano1968/x11r6.3-amix cb61a21, applied after zz9000hw-modes.patch
+and p5-1 .. p5-5).
+
+Every pixel loop stored 16 bits at a time, and the GXcopy spans went through
+libc memcpy.  Three helpers now move two pixels per 32-bit access where both
+ends are long-aligned (Antti: 0.41 against 0.79 us/pixel over Zorro III):
+fillRun (align one word, then longs, then a tail word), copyRun (left to
+right) and copyRunBack (right to left, for overlapping moves to the right).
+A copy whose two ends differ in alignment keeps the 16-bit loop: no
+misaligned 32-bit access to the card's space.  Used by blitFill, FillSpans
+(GXcopy and the default case), copyVRAMBox (rows; the direction choice is
+unchanged), and the GXcopy spans of SetSpans and GetSpans.
+
+Host check: 200000 random runs of all three against 16-bit reference loops,
+0 failures (ASan); a broken tail in copyRunBack gives 12609.
+
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
+@@ -40,6 +40,104 @@
+ #define ZZ9000_STRIDE(pRTG)  ((pRTG)->pitch / 2)  /* pixels per scanline */
+ 
+ /* ---------------------------------------------------------------------- */
++/* Run helpers (P-5 fix 2): 32-bit stores where both ends allow it.         */
++
++/*
++** A 32-bit store moves two pixels in one bus cycle where a 16-bit store moves
++** one (Antti measured 0.41 against 0.79 us/pixel on the VA2000 over Zorro III).
++** The high word is the left pixel (big-endian).  Only aligned longs are used:
++** a misaligned 32-bit access to the card's space is split by the CPU in ways
++** this driver does not want to depend on, so a copy whose two ends differ in
++** alignment keeps the 16-bit loop.
++*/
++#define RUN_ODD(p)  (((unsigned long)(p)) & 2)
++
++/* Fill w pixels with one colour. */
++static void
++fillRun(dst, pixel, w)
++unsigned short *dst;
++unsigned short  pixel;
++int             w;
++{
++    unsigned long  two;
++    unsigned long *l;
++    int            n;
++
++    if (w <= 0)
++        return;
++    if (RUN_ODD(dst)) {
++        *dst++ = pixel;
++        w--;
++    }
++    two = ((unsigned long)pixel << 16) | pixel;
++    l = (unsigned long *)dst;
++    for (n = w >> 1; n > 0; n--)
++        *l++ = two;
++    if (w & 1)
++        *(unsigned short *)l = pixel;
++}
++
++/* Copy w pixels, left to right. */
++static void
++copyRun(dst, src, w)
++unsigned short *dst;
++unsigned short *src;
++int             w;
++{
++    unsigned long *ld, *ls;
++    int            n;
++
++    if (w <= 0)
++        return;
++    if (RUN_ODD(dst) != RUN_ODD(src)) {
++        while (w-- > 0)
++            *dst++ = *src++;
++        return;
++    }
++    if (RUN_ODD(dst)) {
++        *dst++ = *src++;
++        w--;
++    }
++    ld = (unsigned long *)dst;
++    ls = (unsigned long *)src;
++    for (n = w >> 1; n > 0; n--)
++        *ld++ = *ls++;
++    if (w & 1)
++        *(unsigned short *)ld = *(unsigned short *)ls;
++}
++
++/* Copy w pixels, right to left (an overlapping move to the right). */
++static void
++copyRunBack(dst, src, w)
++unsigned short *dst;
++unsigned short *src;
++int             w;
++{
++    unsigned long *ld, *ls;
++    int            n;
++
++    if (w <= 0)
++        return;
++    dst += w;                       /* one past the last pixel */
++    src += w;
++    if (RUN_ODD(dst) != RUN_ODD(src)) {
++        while (w-- > 0)
++            *--dst = *--src;
++        return;
++    }
++    if (RUN_ODD(dst)) {
++        *--dst = *--src;
++        w--;
++    }
++    ld = (unsigned long *)dst;
++    ls = (unsigned long *)src;
++    for (n = w >> 1; n > 0; n--)
++        *--ld = *--ls;
++    if (w & 1)
++        *((unsigned short *)ld - 1) = *((unsigned short *)ls - 1);
++}
++
++/* ---------------------------------------------------------------------- */
+ /* CPU rectangle helpers. Hardware blit can be added after register bring-up. */
+ 
+ static void
+@@ -57,8 +155,7 @@
+ 
+     for (y = y1; y <= y2; ++y) {
+         p = base + ((unsigned long)y * stride) + x1;
+-        for (x = x1; x <= x2; ++x)
+-            *p++ = color;
++        fillRun(p, color, x2 - x1 + 1);
+     }
+ }
+ /*
+@@ -120,22 +217,12 @@
+     for (row = row_start; row != row_end; row += row_step) {
+         src = fbBase + ((unsigned long)(srcy + row) * stride) + srcx;
+         dst = fbBase + ((unsigned long)(dsty + row) * stride) + dstx;
+-        for (col = col_start; col != col_end; col += col_step)
+-            dst[col] = src[col];
++        if (col_step < 0)
++            copyRunBack(dst, src, w);
++        else
++            copyRun(dst, src, w);
+     }
+ }
+-/*
+-** Fill a horizontal run of w pixels with a solid 16-bit colour.
+-*/
+-static void
+-fillRun(dst, pixel, w)
+-unsigned short *dst;
+-unsigned short  pixel;
+-int             w;
+-{
+-    while (w-- > 0)
+-        *dst++ = pixel;
+-}
+ 
+ /* ---------------------------------------------------------------------- */
+ /* ZZ9000GetImage - tracing wrapper for miGetImage                        */
+@@ -218,7 +305,7 @@
+ 
+         switch (alu)
+         {
+-        case GXcopy:         while (w-->0)  *p++ = pixel;              break;
++        case GXcopy:         fillRun(p, pixel, w);                    break;
+         case GXxor:          while (w-->0) { *p ^= pixel;    p++; }    break;
+         case GXor:           while (w-->0) { *p |= pixel;    p++; }    break;
+         case GXand:          while (w-->0) { *p &= pixel;    p++; }    break;
+@@ -234,7 +321,7 @@
+         case GXequiv:        while (w-->0) { *p = ~(pixel ^ *p); p++; } break;
+         case GXorInverted:   while (w-->0) { *p |= ~pixel;      p++; } break;
+         case GXnand:         while (w-->0) { *p = ~(pixel & *p); p++; } break;
+-        default:             while (w-->0)  *p++ = pixel;              break;
++        default:             fillRun(p, pixel, w);                    break;
+         }
+     }
+ 
+@@ -342,9 +429,8 @@
+             cx2 = min(ppt->x + sw, pbox->x2);
+ 
+             if (cx1 < cx2 && pGC->alu == GXcopy)
+-                memcpy((char *)(base + ppt->y * stride + cx1),
+-                       (char *)(psrc + (cx1 - ppt->x)),
+-                       (size_t)((cx2 - cx1) * 2));
++                copyRun(base + ppt->y * stride + cx1,
++                        psrc + (cx1 - ppt->x), cx2 - cx1);
+             else if (cx1 < cx2)
+                 ropRun(base + ppt->y * stride + cx1,
+                        psrc + (cx1 - ppt->x), cx2 - cx1, pGC->alu);
+@@ -396,9 +482,7 @@
+             continue;
+         dstBytes = PixmapBytePad(w, pDraw->depth);
+         memset(dst, 0, (size_t)dstBytes);
+-        memcpy(dst,
+-               (char *)(base + ppt->y * stride + ppt->x),
+-               (size_t)(w * 2));
++        copyRun((unsigned short *)dst, base + ppt->y * stride + ppt->x, w);
+         dst += dstBytes;
+     }
+ }

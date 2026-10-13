@@ -1,0 +1,119 @@
+RT-07 follow-up (MG10): no blitter cost for small fills
+(build-tree patch, applied after rt07-card-blitter.patch; built as s11rt04).
+
+MG10 measured -rect1 at -20 % on s10rt04 at every -blitmin, rect10 and
+the rest within noise: each window fill went through blitFill ->
+blitQueue -> blitFlush -> cpuFill, three calls where s8rt04 made one, and
+every entry point called blitFlush once more.  The tests are now macros:
+BLIT_WANT(w, h) decides before any call, SolidRect draws a fill below the
+threshold with its own loop (as it does for pixmaps), and BLIT_FLUSH() is
+one compare while the queue is empty.  Rig, s8/s10/s11 (A/B only):
+-rect1 111000 / 77500 / 117000 per second.
+
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
+@@ -261,6 +261,15 @@
+ static rtgScreenPtr     blitRTG;
+ static int              blitSaid;       /* the server log has the first batch */
+ 
++/*
++** The common case -- no -blitmin, or a small area -- must cost no more than
++** before the blitter existed (MG10: -rect1 lost 20 % to three extra calls
++** per 1x1 fill), so the tests are macros and a flush of an empty queue is
++** one compare.
++*/
++#define BLIT_WANT(w, h) (zz9000BlitMin > 0 && (long)(w) * (h) >= zz9000BlitMin)
++#define BLIT_FLUSH()    do { if (blitN) blitFlush(); } while (0)
++
+ static void
+ blitFlush()
+ {
+@@ -331,10 +340,11 @@
+ rtgScreenPtr   pRTG;
+ unsigned short x1, y1, x2, y2, color;
+ {
+-    if (blitQueue(pRTG, ZZ9K_BLIT_FILL, x1, y1, x2 - x1 + 1, y2 - y1 + 1,
++    if (BLIT_WANT(x2 - x1 + 1, y2 - y1 + 1) &&
++        blitQueue(pRTG, ZZ9K_BLIT_FILL, x1, y1, x2 - x1 + 1, y2 - y1 + 1,
+                   0, 0, color))
+         return;
+-    blitFlush();
++    BLIT_FLUSH();
+     cpuFill(pRTG, x1, y1, x2, y2, color);
+ }
+ 
+@@ -346,9 +356,10 @@
+ {
+     if (w <= 0 || h <= 0)
+         return;
+-    if (blitQueue(pRTG, ZZ9K_BLIT_COPY, dstx, dsty, w, h, srcx, srcy, 0))
++    if (BLIT_WANT(w, h) &&
++        blitQueue(pRTG, ZZ9K_BLIT_COPY, dstx, dsty, w, h, srcx, srcy, 0))
+         return;
+-    blitFlush();
++    BLIT_FLUSH();
+     cpuCopy(pRTG, srcx, srcy, w, h, dstx, dsty);
+ }
+ 
+@@ -683,7 +694,7 @@
+ 
+             if (cx1 < cx2 && cy1 < cy2)
+             {
+-                if (useHW)
++                if (useHW && BLIT_WANT(cx2 - cx1, cy2 - cy1))
+                 {
+                     blitFill(pRTG,
+                              (unsigned short) cx1,
+@@ -696,6 +707,7 @@
+                 {
+                     w = cx2 - cx1;
+                     h = cy2 - cy1;
++                    BLIT_FLUSH();
+                     for (y = cy1; y < cy1 + h; y++)
+                         fillRun(base + y * stride + cx1, pixel, w);
+                 }
+@@ -703,7 +715,7 @@
+             pbox++;
+         }
+     }
+-    blitFlush();
++    BLIT_FLUSH();
+ }
+ 
+ /* ---------------------------------------------------------------------- */
+@@ -790,7 +802,7 @@
+                      pixel);
+         pbox++;
+     }
+-    blitFlush();
++    BLIT_FLUSH();
+ }
+ 
+ /* ---------------------------------------------------------------------- */
+@@ -879,7 +891,7 @@
+         }
+     }
+ 
+-    blitFlush();
++    BLIT_FLUSH();
+     DEALLOCATE_LOCAL(pptSrc);
+     (*pScreen->RegionDestroy)(prgnDst);
+ }
+@@ -974,7 +986,7 @@
+                 copyVRAMBox(pRTG,
+                             x1 + (sx - tx), y1 + (sy - ty),
+                             x2 - x1, y2 - y1, x1, y1);
+-            blitFlush();
++            BLIT_FLUSH();
+             return (RegionPtr) NULL;
+         }
+     }
+@@ -1062,7 +1074,7 @@
+         }
+     }
+ 
+-    blitFlush();
++    BLIT_FLUSH();
+ 
+     /*
+     ** Always called (see mi/miexpose.c): it paints the destination

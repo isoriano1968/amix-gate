@@ -1,0 +1,386 @@
+RT-07 (P-5 fix 3): fills and copies on the card's own blitter
+(build-tree patch against isoriano1968/x11r6.3-amix cb61a21, applied after
+zz9000hw-modes.patch, p5-1 .. p5-7 and rt04-monsw-hook.patch).
+
+The Z3660 firmware fills and copies rectangles itself (FILLRECT/COPYRECT),
+and the zz9000 driver runs them for a batch of records in one ioctl
+(ZZ9KIOC_BLITS, amix-z3660rtg's zz9000.h).  This patch lets the server hand
+it the large, simple cases:
+
+  zz9000.h      ZZ9KIOC_BLITS, its records, zz9000BlitMin
+  zz9000draw.c  blitFill and copyVRAMBox, the two funnels every window fill
+                (SolidRect GXcopy, PaintWindow) and window-to-window copy
+                (CopyArea GXcopy, CopyWindow) already goes through, queue a
+                record when its area is at least -blitmin pixels and draw it
+                on the CPU otherwise; the old bodies are cpuFill/cpuCopy.
+                The queue is flushed before any CPU drawing in those paths
+                and before each entry point returns, so drawing order is
+                kept and nothing else ever sees queued work.  A refusal
+                (ENXIO: no blitter on this board or mode; EINVAL: a kernel
+                without the ioctl) turns blitting off for the life of the
+                server and draws the refused batch on the CPU; the first
+                accepted batch logs "card blitter in use".
+  amixIo.c      -blitmin N (pixels), in ddxProcessArgument and ddxUseMsg
+
+-blitmin defaults to 0, never: without the option the server draws exactly
+as before, so the patch ships inert until the metal A/B picks a value.
+Non-GXcopy raster ops and pixmaps stay on the CPU in every case.
+
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000.h
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000.h
+@@ -22,6 +22,31 @@
+ #define ZZ9KIOC_GETFBINFO   (ZZ9K_IOC | 11)
+ #define ZZ9KIOC_FILLRECT    (ZZ9K_IOC | 12)
+ #define ZZ9KIOC_COPYRECT    (ZZ9K_IOC | 13)
++#define ZZ9KIOC_BLITS       (ZZ9K_IOC | 16)
++
++/* ZZ9KIOC_BLITS records (the driver's zz9000.h): the card's blitter */
++#define ZZ9K_BLIT_FILL      1
++#define ZZ9K_BLIT_COPY      2
++#define ZZ9K_BLITS_MAX      1024
++
++struct zz9k_blit {
++    unsigned short op;
++    unsigned short x;
++    unsigned short y;
++    unsigned short width;
++    unsigned short height;
++    unsigned short src_x;
++    unsigned short src_y;
++    unsigned short pad;
++    unsigned long  color;
++};
++
++struct zz9k_blits {
++    struct zz9k_blit *recs;
++    unsigned long     n;
++};
++
++extern int zz9000BlitMin;       /* -blitmin: pixels; 0 = never */
+ 
+ struct _ZZ9000ModeRec {
+     char *name;
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
+@@ -14,6 +14,7 @@
+ */
+ 
+ #include <string.h>
++#include <errno.h>
+ #include "X.h"
+ #include "Xmd.h"
+ #include "scrnintstr.h"
+@@ -147,11 +148,11 @@
+ }
+ 
+ /* ---------------------------------------------------------------------- */
+-/* CPU rectangle helpers. Hardware blit can be added after register bring-up. */
++/* CPU rectangle helpers                                                   */
+ 
+ static void
+-blitFill(regBase, x1, y1, x2, y2, color)
+-pointer        regBase;
++cpuFill(pRTG, x1, y1, x2, y2, color)
++rtgScreenPtr   pRTG;
+ unsigned short x1, y1, x2, y2, color;
+ {
+     unsigned short *base;
+@@ -159,7 +160,7 @@
+     int stride;
+     int x, y;
+ 
+-    base = (unsigned short *)regBase;
++    base = pRTG->fbBase;
+     stride = ZZ9000_selected_mode->w;
+ 
+     for (y = y1; y <= y2; ++y) {
+@@ -190,18 +191,17 @@
+ }
+ 
+ /*
+-** copyVRAMBox - copy a screen rectangle in mapped framebuffer memory.
+-** blitter_base / blitter_base2 (0x40-0x46) supply the starting-row SDRAM
+-** word addresses; X/Y coordinate order controls copy direction so that
+-** overlapping moves are handled correctly by the hardware.
++** cpuCopy - copy a screen rectangle in mapped framebuffer memory, rows and
++** columns ordered so that an overlapping move reads every source pixel
++** before it is overwritten.
+ */
+ static void
+-copyVRAMBox(regBase, fbBase, stride, srcx, srcy, w, h, dstx, dsty)
+-pointer         regBase;
+-unsigned short *fbBase;
+-int             stride;
++cpuCopy(pRTG, srcx, srcy, w, h, dstx, dsty)
++rtgScreenPtr    pRTG;
+ int             srcx, srcy, w, h, dstx, dsty;
+ {
++    unsigned short *fbBase = pRTG->fbBase;
++    int             stride = ZZ9000_STRIDE(pRTG);
+     unsigned short *src;
+     unsigned short *dst;
+     int row, col;
+@@ -234,6 +234,125 @@
+ }
+ 
+ /* ---------------------------------------------------------------------- */
++/* The card's blitter (P-5 fix 3)                                          */
++
++/*
++** -blitmin N: window fills (SolidRect GXcopy, PaintWindow) and window-to-
++** window copies (CopyArea GXcopy, CopyWindow) of N pixels or more go to the
++** card's own blitter through the driver's ZZ9KIOC_BLITS; anything smaller,
++** any other raster op and every pixmap stay on the CPU.  0, the default,
++** never blits, so without the option the server draws exactly as before.
++**
++** Records are queued and sent in batches.  The queue keeps drawing order:
++** it is flushed before any CPU drawing in these paths and before each entry
++** point returns, so no other code ever finds it non-empty.  If the driver
++** refuses (no blitter on this board or in this mode: ENXIO; a kernel
++** without the ioctl: EINVAL), blitting stays off for the life of the server
++** and the refused records are drawn by the CPU.  The driver refuses a batch
++** before running any of it, and records made from clip boxes always lie on
++** the screen, so nothing is drawn twice.
++*/
++int zz9000BlitMin = 0;
++
++#define BLITQ   64
++
++static struct zz9k_blit blitQ[BLITQ];
++static int              blitN;
++static rtgScreenPtr     blitRTG;
++static int              blitSaid;       /* the server log has the first batch */
++
++static void
++blitFlush()
++{
++    struct zz9k_blits bs;
++    struct zz9k_blit *b;
++    int               i, n;
++
++    if (blitN == 0)
++        return;
++    bs.recs = blitQ;
++    bs.n    = blitN;
++    if (ioctl(GetZZ9000Screen(blitRTG)->fd, ZZ9KIOC_BLITS, &bs) >= 0)
++    {
++        if (!blitSaid)
++            ErrorF("zz9000: card blitter in use from %d pixels\n", zz9000BlitMin);
++        blitSaid = 1;
++        blitN = 0;
++        return;
++    }
++    ErrorF("zz9000: the driver refused the card blitter (errno %d); -blitmin %d off\n",
++           errno, zz9000BlitMin);
++    zz9000BlitMin = 0;
++    n = blitN;
++    blitN = 0;
++    for (i = 0, b = blitQ; i < n; i++, b++)
++    {
++        if (b->op == ZZ9K_BLIT_FILL)
++            cpuFill(blitRTG, b->x, b->y, b->x + b->width - 1,
++                    b->y + b->height - 1, (unsigned short) b->color);
++        else
++            cpuCopy(blitRTG, b->src_x, b->src_y, b->width, b->height,
++                    b->x, b->y);
++    }
++}
++
++/* Queue one blitter record when the area qualifies; FALSE = draw it yourself. */
++static int
++blitQueue(pRTG, op, x, y, w, h, sx, sy, color)
++rtgScreenPtr   pRTG;
++int            op, x, y, w, h, sx, sy;
++unsigned short color;
++{
++    struct zz9k_blit *b;
++
++    if (zz9000BlitMin <= 0 || (long) w * h < zz9000BlitMin)
++        return FALSE;
++    if (blitN == BLITQ)
++        blitFlush();
++    if (zz9000BlitMin <= 0)         /* that flush was refused */
++        return FALSE;
++    b = &blitQ[blitN++];
++    b->op     = op;
++    b->x      = x;
++    b->y      = y;
++    b->width  = w;
++    b->height = h;
++    b->src_x  = sx;
++    b->src_y  = sy;
++    b->pad    = 0;
++    b->color  = color;
++    blitRTG   = pRTG;
++    return TRUE;
++}
++
++/* Fill the inclusive screen box (x1,y1)-(x2,y2): the blitter or the CPU. */
++static void
++blitFill(pRTG, x1, y1, x2, y2, color)
++rtgScreenPtr   pRTG;
++unsigned short x1, y1, x2, y2, color;
++{
++    if (blitQueue(pRTG, ZZ9K_BLIT_FILL, x1, y1, x2 - x1 + 1, y2 - y1 + 1,
++                  0, 0, color))
++        return;
++    blitFlush();
++    cpuFill(pRTG, x1, y1, x2, y2, color);
++}
++
++/* Copy a w x h screen box from (srcx,srcy) to (dstx,dsty): blitter or CPU. */
++static void
++copyVRAMBox(pRTG, srcx, srcy, w, h, dstx, dsty)
++rtgScreenPtr pRTG;
++int          srcx, srcy, w, h, dstx, dsty;
++{
++    if (w <= 0 || h <= 0)
++        return;
++    if (blitQueue(pRTG, ZZ9K_BLIT_COPY, dstx, dsty, w, h, srcx, srcy, 0))
++        return;
++    blitFlush();
++    cpuCopy(pRTG, srcx, srcy, w, h, dstx, dsty);
++}
++
++/* ---------------------------------------------------------------------- */
+ /* ZZ9000GetImage - tracing wrapper for miGetImage                        */
+ 
+ extern void miGetImage();
+@@ -566,7 +685,7 @@
+             {
+                 if (useHW)
+                 {
+-                    blitFill((pointer)pRTG->fbBase,
++                    blitFill(pRTG,
+                              (unsigned short) cx1,
+                              (unsigned short) cy1,
+                              (unsigned short)(cx2 - 1),
+@@ -584,6 +703,7 @@
+             pbox++;
+         }
+     }
++    blitFlush();
+ }
+ 
+ /* ---------------------------------------------------------------------- */
+@@ -659,20 +779,18 @@
+     nbox = REGION_NUM_RECTS(prgn);
+     pbox = REGION_RECTS(prgn);
+ 
++    while (nbox--)
+     {
+-        pointer regBase = (pointer)pRTG->fbBase;
+-        while (nbox--)
+-        {
+-            if (pbox->x1 < pbox->x2 && pbox->y1 < pbox->y2)
+-                blitFill(regBase,
+-                         (unsigned short) pbox->x1,
+-                         (unsigned short) pbox->y1,
+-                         (unsigned short)(pbox->x2 - 1),
+-                         (unsigned short)(pbox->y2 - 1),
+-                         pixel);
+-            pbox++;
+-        }
++        if (pbox->x1 < pbox->x2 && pbox->y1 < pbox->y2)
++            blitFill(pRTG,
++                     (unsigned short) pbox->x1,
++                     (unsigned short) pbox->y1,
++                     (unsigned short)(pbox->x2 - 1),
++                     (unsigned short)(pbox->y2 - 1),
++                     pixel);
++        pbox++;
+     }
++    blitFlush();
+ }
+ 
+ /* ---------------------------------------------------------------------- */
+@@ -742,7 +860,7 @@
+         ppt  += nbox - 1;
+         for (i = 0; i < nbox; i++, pbox--, ppt--)
+         {
+-            copyVRAMBox(pRTG->frameBase, pRTG->fbBase, ZZ9000_STRIDE(pRTG),
++            copyVRAMBox(pRTG,
+                         ppt->x,  ppt->y,
+                         pbox->x2 - pbox->x1,
+                         pbox->y2 - pbox->y1,
+@@ -753,7 +871,7 @@
+     {
+         for (i = 0; i < nbox; i++, pbox++, ppt++)
+         {
+-            copyVRAMBox(pRTG->frameBase, pRTG->fbBase, ZZ9000_STRIDE(pRTG),
++            copyVRAMBox(pRTG,
+                         ppt->x,  ppt->y,
+                         pbox->x2 - pbox->x1,
+                         pbox->y2 - pbox->y1,
+@@ -761,6 +879,7 @@
+         }
+     }
+ 
++    blitFlush();
+     DEALLOCATE_LOCAL(pptSrc);
+     (*pScreen->RegionDestroy)(prgnDst);
+ }
+@@ -852,9 +971,10 @@
+             x2 = min(tx + width, db->x2);
+             y2 = min(ty + height, db->y2);
+             if (x1 < x2 && y1 < y2)
+-                copyVRAMBox(pRTG->frameBase, pRTG->fbBase, ZZ9000_STRIDE(pRTG),
++                copyVRAMBox(pRTG,
+                             x1 + (sx - tx), y1 + (sy - ty),
+                             x2 - x1, y2 - y1, x1, y1);
++            blitFlush();
+             return (RegionPtr) NULL;
+         }
+     }
+@@ -899,7 +1019,7 @@
+         if (!bandsUp && !boxesLeft)
+         {
+             for (i = 0; i < nbox; i++, pbox++)
+-                copyVRAMBox(pRTG->frameBase, pRTG->fbBase, ZZ9000_STRIDE(pRTG),
++                copyVRAMBox(pRTG,
+                             pbox->x1 + dx, pbox->y1 + dy,
+                             pbox->x2 - pbox->x1, pbox->y2 - pbox->y1,
+                             pbox->x1, pbox->y1);
+@@ -932,7 +1052,7 @@
+                 for (b = boxesLeft ? last : first;
+                      boxesLeft ? (b >= first) : (b <= last);
+                      b += boxesLeft ? -1 : 1)
+-                    copyVRAMBox(pRTG->frameBase, pRTG->fbBase, ZZ9000_STRIDE(pRTG),
++                    copyVRAMBox(pRTG,
+                                 b->x1 + dx, b->y1 + dy,
+                                 b->x2 - b->x1, b->y2 - b->y1,
+                                 b->x1, b->y1);
+@@ -942,6 +1062,8 @@
+         }
+     }
+ 
++    blitFlush();
++
+     /*
+     ** Always called (see mi/miexpose.c): it paints the destination
+     ** background where the source was obscured, and returns the exposed
+--- a/programs/Xserver/hw/amix/amixIo.c
++++ b/programs/Xserver/hw/amix/amixIo.c
+@@ -407,6 +407,14 @@
+ 	amixFbs[AmixIndex].scrtype.dispz = atoi(argv[i]);
+ 	return 2;
+     }
++    if (!strcmp(argv[i], "-blitmin")) {	/* card blitter from this area on */
++	extern int zz9000BlitMin;
++	if (++i >= argc) UseMsg ();
++	zz9000BlitMin = atoi(argv[i]);
++	if (zz9000BlitMin < 0)
++	    zz9000BlitMin = 0;
++	return 2;
++    }
+     if (!strcmp(argv[i], "-mode")) {	/* RTG mode: WxH (e.g. 1024x768) */
+ 	if (++i >= argc) UseMsg ();
+ 	if (!ZZ9000SetMode(argv[i])) {
+@@ -522,6 +530,7 @@
+     ErrorF("-height int            screen height in pixels.\n");
+     ErrorF("-depth int             screen depth in planes.\n");
+     ErrorF("-mode WxH              RTG video mode (e.g. 800x600, 1024x768)\n");
++    ErrorF("-blitmin int           RTG: card blitter for fills/copies of this many pixels or more (0 = never, the default)\n");
+     ErrorF("-group int		   screen group\n");
+ #ifdef TIGA
+     ErrorF("-res<#>                Use /dev/dmi<#> as display.\n");

@@ -1,0 +1,288 @@
+#!/bin/sh
+#
+# startx-rtg - start the X11R6.3 Xzz9000 server on the Z3660/ZZ9000 RTG with
+# the mode chosen BEFORE the server starts, then run the user's X session.
+#
+#   startx-rtg [WxH] [display]
+#
+# Environment: RTG_MODE, RTG_FONTPATH, RTG_RGB, RTG_SERVER_ARGS, RTG_SERVERLOG,
+# RTG_LD_LIBRARY_PATH (the server's own library path), RTG_MONSWITCH (a test
+# override of the monitor-switch value, below), ZZ9K_MONSW (the fallback tool),
+# MONSWCTL (the kernel's monswctl), RTG_KBDBACK (the keyboard tool, below),
+# XPROBECMD (an X client
+# used to test that the server accepts), RTG_SETTLE_MAX (how long to wait for
+# the server's log to go quiet, default 90), RTG_SETTLE_AFTER (floor after
+# that, default 5), RTG_SETTLE (fallback wait when no probe client exists,
+# default 25), XINITRC.
+#
+# The mode is the first argument, else $RTG_MODE, else 1024x768.  It must be
+# one the server knows (its -mode table) and the attached board accepts (the
+# driver's table; a refused mode fails at SETMODE and the server exits -- the
+# log says so).  The session is the first readable of $XINITRC,
+# ~/.xinitrc-rtg, ~/.xinitrc, /.xinitrc -- the RTG file first so that the
+# machine's own session, which the native chipset startx runs from the same
+# /.xinitrc, never has to be edited for the RTG; without any of them, a bare
+# OpenLook session from the X11R5 installation.  Fonts and the colour database come from the X11R5 tree
+# already on the box -- including the Xol directory, whose OPEN LOOK fonts
+# olwm refuses to start without.  Keyboard and mouse are the Amiga's, through
+# the server's screen-manager input path; nothing to configure here.
+#
+# The server does its own SETMODE from -mode; this script only chooses and
+# sequences.  On session exit the server is stopped; the RTG output keeps
+# the last picture (the Z3660 has no switch back).
+#
+# Monitor switch (P-8 / RT-04).  On a kernel with /dev/monsw (`monswctl
+# status` succeeds) this script does nothing about it: the server's rtg/ layer
+# asks its own device to switch at screen init and at exit, the card driver
+# routes that to the kernel's monsw, and a crashed server's last close puts the
+# monitor back on the native video.  On a kernel without monsw (the r13
+# lineage) it falls back to driving the line itself with zz9k_monsw: RTG
+# before the server starts, native however this script ends (a trap: session
+# end, server death, early exit, SIGHUP/INT/QUIT/TERM; a `kill -9` of this
+# script cannot be trapped).  The value is /etc/monsw's -- the firmware's bit
+# sum, 1 CTS, 2 SEL, 16/32 their level flags; e.g. 34 = SEL, RTG when low --
+# with RTG_MONSWITCH as a test override; 0 = no switch.  /etc/rtg-monswitch
+# (RT-02) is retired.
+
+MODE=${1-${RTG_MODE-1024x768}}
+DISP=${2-:0}
+SERVER=${XZZ9000-/opt/amix/bin/Xzz9000}
+# Xol carries the OPEN LOOK fonts olwm refuses to start without.
+FONTPATH=${RTG_FONTPATH-/usr/X/lib/fonts/misc/,/usr/X/lib/fonts/Xol/,/usr/X/lib/fonts/75dpi/}
+RGB=${RTG_RGB-/usr/X/lib/rgb}
+# The session file.  Its own first, so that the machine's /.xinitrc -- which
+# the native chipset startx also runs -- is never edited for the RTG's sake.
+# First of: $XINITRC, ~/.xinitrc-rtg, ~/.xinitrc, /.xinitrc.
+XINITRC=${XINITRC-}
+if [ -z "$XINITRC" ]; then
+	for f in "$HOME/.xinitrc-rtg" "$HOME/.xinitrc" /.xinitrc; do
+		if [ -r "$f" ]; then
+			XINITRC=$f
+			break
+		fi
+	done
+fi
+SERVERLOG=${RTG_SERVERLOG-/tmp/Xzz9000.log}
+EXTRA=${RTG_SERVER_ARGS-"-ac -kb"}
+# The server's own library path.  Its NEEDED list names libscreen by the box
+# path and libsocket/libnsl by name; without this the server has been seen to
+# die mid-run rather than at startup.  Set for the server alone, not for the
+# session's clients, which are the X11R5 binaries with their own linkage.
+SERVERLIBS=${RTG_LD_LIBRARY_PATH-/usr/lib:/usr/amiga/lib}
+
+MONSWCTL=${MONSWCTL-/usr/sbin/monswctl}
+MONSW=${RTG_MONSWITCH-}
+if [ -z "$MONSW" ] && [ -x "$MONSWCTL" ] && "$MONSWCTL" status > /dev/null 2>&1; then
+	MONSW=0		# the kernel's monsw and the server own the switch
+fi
+if [ -z "$MONSW" ] && [ -r /etc/monsw ]; then
+	MONSW=`sed -n 1p /etc/monsw`
+fi
+MONSW=${MONSW:-0}
+MONSWTOOL=
+if [ "$MONSW" != 0 ]; then
+	for t in $ZZ9K_MONSW `dirname $0`/zz9k_monsw /opt/amix/bin/zz9k_monsw /usr/amiga/bin/zz9k_monsw; do
+		if [ -x "$t" ]; then
+			MONSWTOOL=$t
+			break
+		fi
+	done
+	[ -n "$MONSWTOOL" ] || \
+		echo "startx-rtg: warning: monitor switch $MONSW but no zz9k_monsw found; the monitor will not switch" >&2
+fi
+monsw() {
+	[ -n "$MONSWTOOL" ] && "$MONSWTOOL" "$MONSW" "$1" > /dev/null
+}
+
+# The console keyboard after a killed server (RT-11).  The server hands the
+# keyboard back to the console when it ends (RT-10), but a SIGKILL runs none
+# of that and the console takes no typing until something selects a screen
+# again.  rtg-kbdback does.  It runs only when the server died on its own --
+# gone, and not stopped by this script -- never for a server we stopped (its
+# hand-back ran) and never while a server is still alive.  (This shell's
+# `wait` returns 0 whatever the child's status, so the status cannot tell.)
+KBDBACK=
+for t in $RTG_KBDBACK `dirname $0`/rtg-kbdback /opt/amix/bin/rtg-kbdback; do
+	if [ -x "$t" ]; then
+		KBDBACK=$t
+		break
+	fi
+done
+SERVERPID=
+STOPPED=
+kbdback() {
+	[ -n "$SERVERPID" ] || return 0
+	[ -z "$STOPPED" ] || return 0
+	kill -0 $SERVERPID 2> /dev/null && return 0
+	if [ -n "$KBDBACK" ]; then
+		echo "startx-rtg: the server died on its own; giving the keyboard back to the console" >&2
+		"$KBDBACK"
+	fi
+}
+
+known="640x480 800x600 1024x768 1280x720 1280x1024 1920x800 1920x1080 1280x800"
+ok=0
+for m in $known; do
+	[ "$m" = "$MODE" ] && ok=1
+done
+if [ $ok = 0 ]; then
+	echo "startx-rtg: unknown mode '$MODE' (known: $known)" >&2
+	exit 2
+fi
+if [ ! -x "$SERVER" ]; then
+	echo "startx-rtg: server $SERVER not found" >&2
+	exit 1
+fi
+case "$DISP" in
+:[0-9]*) ;;
+*) echo "startx-rtg: display must be :N" >&2; exit 2 ;;
+esac
+num=`echo "$DISP" | sed 's/^://'`
+
+# The server maps the whole framebuffer (46 MB on the Z3660); the login
+# shell's default limit is 16 MB and the mapping fails with "Not enough
+# space", so raise it and say so if it cannot be raised.
+ulimit -v 131072 2> /dev/null || ulimit -m 131072 2> /dev/null || \
+	echo "startx-rtg: warning: cannot raise the memory limit; the server's framebuffer mapping may fail" >&2
+# ...and the server's own heap is brk, which RLIMIT_DATA limits separately --
+# raising the address space does not raise it.  A server that runs out of heap
+# exits with "Out of memory" and every client sees its connection reset.
+ulimit -d 65536 2> /dev/null || \
+	echo "startx-rtg: warning: cannot raise the data limit; the server may exit with \"Out of memory\"" >&2
+
+# RTG from here on; native again however the script ends.
+trap 'monsw off; kbdback' 0
+trap 'exit 1' 1 2 3 15
+monsw rtg
+
+echo "startx-rtg: $SERVER $DISP -mode $MODE (log $SERVERLOG)"
+LD_LIBRARY_PATH=$SERVERLIBS "$SERVER" "$DISP" -mode "$MODE" -fp "$FONTPATH" \
+	-co "$RGB" $EXTRA > "$SERVERLOG" 2>&1 &
+SERVERPID=$!
+
+# Wait for the server to be ready, in two steps.  The endpoint appears when
+# the server BINDS, which is before it accepts connections, so its existence
+# is necessary and not sufficient: a client started on that edge gets "unable
+# to open display".  Step 1 waits for the endpoint (`ls`, because this shell's
+# `test` has neither -S nor -e and the endpoint is a FIFO here); step 2 asks a
+# real X client to connect until it succeeds.  With no probe client available
+# the script settles for a fixed time instead.
+i=0
+while :; do
+	if ls /tmp/.X11-unix/X$num > /dev/null 2>&1; then
+		break
+	fi
+	kill -0 $SERVERPID 2> /dev/null || {
+		echo "startx-rtg: server exited early; see $SERVERLOG" >&2
+		tail -5 "$SERVERLOG" >&2
+		exit 1
+	}
+	i=`expr $i + 1`
+	if [ $i -ge 60 ]; then
+		echo "startx-rtg: server did not come up in ${i}s; see $SERVERLOG" >&2
+		tail -5 "$SERVERLOG" >&2
+		kill $SERVERPID 2> /dev/null
+		exit 1
+	fi
+	sleep 1
+done
+
+XPROBE=
+for c in $XPROBECMD /usr/X/bin/xdpyinfo /usr/X/bin/xset /usr/bin/X11/xdpyinfo; do
+	if [ -x "$c" ]; then
+		XPROBE=$c
+		break
+	fi
+done
+
+# Readiness, in three steps, and one thing to know first: **every probe costs
+# a server reset.**  The X server resets when its last client disconnects, and
+# a probe client connects and exits, so each probe makes the server bump its
+# generation and re-run the whole ZZ9000InitHW/ScreenInit -- seconds of it on
+# a 68LC060.  Probing harder therefore makes readiness worse, not better
+# (metal, 2026-09-18: two probes plus an 8 s settle left the server still
+# re-initialising at generation 4, and every client got "Can't Open display").
+#
+# So: probe ONCE to learn that it accepts at all, then wait for the server's
+# own log to go quiet -- which is exactly the re-init finishing, and adapts
+# itself to the hardware instead of guessing a number -- then a short floor.
+xprobe_ok() {
+	DISPLAY=$DISP $XPROBE q > /dev/null 2>&1 && return 0
+	DISPLAY=$DISP $XPROBE > /dev/null 2>&1
+}
+
+if [ -n "$XPROBE" ]; then
+	i=0
+	until xprobe_ok; do
+		kill -0 $SERVERPID 2> /dev/null || {
+			echo "startx-rtg: server exited before accepting; see $SERVERLOG" >&2
+			tail -5 "$SERVERLOG" >&2
+			exit 1
+		}
+		i=`expr $i + 1`
+		if [ $i -ge 40 ]; then
+			echo "startx-rtg: server never accepted a connection; see $SERVERLOG" >&2
+			tail -5 "$SERVERLOG" >&2
+			kill $SERVERPID 2> /dev/null
+			exit 1
+		fi
+		sleep 1
+	done
+
+	# the probe just disconnected: wait for the reset it caused to finish
+	prev=
+	stable=0
+	i=0
+	while [ $stable -lt 3 ]; do
+		cur=`wc -c < "$SERVERLOG" 2>/dev/null`
+		if [ "$cur" = "$prev" ]; then
+			stable=`expr $stable + 1`
+		else
+			stable=0
+		fi
+		prev=$cur
+		kill -0 $SERVERPID 2> /dev/null || {
+			echo "startx-rtg: server exited while settling; see $SERVERLOG" >&2
+			tail -5 "$SERVERLOG" >&2
+			exit 1
+		}
+		i=`expr $i + 1`
+		if [ $i -ge ${RTG_SETTLE_MAX-90} ]; then
+			echo "startx-rtg: server log never went quiet; starting the session anyway" >&2
+			break
+		fi
+		sleep 1
+	done
+	sleep ${RTG_SETTLE_AFTER-5}
+	echo "startx-rtg: server ready on $DISP (probe: $XPROBE, settled after ${i}s)"
+else
+	sleep ${RTG_SETTLE-25}
+	echo "startx-rtg: no X probe client found; settled ${RTG_SETTLE-25}s"
+fi
+
+DISPLAY=$DISP
+export DISPLAY
+if [ -n "$XINITRC" ] && [ -r "$XINITRC" ]; then
+	echo "startx-rtg: session $XINITRC"
+	sh "$XINITRC"
+	rc=$?
+else
+	echo "startx-rtg: no session file; running a bare OpenLook session" >&2
+	xclock -geometry 100x100-10+10 &
+	xterm -geometry 80x24+20+20 &
+	if [ -x /usr/X/bin/olwsm ]; then
+		/usr/X/bin/olwsm &
+	fi
+	olwm
+	rc=$?
+fi
+
+# The server is stopped here, by us: a log that ends mid-sentence after this
+# line was truncated by this kill, not by a fault in the server.
+echo "startx-rtg: session exited (status $rc); stopping the server"
+if kill -0 $SERVERPID 2> /dev/null; then
+	STOPPED=1
+	kill $SERVERPID 2> /dev/null
+fi
+wait $SERVERPID 2> /dev/null
+exit $rc

@@ -1,0 +1,216 @@
+P-5 fix 1, S2: window-to-window CopyArea copies only what of the source is
+visible and reports the rest (build-tree patch against isoriano1968/x11r6.3-amix
+cb61a21, applied after zz9000hw-modes.patch and p5-1-solidrect-alu.patch).
+
+ZZ9000CopyArea copied the whole source rectangle out of the framebuffer, so
+where the source window was covered it copied the covering window's pixels,
+and it returned NULL, so no GraphicsExpose was ever sent.  Now, as in
+cfbBitBlt: the source rectangle is clipped to the source window's clipList
+(NotClippedByChildren for IncludeInferiors), translated to the destination
+and clipped to the composite clip; only that region is copied, bands and
+boxes in an overlap-safe order; miHandleExposures paints the destination
+background over the uncopyable part and returns the exposed region.
+
+Proof: x11/bench/copyexpose (both cases FAIL on 709b8a97, the rig,
+2026-09-27); the box order is checked host-side by x11/bench/copyarea-order.c.
+
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
+@@ -635,12 +635,18 @@
+ ** ZZ9000CopyArea - copy a rectangular region between drawables.
+ **
+ ** Fast path: both drawables are windows on the same screen -> direct VRAM
+-** copy clipped against the GC composite clip.
++** copy.  Modelled on cfbBitBlt: the source rectangle is first clipped to
++** what of the source window is actually visible (its clipList, or the
++** area not clipped by children for IncludeInferiors), translated to the
++** destination and clipped to the GC composite clip.  Only that region is
++** copied -- the framebuffer under an obscured part of the source holds
++** some other window's pixels, not the source's.  miHandleExposures then
++** paints the destination background over the parts that could not be
++** copied and, with graphics exposures on, returns the region the client
++** must redraw (the GraphicsExpose events).
+ **
+ ** All other cases (pixmap source or destination) fall back to miCopyArea,
+ ** which uses GetSpans/SetSpans (correct but slower).
+-**
+-** Returns NULL (no backing-store damage region).
+ */
+ RegionPtr
+ ZZ9000CopyArea(pSrcDraw, pDstDraw, pGC, srcx, srcy, width, height, dstx, dsty)
+@@ -651,18 +657,17 @@
+ int         width, height;
+ int         dstx, dsty;
+ {
+-    rtgScreenPtr   pRTG;
+-    unsigned short *fbBase;
+-    RegionPtr       clip;
+-    BoxPtr          pbox;
+-    int             nbox;
+-    int             absDstX, absDstY;
+-    int             absSrcX, absSrcY;
+-    int             cx1, cy1, cx2, cy2;
+-    int             bw, bh;
+-    int             bsrcx, bsrcy;
+-    int             dx_move, dy_move;
+-    int             i;
++    ScreenPtr       pScreen;
++    rtgScreenPtr    pRTG;
++    RegionPtr       prgnSrcClip;
++    RegionPtr       prgnExposed;
++    RegionRec       rgnDst;
++    BoxRec          box;
++    BoxPtr          pbox, pboxBand, pboxNext, pboxEnd;
++    int             freeSrcClip = FALSE;
++    int             nbox, i;
++    int             dx, dy;
++    int             bandsUp, boxesLeft;
+ 
+     /* Only the window-to-window same-screen path gets the fast VRAM blit */
+     if (pSrcDraw->type != DRAWABLE_WINDOW ||
+@@ -673,54 +678,106 @@
+                           srcx, srcy, width, height, dstx, dsty);
+     }
+ 
+-    pRTG   = GetRTGScreen(pDstDraw->pScreen);
+-    fbBase = pRTG->fbBase;
+-    clip   = rtgGCClip(pGC);
+-
+-    /* Absolute destination rectangle */
+-    absDstX = pDstDraw->x + dstx;
+-    absDstY = pDstDraw->y + dsty;
+-
+-    /* Absolute source origin */
+-    absSrcX = pSrcDraw->x + srcx;
+-    absSrcY = pSrcDraw->y + srcy;
+-
+-    /* Delta from destination to source (source = destination + delta) */
+-    dx_move = absDstX - absSrcX;
+-    dy_move = absDstY - absSrcY;
++    pScreen = pDstDraw->pScreen;
++    pRTG    = GetRTGScreen(pScreen);
++
++    if (!((WindowPtr) pDstDraw)->realized)
++        return (RegionPtr) NULL;
+ 
+-    nbox = REGION_NUM_RECTS(clip);
+-    pbox = REGION_RECTS(clip);
++    /* What of the source is visible */
++    if (pGC->subWindowMode == IncludeInferiors)
++    {
++        prgnSrcClip = NotClippedByChildren((WindowPtr) pSrcDraw);
++        freeSrcClip = TRUE;
++    }
++    else
++        prgnSrcClip = &((WindowPtr) pSrcDraw)->clipList;
++
++    box.x1 = pSrcDraw->x + srcx;
++    box.y1 = pSrcDraw->y + srcy;
++    box.x2 = box.x1 + width;
++    box.y2 = box.y1 + height;
++    REGION_INIT(pScreen, &rgnDst, &box, 1);
++    REGION_INTERSECT(pScreen, &rgnDst, &rgnDst, prgnSrcClip);
++
++    /* Source -> destination offset; move the region, clip to the GC */
++    dx = (pSrcDraw->x + srcx) - (pDstDraw->x + dstx);
++    dy = (pSrcDraw->y + srcy) - (pDstDraw->y + dsty);
++    REGION_TRANSLATE(pScreen, &rgnDst, -dx, -dy);
++    REGION_INTERSECT(pScreen, &rgnDst, &rgnDst, rtgGCClip(pGC));
+ 
+     /*
+-    ** Process clip boxes in direction-aware order to handle VRAM overlap.
+-    ** Boxes from REGION_RECTS are sorted top-to-bottom, left-to-right.
++    ** Copy the boxes in an order that never overwrites a source box
++    ** before it is read: bands bottom-up when the copy moves down
++    ** (dy < 0: the source lies above), boxes within a band right-to-left
++    ** when it moves right (dx < 0).  copyVRAMBox orders rows and columns
++    ** inside one box the same way.
+     */
+-    if (dy_move > 0 || (dy_move == 0 && dx_move > 0))
+-        pbox += nbox - 1;   /* start from last box */
++    nbox    = REGION_NUM_RECTS(&rgnDst);
++    pbox    = REGION_RECTS(&rgnDst);
++    pboxEnd = pbox + nbox;
++    bandsUp   = (dy < 0);
++    boxesLeft = (dx < 0);
+ 
+-    for (i = 0; i < nbox; i++)
++    if (nbox && width > 0 && height > 0)
+     {
+-        cx1 = max(absDstX,          pbox->x1);
+-        cy1 = max(absDstY,          pbox->y1);
+-        cx2 = min(absDstX + width,  pbox->x2);
+-        cy2 = min(absDstY + height, pbox->y2);
+-
+-        if (cx1 < cx2 && cy1 < cy2)
++        if (!bandsUp && !boxesLeft)
+         {
+-            bsrcx = absSrcX + (cx1 - absDstX);
+-            bsrcy = absSrcY + (cy1 - absDstY);
+-            bw    = cx2 - cx1;
+-            bh    = cy2 - cy1;
+-
+-            copyVRAMBox(pRTG->frameBase, fbBase, ZZ9000_STRIDE(pRTG), bsrcx, bsrcy, bw, bh, cx1, cy1);
++            for (i = 0; i < nbox; i++, pbox++)
++                copyVRAMBox(pRTG->frameBase, pRTG->fbBase, ZZ9000_STRIDE(pRTG),
++                            pbox->x1 + dx, pbox->y1 + dy,
++                            pbox->x2 - pbox->x1, pbox->y2 - pbox->y1,
++                            pbox->x1, pbox->y1);
+         }
+-
+-        if (dy_move > 0 || (dy_move == 0 && dx_move > 0))
+-            pbox--;
+         else
+-            pbox++;
++        {
++            /* Walk the bands in the chosen order, each band's boxes in theirs */
++            pboxBand = bandsUp ? pboxEnd : pbox;
++            while (bandsUp ? (pboxBand > pbox) : (pboxBand < pboxEnd))
++            {
++                BoxPtr first, last, b;
++
++                if (bandsUp)
++                {
++                    last  = pboxBand - 1;
++                    first = last;
++                    while (first > pbox && (first - 1)->y1 == last->y1)
++                        first--;
++                    pboxNext = first;
++                }
++                else
++                {
++                    first = pboxBand;
++                    last  = first;
++                    while (last + 1 < pboxEnd && (last + 1)->y1 == first->y1)
++                        last++;
++                    pboxNext = last + 1;
++                }
++
++                for (b = boxesLeft ? last : first;
++                     boxesLeft ? (b >= first) : (b <= last);
++                     b += boxesLeft ? -1 : 1)
++                    copyVRAMBox(pRTG->frameBase, pRTG->fbBase, ZZ9000_STRIDE(pRTG),
++                                b->x1 + dx, b->y1 + dy,
++                                b->x2 - b->x1, b->y2 - b->y1,
++                                b->x1, b->y1);
++
++                pboxBand = pboxNext;
++            }
++        }
+     }
+ 
+-    return (RegionPtr) NULL;
++    /*
++    ** Always called (see mi/miexpose.c): it paints the destination
++    ** background where the source was obscured, and returns the exposed
++    ** region only when the GC has graphics exposures on.
++    */
++    prgnExposed = miHandleExposures(pSrcDraw, pDstDraw, pGC,
++                                    srcx, srcy, width, height,
++                                    dstx, dsty, 0L);
++
++    REGION_UNINIT(pScreen, &rgnDst);
++    if (freeSrcClip)
++        REGION_DESTROY(pScreen, prgnSrcClip);
++    return prgnExposed;
+ }

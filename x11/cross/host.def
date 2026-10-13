@@ -1,0 +1,59 @@
+/*
+ * host.def -- cross-build overrides for the Amix X11R6.3 tree (build host: Linux,
+ * target: m68k-cbm-sysv4 via the gcc-cross-amix wrapper).  Included by site.def
+ * AFTER amix.cf, so every override is an #undef/#define pair.  Not upstream
+ * material: the deviation list is docs/X-CROSS.md in amix-z3660rtg.
+ */
+/*
+ * Path parameters (scrubbed copy; see x11/cross/README.md).  Override on the
+ * imake command line, e.g. -DAmixSysroot=/path/to/sysroot-mirror.
+ *   AmixCrossPrefix  gcc-cross-amix install prefix
+ *   AmixSysroot      target sysroot (the recipe's mirror sysroot, X-CROSS.md)
+ *   AmixXStubDir     directory holding libsockstub.a
+ */
+#ifndef AmixCrossPrefix
+#define AmixCrossPrefix /opt/amix-cross
+#endif
+#ifndef AmixSysroot
+#define AmixSysroot AmixCrossPrefix/m68k-cbm-sysv4/sysroot
+#endif
+#ifndef AmixXStubDir
+#define AmixXStubDir $(TOP)/../../stub
+#endif
+#undef  CcCmd
+#define CcCmd m68k-cbm-sysv4-gcc
+#undef  ServerCcCmd
+#define ServerCcCmd m68k-cbm-sysv4-gcc
+#undef  CppCmd
+#define CppCmd m68k-cbm-sysv4-gcc -E
+#undef  PreProcessCmd
+#define PreProcessCmd m68k-cbm-sysv4-gcc -E
+#undef  ArCmdBase
+#define ArCmdBase m68k-cbm-sysv4-ar
+#undef  AsCmd
+#define AsCmd m68k-cbm-sysv4-as
+#undef  LdCmd
+#define LdCmd m68k-cbm-sysv4-ld
+/* host makedepend, if ever run (the recipe does not run depend) */
+#undef  DependCmd
+#define DependCmd $(TOP)/config/makedepend/makedepend
+/* archives only in usr/ccs/lib on this target */
+#undef  MathLibrary
+#define MathLibrary -L AmixSysroot/usr/ccs/lib -lm
+/*
+ * The server's system libraries.  select/syslog/seteuid are not exported by
+ * the shared libc; libsocket.so itself imports syslog/seteuid.  The stub
+ * archive holds exactly those members of libc.a (see X-CROSS.md); the -u
+ * flags make ld extract them for the shared library's sake.
+ */
+#undef  ServerExtraSysLibs
+#define ServerExtraSysLibs -usyslog -useteuid -lsocket -lnsl -L AmixSysroot/usr/ccs/lib -ldbm -lscreen -L AmixXStubDir -lsockstub
+/*
+ * The wrapper forwards unknown options to ld at link time, and imake puts
+ * CCOPTIONS into LDOPTIONS as well as CFLAGS: "-ansi" reaches ld as "-a nsi".
+ * Carry the compile-only options in StandardDefines (CFLAGS only) instead.
+ */
+#undef  DefaultCCOptions
+#define DefaultCCOptions /**/
+#undef  StandardDefines
+#define StandardDefines OSDefines OSRelease -ansi -finline-functions

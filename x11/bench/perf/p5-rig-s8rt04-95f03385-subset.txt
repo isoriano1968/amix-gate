@@ -1,0 +1,85 @@
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:42:58 1977
+
+Sync time adjustment is 1.6444 msecs.
+
+ 600000 reps @   0.0055 msec (181000.0/sec): Dot
+ 600000 reps @   0.0065 msec (153000.0/sec): Dot
+ 600000 reps @   0.0054 msec (184000.0/sec): Dot
+1800000 trep @   0.0058 msec (172000.0/sec): Dot
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:43:15 1977
+
+Sync time adjustment is 1.2907 msecs.
+
+ 300000 reps @   0.0086 msec (117000.0/sec): 1x1 rectangle
+ 300000 reps @   0.0087 msec (115000.0/sec): 1x1 rectangle
+ 300000 reps @   0.0086 msec (117000.0/sec): 1x1 rectangle
+ 900000 trep @   0.0086 msec (116000.0/sec): 1x1 rectangle
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:43:33 1977
+
+Sync time adjustment is 1.5636 msecs.
+
+  80000 reps @   0.0373 msec ( 26800.0/sec): 10x10 rectangle
+  80000 reps @   0.0450 msec ( 22200.0/sec): 10x10 rectangle
+  80000 reps @   0.0375 msec ( 26700.0/sec): 10x10 rectangle
+ 240000 trep @   0.0399 msec ( 25100.0/sec): 10x10 rectangle
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:43:52 1977
+
+Sync time adjustment is 1.2689 msecs.
+
+  40000 reps @   0.0646 msec ( 15500.0/sec): 10-pixel line
+  40000 reps @   0.0641 msec ( 15600.0/sec): 10-pixel line
+  40000 reps @   0.0646 msec ( 15500.0/sec): 10-pixel line
+ 120000 trep @   0.0644 msec ( 15500.0/sec): 10-pixel line
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:44:10 1977
+
+Sync time adjustment is 1.5636 msecs.
+
+   7000 reps @   0.4450 msec (  2250.0/sec): 100-pixel line
+   7000 reps @   0.4379 msec (  2280.0/sec): 100-pixel line
+   7000 reps @   0.5164 msec (  1940.0/sec): 100-pixel line
+  21000 trep @   0.4664 msec (  2140.0/sec): 100-pixel line
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:44:28 1977
+
+Sync time adjustment is 1.3326 msecs.
+
+   2520 reps @   1.4942 msec (   669.0/sec): 100x100 rectangle
+   2520 reps @   1.2693 msec (   788.0/sec): 100x100 rectangle
+   2520 reps @   1.2693 msec (   788.0/sec): 100x100 rectangle
+   7560 trep @   1.3443 msec (   744.0/sec): 100x100 rectangle
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:44:44 1977
+
+Sync time adjustment is 1.3110 msecs.
+
+   2000 reps @   1.5993 msec (   625.0/sec): Scroll 100x100 pixels
+   2000 reps @   1.5910 msec (   629.0/sec): Scroll 100x100 pixels
+   2000 reps @   1.8827 msec (   531.0/sec): Scroll 100x100 pixels
+   6000 trep @   1.6910 msec (   591.0/sec): Scroll 100x100 pixels
+
+SUBDONE

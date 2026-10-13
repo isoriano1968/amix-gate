@@ -1,0 +1,42 @@
+P-5 fix 1, S1: PolyFillRect honours the GC's raster op (build-tree patch
+against isoriano1968/x11r6.3-amix cb61a21, applied after zz9000hw-modes.patch).
+
+ZZ9000SolidRect wrote fgPixel whatever pGC->alu said, so a GXxor rubber
+band (an outline move, XFillRectangle, a wide XDrawRectangle) drawn twice
+stayed on screen instead of erasing itself.  Non-GXcopy fills now go through
+miPolyFillRect, which reaches ZZ9000FillSpans; that one already implements
+all sixteen raster ops.  The GXcopy fast path is unchanged.
+
+Proof: x11/bench/xorfill (fill and wide FAIL on 709b8a97, the rig, 2026-09-27).
+
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
+@@ -370,7 +370,15 @@
+ **
+ ** Window drawables: direct framebuffer fill.
+ ** Pixmap drawables: CPU fill (blitter addresses VRAM, not host memory).
++**
++** Only GXcopy is filled here; the loops below write fgPixel and cannot
++** apply a raster op.  Any other alu goes through miPolyFillRect, which
++** calls this GC's FillSpans (ZZ9000FillSpans implements all sixteen), so
++** a GXxor rubber band drawn twice erases itself instead of staying on
++** screen.
+ */
++extern void miPolyFillRect();
++
+ void
+ ZZ9000SolidRect(pDraw, pGC, nrects, prects)
+ DrawablePtr pDraw;
+@@ -393,6 +401,12 @@
+     int             cx1, cy1, cx2, cy2;
+     int             y, w, h;
+ 
++    if (pGC->alu != GXcopy)
++    {
++        miPolyFillRect(pDraw, pGC, nrects, prects);
++        return;
++    }
++
+     while (nrects--)
+     {
+         rx1 = xorg + (int) prects->x;

@@ -1,0 +1,42 @@
+RT-07 follow-up (MG10 1f): set the zero-width line bias
+(build-tree patch against isoriano1968/x11r6.3-amix cb61a21, applied after
+rt07b-small-fills.patch; built as s12rt04).
+
+The rtg/ screen is not built on miScreenInit, the only caller of
+miSetZeroLineBias, so miZeroLineScreenIndex stayed 0 and miZeroLine took its
+Bresenham tie-breaks from devPrivates[0] -- a heap pointer.  Diagonal edges
+drawn with zero-width lines (olwm's window-menu triangle) therefore changed
+with every build that moved the heap: s8rt04 and s10rt04 differ by 7 pixels
+there with no drawing code changed, and the zline client's checksum differs
+for s8/s10/s11.  rtgScreenInit now sets DEFAULTZEROLINEBIAS, the value every
+miScreenInit server uses.  Rig: s12rt04 and a heap-shifted s12 (a 64 KiB
+data array added) give the same zline checksum and the same triangle.
+
+Antti's R5 Xrtg: R5's mi has no zero-line bias, so nothing to port there.
+
+--- a/programs/Xserver/hw/amix/rtg/rtgInit.c
++++ b/programs/Xserver/hw/amix/rtg/rtgInit.c
+@@ -28,6 +28,7 @@
+ #include "servermd.h"
+ #include <scrnintstr.h>
+ #include "mipointer.h"
++#include "miline.h"
+ #include "mi.h"
+ #include "rtg.h"
+ #include "opaque.h"		/* dispatchException, DE_TERMINATE */
+@@ -285,6 +286,15 @@
+ 
+     pScreen->devPrivates[rtgScreenIndex].ptr = (pointer) pRTG;
+ 
++    /*
++    ** The zero-width line bias, which miScreenInit sets and this screen
++    ** (not built on miScreenInit) never did: without it miZeroLineScreenIndex
++    ** stays 0 and miZeroLine takes its Bresenham tie-breaks from whatever
++    ** devPrivates[0] holds -- a heap pointer -- so diagonal edges changed
++    ** with every build (MG10: the window-menu triangle, s8rt04 vs s10rt04).
++    */
++    miSetZeroLineBias(pScreen, DEFAULTZEROLINEBIAS);
++
+     /* Screen geometry from selected mode */
+     pRTG->width        = ZZ9000_selected_mode->w;
+     pRTG->height       = ZZ9000_selected_mode->h;

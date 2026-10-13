@@ -1,5 +1,9 @@
 # Installation
 
+> **Fork note (amix-z3660rtg, 2026-09-26).** This file is upstream's ZZ9000 / A3000UX procedure,
+> unchanged. For the Z3660 target (`-DZZ9K_TARGET_Z3660`, 68LC060 kernel), see `README.md`
+> (fork section), `docs/DEMO-RTG.md` and `docs/X-INSTALL-RTG.md`.
+
 These instructions assume a vanilla or locally maintained AMIX source tree at
 `/usr/sys`. Existing local kernel changes should be preserved.
 

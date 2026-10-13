@@ -15,3 +15,17 @@ colorls
 /zzc.c
 /zzcreg.h
 /zzcvar.h
+build/
+work/
+*.o
+*.log
+.claude/
+CLAUDE.md
+tmp/
+*.hdf
+*.adf
+*.rom
+*.uae
+*.img
+frames*/
+out/

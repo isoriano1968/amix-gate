@@ -1,0 +1,84 @@
+P-5 fix 1, S4: SetSpans honours the GC's raster op (build-tree patch against
+isoriano1968/x11r6.3-amix cb61a21, applied after zz9000hw-modes.patch,
+p5-1-solidrect-alu.patch and p5-2-copyarea-expose.patch).
+
+ZZ9000SetSpans memcpy'd the source whatever pGC->alu said.  mi's PutImage
+(ZPixmap) and its CopyArea (pixmap source, and window-to-window once S5 sends
+non-GXcopy there) write through SetSpans, so every non-GXcopy image or copy
+was drawn as GXcopy.  GXcopy keeps the memcpy; the other fifteen go through
+ropRun, checked host-side against the X definition of all sixteen ops.
+
+Proof: x11/bench/xorcopy (XPutImage and pixmap-to-window XCopyArea, GXxor
+twice, must leave the window as it was).
+
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
+@@ -246,11 +246,52 @@
+ /* ZZ9000SetSpans                                                          */
+ 
+ /*
++** ropRun - combine w source pixels into dst under a raster op (not GXcopy).
++*/
++static void
++ropRun(dst, src, w, alu)
++unsigned short *dst;
++unsigned short *src;
++int             w;
++int             alu;
++{
++    unsigned short s, d;
++
++    while (w-- > 0)
++    {
++        s = *src++;
++        d = *dst;
++        switch (alu)
++        {
++        case GXclear:        d = 0;           break;
++        case GXand:          d = s & d;       break;
++        case GXandReverse:   d = s & ~d;      break;
++        case GXcopy:         d = s;           break;
++        case GXandInverted:  d = ~s & d;      break;
++        case GXnoop:                          break;
++        case GXxor:          d = s ^ d;       break;
++        case GXor:           d = s | d;       break;
++        case GXnor:          d = ~(s | d);    break;
++        case GXequiv:        d = ~s ^ d;      break;
++        case GXinvert:       d = ~d;          break;
++        case GXorReverse:    d = s | ~d;      break;
++        case GXcopyInverted: d = ~s;          break;
++        case GXorInverted:   d = ~s | d;      break;
++        case GXnand:         d = ~(s & d);    break;
++        case GXset:          d = 0xFFFF;      break;
++        }
++        *dst++ = d;
++    }
++}
++
++/*
+ ** ZZ9000SetSpans - write packed 16-bit pixel data to the framebuffer.
+ **
+ ** Each source scanline is padded according to PixmapBytePad(), as required
+ ** by the DDX SetSpans contract.  For each input span we clip each clip-box
+-** intersection and copy the appropriate slice of the source.
++** intersection and copy the appropriate slice of the source.  GXcopy is a
++** plain copy; every other raster op goes through ropRun (mi's PutImage and
++** CopyArea paths land here with the GC's alu).
+ */
+ void
+ ZZ9000SetSpans(pDraw, pGC, pcharsrc, ppt, pwidths, nspans, fSorted)
+@@ -300,10 +341,13 @@
+             cx1 = max(ppt->x,      pbox->x1);
+             cx2 = min(ppt->x + sw, pbox->x2);
+ 
+-            if (cx1 < cx2)
++            if (cx1 < cx2 && pGC->alu == GXcopy)
+                 memcpy((char *)(base + ppt->y * stride + cx1),
+                        (char *)(psrc + (cx1 - ppt->x)),
+                        (size_t)((cx2 - cx1) * 2));
++            else if (cx1 < cx2)
++                ropRun(base + ppt->y * stride + cx1,
++                       psrc + (cx1 - ppt->x), cx2 - cx1, pGC->alu);
+             pbox++;
+         }
+         psrcLine += srcBytes;

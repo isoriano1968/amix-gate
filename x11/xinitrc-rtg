@@ -1,0 +1,93 @@
+#!/bin/sh
+#
+# .xinitrc-rtg - the X session startx-rtg runs on the Z3660 RTG display.
+#
+# Install as $HOME/.xinitrc-rtg (root's home is / on the demo image, so
+# /.xinitrc-rtg).  startx-rtg prefers this file, which is why the machine's
+# own /.xinitrc -- the one the native chipset `startx` runs -- never has to
+# be edited for the RTG's sake.
+#
+# This is the DEMO session: the OpenLook window manager, the Workspace
+# manager and a clock, from the X11R5 installation.  Adapt it from the
+# image's own demo /.xinitrc rather than from this example if they differ.
+#
+# TWO RULES, both learned on this hardware:
+#
+#   1. Start the window manager FIRST and let it claim the screen before any
+#      client maps a window.  olwm decorates a window by reparenting it, and
+#      a client that maps during olwm's own startup can end up with no title
+#      bar and no resize corners for the life of the session -- seen here on
+#      2026-09-18 with a busy session (frame B3-decoration-final.png: bare
+#      xterms while olwm's Workspace menu drew perfectly).  A 68060 is slow
+#      enough for that race to be the normal case, not the rare one.
+#
+#   2. The script must not return until the session is over: startx-rtg stops
+#      the server when it does.  The session is over when the window manager
+#      ends -- or when the workspace manager does (RT-12, below).
+#
+# No sleep is needed at the top: the launcher proves the server ready (two
+# probes a second apart, then a settle) before this script runs.
+
+WMSETTLE=${WMSETTLE-5}
+
+olwm &
+OLWM=$!
+sleep $WMSETTLE
+
+# Wait until olwm is actually managing (RT-06).  On the LC060 olwm needs
+# 50-110 s to come up (A4000T, MG6, 2026-09-28), and a client that maps
+# before that stays undecorated -- a fixed sleep cannot know.  olwm announces
+# itself on the root: OL_MANAGER_STATE gets its OLWM bit (value 2; olwsm is
+# 1) right after it has reparented the existing windows (USL olwm Misc.c
+# SetOlwmRunning, called from wm.c after ReparentWindows); the box's olwm
+# shows "OL_MANAGER_STATE(OL_MANAGER_STATE) = 0x3" with olwsm running.
+# Polled with xprop -- olwm is already connected after the sleep above, so
+# a probe is never the server's last client -- for at most $WMWAIT seconds,
+# and not at all once olwm has died.
+WMWAIT=${WMWAIT-120}
+i=0
+while [ $i -lt $WMWAIT ]; do
+	case "`xprop -root OL_MANAGER_STATE 2>/dev/null`" in
+	*"= 0x"*[2367abefABEF])
+		break ;;
+	esac
+	kill -0 $OLWM 2> /dev/null || break
+	sleep 2
+	i=`expr $i + 2`
+done
+
+# No screen saver: the server's default blanks the RTG
+# after 600 s, and while blanked a newly mapped managed window never gets
+# its first Expose.  After olwm, not before: a short-lived first client
+# makes the server reset under the window manager.  The box's X11R5 xset
+# has no DPMS option, so blanking is the only thing to turn off.
+xset s off
+
+xsetroot -solid '#4a5a6a'
+olwsm &
+OLWSM=$!
+xclock -geometry 100x100-10+10 &
+
+# Workspace -> Exit (RT-12).  OpenLook's own Exit goes through the workspace
+# manager: olwsm closes every client and ends, but olwm stays -- idle, waiting
+# for a session manager to tear it down (A4000T, MG13, 2026-09-30: 150 s+ with
+# only olwm, this script and the server left).  So the session also ends when
+# olwsm does, and olwm is stopped here.  An olwsm that dies within its first
+# 20 s failed to start and is ignored, so it cannot end a session by itself.
+# (This shell has no `!`; `kill -0` tests a pid.)
+i=0
+while kill -0 $OLWM 2> /dev/null; do
+	if [ -n "$OLWSM" ]; then
+		if kill -0 $OLWSM 2> /dev/null; then
+			:
+		elif [ $i -lt 10 ]; then
+			OLWSM=
+		else
+			kill $OLWM 2> /dev/null
+			break
+		fi
+	fi
+	sleep 2
+	i=`expr $i + 1`
+done
+wait $OLWM
