@@ -59,9 +59,13 @@ echo "[*] alien SCSI headers (rico.h, sd.h): $ALIEN"
 
 echo "[*] cross-compiling both drivers"
 CF=$(echo "$AMIX_KERNEL_CFLAGS" | sed 's/-m68020/-m68040/')
-m68k-cbm-sysv4-gcc $CF -I"$ALIEN" -I"$HERE/build" \
+# Z3660_KVMAP: a board at or above VSECT1 (autoconfig_rtg YES, e.g. 0x50000000
+# on an A3000) is mapped noncacheable through dev_kvmap (src/devkvmap040.s,
+# linked below) instead of sptalloc's writethrough-cacheable leaves; the drivers
+# also arm their data-cache maintenance from cputype.  Needed on real 040/060.
+m68k-cbm-sysv4-gcc $CF -DZ3660_KVMAP -I"$ALIEN" -I"$HERE/build" \
 	-c "$HERE/build/z3660_040.c"    -o "$HERE/build/z3660_040.o"
-m68k-cbm-sysv4-gcc $CF -I"$ALIEN" -I"$HERE/build" \
+m68k-cbm-sysv4-gcc $CF -DZ3660_KVMAP -I"$ALIEN" -I"$HERE/build" \
 	-c "$HERE/build/z3660eth_040.c" -o "$HERE/build/z3660eth_040.o"
 
 # Guard the conversion at the OBJECT level, not at the source level: the whole
@@ -77,14 +81,20 @@ m68k-cbm-sysv4-gcc $CF -I"$ALIEN" -I"$HERE/build" \
 # SIGNED `>> 11` compiles to asrl and the old check here could not see it.
 sh "$HERE/src/check_page_geometry.sh" \
 	"$HERE/build/z3660_040.o" "$HERE/build/z3660eth_040.o"
+# With Z3660_KVMAP the drivers no longer call phystopfn() (dev_kvmap takes byte
+# addresses), so they carry no page shift at all; check_page_geometry.sh above
+# still refuses any 2 KiB (>>11) shift.  What must hold instead is the import --
+# the thing the define produces (a build without it would silently compile the
+# sptalloc arm again; compare ISSUE-64 in relink-040-va2000.sh).
 for o in z3660_040 z3660eth_040; do
-	m68k-linux-gnu-objdump -d "$HERE/build/$o.o" | grep -A1 "moveq #12," | grep -q "lsrl" \
-		|| { echo "[FAIL] $o.o has no 4 KiB page shift at all -- phystopfn override missing?"; exit 1; }
+	m68k-linux-gnu-nm "$HERE/build/$o.o" | grep -qE ' U dev_kvmap$' \
+		|| { echo "[FAIL] $o.o does not import dev_kvmap -- built without -DZ3660_KVMAP?"; exit 1; }
 done
-echo "[OK] both driver objects shift by 12 (4 KiB PFN), none by 11"
+echo "[OK] both driver objects import dev_kvmap (noncacheable mapping above VSECT1)"
 
 echo "[*] assembling the registration glue"
 m68k-cbm-sysv4-gcc -m68040 -c "$HERE/src/z3660_glue040.s" -o "$HERE/build/z3660_glue040.o"
+m68k-cbm-sysv4-gcc -m68040 -c "$HERE/src/devkvmap040.s" -o "$HERE/build/devkvmap040.o"
 
 # parinit is the io_init[] hook (same one the VA2000 driver uses, and for the same
 # reason).  Weaken the stock one and expose it as parinit_orig so the glue can
@@ -106,10 +116,11 @@ m68k-linux-gnu-objcopy \
 # .balign 4 closes the gap.
 echo "[*] ld -r: base + both drivers + glue (glue LAST: it carries the .balign 4)"
 m68k-cbm-sysv4-ld -r -o "$OUT" "$HERE/build/unix-stage-z3660" \
-	"$HERE/build/z3660_040.o" "$HERE/build/z3660eth_040.o" "$HERE/build/z3660_glue040.o"
+	"$HERE/build/z3660_040.o" "$HERE/build/z3660eth_040.o" "$HERE/build/devkvmap040.o" \
+	"$HERE/build/z3660_glue040.o"
 
 echo "[*] symbols that must be defined:"
-for s in z3660queue z3660present z3660ethinfo z3660_scsicard dd_startio_first parinit parinit_orig; do
+for s in z3660queue z3660present z3660ethinfo z3660_scsicard dd_startio_first parinit parinit_orig dev_kvmap; do
 	m68k-linux-gnu-nm "$OUT" | grep -E " [TtDdBb] $s\$" | sed "s/^/      /" \
 		|| { echo "[FAIL] $s not defined"; exit 1; }
 done
