@@ -104,7 +104,8 @@ def main():
     path = sys.argv[1]
     today = datetime.date.today().strftime('%y%m%d')
     seq = next_seq(os.path.dirname(path) or '.', today)
-    field = f" 68040-{today}-{seq:02d}".encode()
+    # local (isoriano): seq 100+ has no two-digit room; tag it "i<hex>" so it never reads as an upstream id
+    field = (f" 68040-{today}-i{seq-100:x}" if seq >= 100 else f" 68040-{today}-{seq:02d}").encode()
     if len(field) != FIELD_LEN:
         die(f"stamp too long: {field!r} ({len(field)} != {FIELD_LEN})")
 
