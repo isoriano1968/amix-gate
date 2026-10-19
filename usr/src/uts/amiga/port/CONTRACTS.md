@@ -23,6 +23,7 @@ Numbers that carry a per-line block never do. This table is the registry, and
 |---|---|---|
 | antti.sokero@gmail.com | 1-99 | 1-49 |
 | jussi@alanara.fi | 100-199 | 50-99 |
+| 81116077+isoriano1968@users.noreply.github.com | 200-299 | 100-115 |
 
 **Identity comes from `git config user.email`.** It is already on every machine, git already
 uses it for authorship, and it survives a fresh clone and a lost session — which is what a
