@@ -1,7 +1,7 @@
 #!/bin/sh
 # relink-040-kvseg.sh -- the base kernel with a 12 MB kvseg (src/kvseg040.s,
 # src/patch_kvseg.py), for machines with more RAM than 4 MB of kvseg can index
-# (a Z3660's 128 MB CPU RAM).  Usage: sh relink-040-kvseg.sh [IN] [OUT]
+# (a Z3660's 128 MB CPU RAM).  Usage: [KVSEG_MB=12] sh relink-040-kvseg.sh [IN] [OUT]
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/tools/config-load.sh"

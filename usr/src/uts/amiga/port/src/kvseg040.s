@@ -6,7 +6,8 @@
 | takes 1.9 MB and boot-time allocations the rest: sptmap is left with one page
 | and the first big kmem_alloc (every fork) sleeps on Km_BigWanted for ever.
 |
-| src/patch_kvseg.py grows kvseg to 12 MB: sysseginit's page-table loop, the
+| src/patch_kvseg.py grows kvseg to KVSEG_MB (default 12; 16 for a Z3660
+| with its RTG console mapped): sysseginit's page-table loop, the
 | sptmap mfree count and kvm_init's seg_attach size, and moves kvsegmap (the
 | segmap window after kvseg) from 0x40440000 to 0x40c40000.  segmap's size,
 | smsegs, scales with physical memory (about 126 MB for 128 MB of RAM); the
@@ -17,7 +18,9 @@
 | returns with the condition codes of that value (kvm_init branches on them
 | next: its "addqw #8,%sp" in between leaves them alone).  Only d0 is changed.
 
-	.set	KVSEG_SMSEGS_MAX, 480	| (0x48440000 - 0x40c40000) / 256 KB
+	.set	KVSEG_SMSEGS_MAX, 480	| (0x48440000 - 0x40c40000) / 256 KB for 12 MB;
+					| patch_kvseg.py rewrites both immediates
+					| for its KVSEG_MB
 
 	.text
 	.globl	kvseg_smsegs_clamp

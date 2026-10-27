@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""patch_kvseg.py -- grow kvseg from 4 MB to 12 MB in a linked 040/060 kernel.
+"""patch_kvseg.py -- grow kvseg from 4 MB to KVSEG_MB (default 12) in a linked 040/060 kernel.
 
 Usage: python3 src/patch_kvseg.py KERNEL   (in place; KERNEL already contains
 src/kvseg040.s, i.e. the symbol kvseg_smsegs_clamp).  See src/kvseg040.s for
@@ -8,8 +8,14 @@ change written.
 """
 import struct, sys
 
-KVSEG_PAGES = 0xc00                    # 12 MB of 4 KB pages (stock 0x400)
-KVSEGMAP_OLD, KVSEGMAP_NEW = 0x40440000, 0x40c40000
+import os
+KVSEG_MB = int(os.environ.get("KVSEG_MB", "12"))   # stock 4
+if KVSEG_MB < 4 or KVSEG_MB > 64 or KVSEG_MB % 4:
+    sys.exit("[FAIL] patch_kvseg: KVSEG_MB must be a multiple of 4, 4..64")
+KVSEG_PAGES = KVSEG_MB * 256           # 4 KB pages
+SYSSEGS, KVSEGU = 0x40040000, 0x48440000
+KVSEGMAP_OLD, KVSEGMAP_NEW = 0x40440000, SYSSEGS + (KVSEG_PAGES << 12)
+SMSEGS_MAX = (KVSEGU - KVSEGMAP_NEW) >> 18   # 256 KB segmap segments
 
 def die(msg):
     sys.exit("[FAIL] patch_kvseg: " + msg)
@@ -69,7 +75,14 @@ patch(0x48c7e, bytes.fromhex("2f3c00400000"),
       bytes.fromhex("2f3c") + struct.pack(">I", KVSEG_PAGES << 12),
       "kvm_init: kvseg seg_attach size")
 # 4. stock kvm_init: movel %d0,smsegs -> jsr kvseg_smsegs_clamp
-clamp, _, _, x = find("kvseg_smsegs_clamp")
+clamp, _, cval, x = find("kvseg_smsegs_clamp")
+# the clamp's limit ("cmpil #N,%d0" and "movel #N,%d0") must fit the window
+co = toff + cval
+if d[co:co + 2] != bytes.fromhex("0c80") or d[co + 8:co + 10] != bytes.fromhex("203c"):
+    die("kvseg_smsegs_clamp: unexpected code")
+for o in (co + 2, co + 10):
+    struct.pack_into(">I", d, o, SMSEGS_MAX)
+print(f"  [ok]   {'kvseg_smsegs_clamp limit':44s} {SMSEGS_MAX} x 256 KB")
 smsegs = find("smsegs")[0]
 rela = [i for i, s in enumerate(secs) if s[1] == 4 and s[7] == text]
 if len(rela) != 1:
@@ -94,5 +107,5 @@ if x != 0xfff1 or v != KVSEGMAP_OLD:
 struct.pack_into(">I", d, o + 4, KVSEGMAP_NEW)
 print(f"  [ok]   {'kvsegmap':44s} 0x{KVSEGMAP_OLD:x} -> 0x{KVSEGMAP_NEW:x}")
 open(path, "wb").write(d)
-print(f"[OK] kvseg {KVSEG_PAGES * 4 // 1024} MB, segmap window "
-      f"0x{KVSEGMAP_NEW:x}-0x48440000: {path}")
+print(f"[OK] kvseg {KVSEG_MB} MB, segmap window "
+      f"0x{KVSEGMAP_NEW:x}-0x{KVSEGU:x} ({SMSEGS_MAX * 256 // 1024} MB): {path}")
