@@ -1776,7 +1776,8 @@ struct zz9k_board *bp;
     ZZ9K_MONSW_SET(1);
 
     zz9k_console_puts("\033[2J");
-    zz9k_console_puts("ZZ9000 direct console renderer test\n");
+    zz9k_console_puts(bp->bt->name);
+    zz9k_console_puts(" direct console renderer test\n");
     zz9k_console_puts("ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789\n");
     zz9k_console_puts("THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG\n");
     zz9k_console_puts("\033[31mRED\033[0m \033[32mGREEN\033[0m ");
@@ -2260,19 +2261,19 @@ int *rvalp;
             error = zz9k_console_enable(bp);
             if (error)
                 return error;
-            printf("zz9000 console enabled\n");
+            printf("%s console enabled\n", bp->bt->name);
             break;
         }
         if (arg == ZZ9K_CONSOLE_DISABLE) {
             zz9k_console_disable();
-            printf("zz9000 console disabled\n");
+            printf("%s console disabled\n", bp->bt->name);
             break;
         }
         if (arg == ZZ9K_CONSOLE_REDIRECT) {
             error = zz9k_console_redirect_enable(bp);
             if (error)
                 return error;
-            printf("zz9000 console redirect enabled\n");
+            printf("%s console redirect enabled\n", bp->bt->name);
             break;
         }
         if (arg == ZZ9K_CONSOLE_TEST) {

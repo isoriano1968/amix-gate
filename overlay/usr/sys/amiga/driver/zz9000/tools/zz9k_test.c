@@ -491,7 +491,8 @@ char **argv;
         rc = ioctl(fd, ZZ9KIOC_CONSOLE, ZZ9K_CONSOLE_TEST);
         if (rc < 0)
             perror("ZZ9KIOC_CONSOLE test");
-        zz9k_hold("ZZ9000 console enabled.");
+        zz9k_hold(info.zorro == 3 && info.product == 1 ?
+            "Z3660 RTG console enabled." : "ZZ9000 console enabled.");
         rc = ioctl(fd, ZZ9KIOC_CONSOLE, ZZ9K_CONSOLE_DISABLE);
         if (rc < 0)
             perror("ZZ9KIOC_CONSOLE disable");
@@ -515,7 +516,8 @@ char **argv;
             close(fd);
             return 1;
         }
-        printf("ZZ9000 console redirect enabled. Native RGB drawing should stop.\n");
+        printf("%s console redirect enabled. Native RGB drawing should stop.\n",
+            info.zorro == 3 && info.product == 1 ? "Z3660 RTG" : "ZZ9000");
         printf("Run a command such as 'date' or 'ls -l /' to verify redirected output.\n");
         close(fd);
         return 0;
