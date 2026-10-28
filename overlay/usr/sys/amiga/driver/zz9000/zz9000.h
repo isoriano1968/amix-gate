@@ -103,6 +103,40 @@
 #define ZZ9KIOC_CONPUTS        (ZZ9K_IOC | 14)  /* write text to the framebuffer console */
 #define ZZ9KIOC_GETMONSW       (ZZ9K_IOC | 15)  /* interim only, see below */
 #define ZZ9KIOC_BLITS          (ZZ9K_IOC | 16)  /* a batch of card-blitter fills/copies */
+#define ZZ9KIOC_SOFT3D         (ZZ9K_IOC | 17)  /* one soft3D operation: write op, read result */
+
+/*
+ * ZZ9KIOC_SOFT3D (-DZZ9K_MAP_BOARD kernels): the Z3660 firmware's soft3D --
+ * Wazp3D's rasterizer on the ARM -- takes its parameters in a block at
+ * board+0x4200000, which the caller writes through its own mmap() of the
+ * board (that page is outside the framebuffer interval, so mapped
+ * serialised: every parameter has landed before the operation starts);
+ * this ioctl writes the operation to REG_ZZ_SOFT3D_OP and returns what the
+ * register reads afterwards (a context, a buffer, a status).  One system
+ * call per operation, where GETREG/SETREG take four.
+ */
+struct zz9k_soft3d {
+    unsigned long op;
+    unsigned long result;
+};
+#define ZZ9K_REG_SOFT3D_OP     0x270
+
+/*
+ * ZZ9KIOC_BLITX (-DZZ9K_MAP_BOARD kernels): FILLRECT/COPYRECT on the card's
+ * blitter, checked against every framebuffer row the board holds instead of
+ * the visible screen alone -- for soft3D's back buffer in off-screen VRAM,
+ * cleared and then copied into the window.  op 0 fills (color), op 1
+ * copies (sx, sy -> dx, dy).
+ */
+#define ZZ9KIOC_BLITX          (ZZ9K_IOC | 18)
+struct zz9k_blitx {
+    unsigned short op;          /* 0 fill, 1 copy */
+    unsigned short sx, sy;
+    unsigned short dx, dy;
+    unsigned short width, height;
+    unsigned short pad;
+    unsigned long color;
+};
 /*
  * ZZ9KIOC_GETMONSW was answered by the interim RT-03 driver (03844ac, 407d379) that drove the
  * monitor-switch line itself; it is kept here for zz9k_monsw, which still meets such kernels.

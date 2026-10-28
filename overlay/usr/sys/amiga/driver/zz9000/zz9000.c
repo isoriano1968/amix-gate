@@ -99,6 +99,9 @@ struct zz9k_board {
     char *fb;
     unsigned long board_size;
     unsigned long fb_size;
+#ifdef ZZ9K_MAP_BOARD
+    unsigned long map_size;       /* mmap() bound: up to the board's end */
+#endif
     unsigned short hw_version;
     unsigned short fw_version;
     unsigned short mode;
@@ -613,6 +616,20 @@ long size;
         else
             bp->fb_size = 0;
     }
+#ifdef ZZ9K_MAP_BOARD
+    /*
+     * soft3D (the Z3660 firmware's Wazp3D rasterizer on the ARM) takes its
+     * parameter block at board+0x4200000 and its vertices, textures and
+     * target bitmap anywhere in the board, at the 060's addresses: on a row
+     * whose device space is the framebuffer alone (fb_offset 0), mmap()
+     * reaches on to the board's end.  The framebuffer itself, the kernel's
+     * own mappings and the cache class of the framebuffer interval are
+     * unchanged; pages past it are unmanaged device pages, serialised.
+     */
+    bp->map_size = bp->board_size;
+    if (bt->fb_offset == 0 && (unsigned long)size > bt->fb_phys + bp->board_size)
+        bp->map_size = (unsigned long)size - bt->fb_phys;
+#endif
     bp->fb = (char *)base + bt->fb_phys;
 #ifdef ZZ9K_KVMAP
     if (!bp->phys) {              /* identity map: kernel and physical agree */
@@ -646,6 +663,11 @@ long size;
     printf("zz9000: %s at 0x%x size 0x%x hw 0x%x fw 0x%x\n", bt->name,
         (unsigned int)ZZ9K_PHYS(bp), (unsigned int)bp->board_size,
         bp->hw_version, bp->fw_version);
+#ifdef ZZ9K_MAP_BOARD
+    if (bp->map_size > bp->board_size)
+        printf("zz9000: mmap reaches device offset 0x%x (soft3D)\n",
+            (unsigned int)bp->map_size);
+#endif
     if (bt->fw_min && bp->fw_version < bt->fw_min)
         printf("zz9000: warning firmware 0x%x is older than 0x%x\n",
             bp->fw_version, bt->fw_min);
@@ -1924,8 +1946,13 @@ int maxprot;
     if (!zz9k_probe(unit))
         return -1;
     bp = &zz9k_boards[unit];
+#ifdef ZZ9K_MAP_BOARD
+    if (offset < 0 || (unsigned long)offset >= bp->map_size)
+        return -1;
+#else
     if (offset < 0 || (unsigned long)offset >= bp->board_size)
         return -1;
+#endif
 
     return phystopfn(zz9k_devpa(bp, (unsigned long)offset));
 }
@@ -2070,6 +2097,48 @@ int *rvalp;
     }
     if (cmd == ZZ9KIOC_BLITS)           /* outside the switch for the same reason */
         return zz9k_blits(bp, arg, rvalp);
+#ifdef ZZ9K_MAP_BOARD
+    if (cmd == ZZ9KIOC_SOFT3D) {        /* outside the switch for the same reason */
+        struct zz9k_soft3d s3;
+        volatile unsigned long *reg;
+
+        if (!zz9k_probe(unit) || bp->bt->regw != 4)
+            return ENXIO;
+        if (copyin((caddr_t)arg, (caddr_t)&s3, sizeof s3))
+            return EFAULT;
+        reg = (volatile unsigned long *)((char *)bp->base + ZZ9K_REG_SOFT3D_OP);
+        *reg = s3.op;                   /* the firmware runs the operation */
+        s3.result = *reg;
+        if (copyout((caddr_t)&s3, (caddr_t)arg, sizeof s3))
+            return EFAULT;
+        return 0;
+    }
+    if (cmd == ZZ9KIOC_BLITX) {         /* outside the switch for the same reason */
+        struct zz9k_blitx bx;
+        unsigned long rows, pitch;
+
+        /* the blitter only: the CPU fallbacks reach just the kernel's
+           mapping of the framebuffer, not the off-screen rows */
+        if (!zz9k_probe(unit) || !zz9k_can_blit(bp))
+            return ENXIO;
+        if (copyin((caddr_t)arg, (caddr_t)&bx, sizeof bx))
+            return EFAULT;
+        pitch = (unsigned long)bp->width * zz9k_bpp(bp->color_mode);
+        rows = pitch ? bp->fb_size / pitch : 0;
+        if (bx.width == 0 || bx.height == 0 || bx.op > 1 ||
+            (unsigned long)bx.dx + bx.width > bp->width ||
+            (unsigned long)bx.dy + bx.height > rows ||
+            (bx.op == 1 && ((unsigned long)bx.sx + bx.width > bp->width ||
+                            (unsigned long)bx.sy + bx.height > rows)))
+            return EINVAL;
+        if (bx.op == 0)
+            zz9k_fillrect(bp, bx.dx, bx.dy, bx.width, bx.height,
+                (unsigned short)bx.color);
+        else
+            zz9k_copyrect(bp, bx.sx, bx.sy, bx.dx, bx.dy, bx.width, bx.height);
+        return 0;
+    }
+#endif
 
     switch (cmd) {
     case ZZ9KIOC_GETAUTOCON:
