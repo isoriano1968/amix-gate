@@ -1,5 +1,36 @@
 # ZZ9000 driver for Amiga UNIX (AMIX)
 
+## This repository: soft3d-z3660rtg-amix
+
+The Z3660 RTG driver for AMIX, continued from
+[jusii/amix-z3660rtg](https://github.com/jusii/amix-z3660rtg) (itself a fork of
+[isoriano1968/zz9000-amix](https://github.com/isoriano1968/zz9000-amix)), as it runs on an
+Amiga 3000 with a Z3660 and a real 68060 under the
+[68040/68060 kernel port](https://github.com/asokero/amix-040-060-port).
+
+What it adds to amix-z3660rtg 1.0:
+
+- **The board above VSECT1** (`-DZZ9K_KVMAP`): the Z3660's RTG mapped through the kernel's
+  `dev_kvmap`, for kernels that use all of the Z3660's 128 MB.
+- **soft3D** (`-DZZ9K_MAP_BOARD`): the Z3660 firmware's Wazp3D rasterizer from AMIX programs.
+  - The driver lets a program map the whole board, and adds two ioctls: one soft3D operation
+    per system call, and blitter fills and copies over off-screen VRAM.
+  - `soft3d/` has the user side: `libs3d` and a test program. See `soft3d/README.md`.
+- **The X server** (`x11/patches/rt11`–`rt18`):
+  - the ZZ9K-SOFT3D extension, which puts a soft3D frame into its window through the clip
+    list;
+  - MIT-SHM;
+  - fixes for CopyWindow, tiled backgrounds, tiled and stippled fills, and the bell, which CDE
+    and Motif need.
+  - `x11/README.md` lists them.
+- **Console:** console messages name the board, and `zz9k_test constate` reports whether the
+  console is on the RTG.
+- **`ztop`** (`overlay/usr/sys/amiga/driver/zz9000/tools/ztop.c`): the Z3660's sensors (temperatures, voltages, clocks) on AMIX, as ZTop
+  shows them on AmigaOS.
+
+Everything else below is amix-z3660rtg's own README, unchanged.
+
+
 ## This fork: the Z3660 RTG target (amix-z3660rtg)
 
 This is a fork of [isoriano1968/zz9000-amix](https://github.com/isoriano1968/zz9000-amix)
