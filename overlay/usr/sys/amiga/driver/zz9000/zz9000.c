@@ -111,7 +111,36 @@ struct zz9k_board {
     short svga_switch;            /* last SVGAIOCSetMonitorSwitch: 1 Amiga, 2 SVGA */
     unsigned long blitreg[ZZ9K_NREG];  /* blitter registers as last written (RT-09) */
     unsigned long blitvalid;      /* bit r: blitreg[r] is what the card holds */
+#ifdef ZZ9K_KVMAP
+    long phys;                    /* physical board base; base is a kernel mapping */
+    char *fb_pa;                  /* physical framebuffer; fb is a kernel mapping */
+    unsigned long fb_kmap;        /* framebuffer bytes the kernel has mapped */
+#endif
 };
+
+/*
+ * ZZ9K_KVMAP (68040/68060 relink with the port's src/devkvmap040.s): a board
+ * outside the identity-mapped low 1 GB -- the Z3660 with autoconfig_rtg YES
+ * sits at 0x40000000 or 0x50000000 -- is reached through kernel mappings with
+ * an explicit cache class: the register page noncacheable-serialised, the
+ * first ZZ9K_KMAP_FB bytes of the framebuffer noncacheable (the console and
+ * the kernel's CPU fallbacks stay inside them).  mmap() hands out physical
+ * pages of the whole framebuffer, as before.  Without the define the board
+ * is used through the identity map and these name the same addresses.
+ */
+#ifdef ZZ9K_KVMAP
+extern char *dev_kvmap();
+#define ZZ9K_CM_NCS     0x40
+#define ZZ9K_CM_NC      0x60
+#define ZZ9K_KMAP_FB    0x00400000UL  /* 1920x1080x16 bpp = 0x3f4800 fits */
+#define ZZ9K_PHYS(bp)   ((bp)->phys)
+#define ZZ9K_FBPA(bp)   ((bp)->fb_pa)
+#define ZZ9K_FBK(bp)    ((bp)->fb_kmap)
+#else
+#define ZZ9K_PHYS(bp)   ((bp)->base)
+#define ZZ9K_FBPA(bp)   ((bp)->fb)
+#define ZZ9K_FBK(bp)    ((bp)->fb_size)
+#endif
 
 /*
  * The blitter register cache (RT-09).  Every band of a banded operation used to re-send
@@ -135,12 +164,17 @@ static unsigned short zz9k_bpp();
 static int zz9k_probe();
 static int zz9k_present();
 static int zz9k_attach();
+#ifdef ZZ9K_KVMAP
+static int zz9k_attach_kv();
+extern void dev_kvunmap();
+#endif
 static void zz9k_fill_autocon();
 static unsigned long zz9k_rd();
 static void zz9k_wr();
 static void zz9k_wr32();
 static int zz9k_aga();
 static char *zz9k_devphys();
+static char *zz9k_devpa();
 static void zz9k_monsw_attach();
 
 #ifdef ZZ9K_FB_NC
@@ -580,12 +614,23 @@ long size;
             bp->fb_size = 0;
     }
     bp->fb = (char *)base + bt->fb_phys;
+#ifdef ZZ9K_KVMAP
+    if (!bp->phys) {              /* identity map: kernel and physical agree */
+        bp->phys = base;
+        bp->fb_pa = bp->fb;
+        bp->fb_kmap = bp->fb_size;
+    } else {                      /* zz9k_attach_kv maps fb and sets it after */
+        bp->fb = (char *)0;
+        if (bp->fb_kmap > bp->fb_size)
+            bp->fb_kmap = bp->fb_size;
+    }
+#endif
 #ifdef ZZ9K_FB_NC
     if (bp->fb_size) {
-        if (hat_cm_fb_add(phystopfn((unsigned long)base + bt->fb_phys),
-                          phystopfn((unsigned long)base + bt->fb_phys + bp->fb_size)))
+        if (hat_cm_fb_add(phystopfn((unsigned long)ZZ9K_FBPA(bp)),
+                          phystopfn((unsigned long)ZZ9K_FBPA(bp) + bp->fb_size)))
             printf("zz9000: framebuffer 0x%x+0x%x registered noncacheable-not-serialised\n",
-                (unsigned int)((unsigned long)base + bt->fb_phys), (unsigned int)bp->fb_size);
+                (unsigned int)ZZ9K_FBPA(bp), (unsigned int)bp->fb_size);
         else
             printf("zz9000: framebuffer cache class NOT registered (stays serialised)\n");
     }
@@ -599,7 +644,7 @@ long size;
     zz9k_monsw_attach(bp);
 
     printf("zz9000: %s at 0x%x size 0x%x hw 0x%x fw 0x%x\n", bt->name,
-        (unsigned int)bp->base, (unsigned int)bp->board_size,
+        (unsigned int)ZZ9K_PHYS(bp), (unsigned int)bp->board_size,
         bp->hw_version, bp->fw_version);
     if (bt->fw_min && bp->fw_version < bt->fw_min)
         printf("zz9000: warning firmware 0x%x is older than 0x%x\n",
@@ -640,6 +685,55 @@ zz9k_aga()
     v = *((volatile unsigned short *)ZZ9K_VPOSR);
     return ((v >> 8) & 0x7f) >= 0x22;
 }
+
+#ifdef ZZ9K_KVMAP
+/*
+ * Attach a board outside the identity map through two kernel mappings:
+ * the register page (NCS) and the first ZZ9K_KMAP_FB bytes of the
+ * framebuffer (NC).  Kept for the life of the kernel, like every other
+ * driver's MMIO mapping; both are released if the board does not answer.
+ */
+static int
+zz9k_attach_kv(bp, bt, base, size)
+struct zz9k_board *bp;
+struct zz9k_boardtab *bt;
+long base;
+long size;
+{
+    char *regs, *fb;
+    unsigned long fbmax, kmap;
+    long rsize;
+
+    rsize = (long)(bt->reg_size ? bt->reg_size : 0x1000);
+    fbmax = bt->fb_max ? bt->fb_max :
+        (unsigned long)size - bt->fb_offset - bt->reserved_tail;
+    kmap = fbmax < ZZ9K_KMAP_FB ? fbmax : ZZ9K_KMAP_FB;
+    regs = dev_kvmap((unsigned long)base, (unsigned long)rsize, ZZ9K_CM_NCS, 0);
+    fb = kmap ? dev_kvmap((unsigned long)base + bt->fb_phys, kmap, ZZ9K_CM_NC, 0)
+        : (char *)0;
+    if (!regs || (kmap && !fb)) {
+        printf("zz9000: %s at 0x%x: cannot map it into the kernel\n",
+            bt->name, (unsigned int)base);
+        if (regs)
+            dev_kvunmap(regs, (unsigned long)rsize);
+        return 0;
+    }
+    bp->phys = base;
+    bp->fb_pa = (char *)base + bt->fb_phys;
+    bp->fb_kmap = kmap;
+    if (!zz9k_attach(bp, bt, (long)regs, size)) {
+        bp->phys = 0;
+        dev_kvunmap(regs, (unsigned long)rsize);
+        if (fb)
+            dev_kvunmap(fb, kmap);
+        return 0;
+    }
+    bp->fb = fb;                  /* zz9k_attach set the physical one */
+    printf("zz9000: %s mapped: registers 0x%x, framebuffer 0x%x+0x%x\n",
+        bt->name, (unsigned int)regs, (unsigned int)fb, (unsigned int)kmap);
+    return 1;
+}
+#endif
 
 static int
 zz9k_probe(unit)
@@ -685,11 +779,17 @@ int unit;
          */
         if ((unsigned long)base >= ZZ9K_VSECT1 ||
             ZZ9K_VSECT1 - (unsigned long)base < (unsigned long)size) {
+#ifdef ZZ9K_KVMAP
+            if (zz9k_attach_kv(bp, bt, base, size))
+                return 1;
+            continue;
+#else
             printf("zz9000: %s at 0x%x size 0x%x is outside the identity map\n",
                 bt->name, (unsigned int)base, (unsigned int)size);
             if (bt->advice[0])
                 printf("zz9000: %s\n", bt->advice);
             continue;
+#endif
         }
         if (zz9k_attach(bp, bt, base, size))
             return 1;
@@ -799,6 +899,17 @@ unsigned long off;
     return bp->fb + (off - bp->bt->fb_offset);
 }
 
+/* the same device-space offset as a physical address, for mmap() */
+static char *
+zz9k_devpa(bp, off)
+struct zz9k_board *bp;
+unsigned long off;
+{
+    if (off < bp->bt->fb_offset)
+        return (char *)ZZ9K_PHYS(bp) + off;
+    return ZZ9K_FBPA(bp) + (off - bp->bt->fb_offset);
+}
+
 static void
 zz9k_blit_fill(bp, x, y, w, h, color)
 struct zz9k_board *bp;
@@ -867,6 +978,8 @@ unsigned short color;
 
     if (!bp || !bp->base || w <= 0 || h <= 0)
         return;
+    if (((unsigned long)(y + h) * bp->width) * 2 > ZZ9K_FBK(bp))
+        return;                   /* beyond what the kernel has mapped */
 
     fb = (unsigned short *)bp->fb;
     for (yy = y; yy < y + h; ++yy) {
@@ -890,6 +1003,8 @@ int sx, sy, dx, dy, w, h;
 
     if (!bp || !bp->base || w <= 0 || h <= 0)
         return;
+    if (((unsigned long)((sy > dy ? sy : dy) + h) * bp->width) * 2 > ZZ9K_FBK(bp))
+        return;                   /* beyond what the kernel has mapped */
 
     fb = (unsigned short *)bp->fb;
 
@@ -1514,7 +1629,7 @@ struct zz9k_board *bp;
         return EINVAL;
     zz9k_con_w = bp->bt->con_width;
     zz9k_con_h = bp->bt->con_height;
-    if ((unsigned long)zz9k_con_w * zz9k_con_h * 2 > bp->fb_size)
+    if ((unsigned long)zz9k_con_w * zz9k_con_h * 2 > ZZ9K_FBK(bp))
         return ENOMEM;
 
     zz9k_set_mode_hw(bp, id, ZZ9K_CON_COLOR, 0);
@@ -1754,12 +1869,12 @@ struct uio *uiop;
     if (count == 0)
         return 0;
     if (uiop->uio_offset < 0 ||
-        (unsigned long)uiop->uio_offset >= bp->board_size)
+        (unsigned long)uiop->uio_offset >= bp->bt->fb_offset + ZZ9K_FBK(bp))
         return ENXIO;
 
     end = (unsigned long)uiop->uio_offset + count;
-    if (end > bp->board_size)
-        count = bp->board_size - (unsigned long)uiop->uio_offset;
+    if (end > bp->bt->fb_offset + ZZ9K_FBK(bp))
+        count = bp->bt->fb_offset + ZZ9K_FBK(bp) - (unsigned long)uiop->uio_offset;
     if (direction == UIO_WRITE && count == 0)
         return ENXIO;
 
@@ -1811,7 +1926,7 @@ int maxprot;
     if (offset < 0 || (unsigned long)offset >= bp->board_size)
         return -1;
 
-    return phystopfn(zz9k_devphys(bp, (unsigned long)offset));
+    return phystopfn(zz9k_devpa(bp, (unsigned long)offset));
 }
 
 /*
@@ -1973,7 +2088,7 @@ int *rvalp;
 
     switch (cmd) {
     case ZZ9KIOC_GETINFO:
-        info.base = (unsigned long)bp->base;
+        info.base = (unsigned long)ZZ9K_PHYS(bp);
         info.board_size = bp->board_size;
         info.fb_offset = bp->bt->fb_offset;
         info.fb_size = bp->fb_size;
@@ -2028,10 +2143,10 @@ int *rvalp;
             return EFAULT;
         if (zf.bytes == 0)
             break;
-        if (zf.offset >= bp->fb_size)
+        if (zf.offset >= ZZ9K_FBK(bp))
             return EINVAL;
-        if (zf.bytes > bp->fb_size - zf.offset)
-            limit = bp->fb_size;
+        if (zf.bytes > ZZ9K_FBK(bp) - zf.offset)
+            limit = ZZ9K_FBK(bp);
         else
             limit = zf.offset + zf.bytes;
         fill = (unsigned char)zf.value;
