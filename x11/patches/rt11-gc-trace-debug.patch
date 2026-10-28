@@ -1,0 +1,24 @@
+diff --git a/programs/Xserver/hw/amix/rtg/zz9000/zz9000screen.c b/programs/Xserver/hw/amix/rtg/zz9000/zz9000screen.c
+index 8a70c88..0aa8111 100644
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000screen.c
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000screen.c
+@@ -168,7 +168,9 @@ GCPtr pGC;
+ {
+     RTGGCPRIV *pPriv;
+ 
++#ifdef ZZ9000_DEBUG
+     ErrorF("ZZ9000CreateGC: depth=%d\n", pGC->depth);
++#endif
+ 
+     /* Delegate 1-bit GCs to mfb - same pattern as cfb/cfbgc.c line 241.
+        mfbAllocatePrivates() in rtgScreenInit ensures the mfb GC private
+@@ -182,7 +184,9 @@ GCPtr pGC;
+         return FALSE;
+     }
+ 
++#ifdef ZZ9000_DEBUG
+     ErrorF("ZZ9000CreateGC: pPriv=%p\n", pGC->devPrivates[rtgGCPrivateIndex].ptr);
++#endif
+ 
+     pGC->funcs = (GCFuncs *) xalloc(sizeof(GCFuncs));
+     if (!pGC->funcs)

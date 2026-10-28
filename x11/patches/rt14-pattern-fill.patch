@@ -1,0 +1,221 @@
+diff --git a/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c b/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
+index 23b5e3e..a6c002c 100644
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
+@@ -594,6 +594,134 @@ int             alu;
+     }
+ }
+ 
++/*
++** ZZ9000PatternSpans - FillSpans for FillTiled, FillStippled and
++** FillOpaqueStippled, on windows (VRAM) and pixmaps (host memory) alike.
++**
++** The pattern origin is the drawable's origin plus the GC's patOrg.  A tile
++** is a 16-bit pixmap; a stipple is a depth-1 pixmap, MSBFirst bit order
++** (servermd.h for AMIX), so bit x of a row is row[x>>3] & (0x80 >> (x&7)).
++** FillStippled leaves clear bits alone; FillOpaqueStippled paints them with
++** the background.  These used to fall back to a solid foreground fill, which
++** made every tiled rectangle (dtstyle's backdrop preview) and every stippled
++** one (Motif's insensitive text and shading) a plain block.
++*/
++void
++ZZ9000PatternSpans(pDraw, pGC, nspans, ppts, pwidths, fSorted)
++DrawablePtr pDraw;
++GCPtr       pGC;
++int         nspans;
++DDXPointPtr ppts;
++int        *pwidths;
++int         fSorted;
++{
++    rtgScreenPtr    pRTG   = GetRTGScreen(pDraw->pScreen);
++    unsigned short *base   = drawBase(pDraw, pRTG);
++    int             stride = drawStride(pDraw);
++    RegionPtr       clip   = rtgGCClip(pGC);
++    int             alu    = pGC->alu;
++    int             tiled  = (pGC->fillStyle == FillTiled);
++    int             opaque = (pGC->fillStyle == FillOpaqueStippled);
++    PixmapPtr       pPat   = tiled ? pGC->tile.pixmap : pGC->stipple;
++    unsigned short  fg     = (unsigned short) pGC->fgPixel;
++    unsigned short  bg     = (unsigned short) pGC->bgPixel;
++    int             xorg, yorg, pw, ph, pstride;
++    DDXPointPtr     clippedPts;
++    int            *clippedWidths;
++    int             maxSpans, i, w, n, x, px, py;
++    unsigned short *p;
++    unsigned char  *srow;
++    unsigned short *trow;
++
++    if (nspans <= 0 || !pPat || !pPat->devPrivate.ptr ||
++        pPat->drawable.width <= 0 || pPat->drawable.height <= 0 ||
++        (tiled && pPat->drawable.depth != ZZ9000_DEPTH) ||
++        (!tiled && pPat->drawable.depth != 1))
++    {
++        ZZ9000FillSpans(pDraw, pGC, nspans, ppts, pwidths, fSorted);
++        return;
++    }
++    pw = pPat->drawable.width;
++    ph = pPat->drawable.height;
++    pstride = pPat->devKind;            /* bytes */
++    xorg = pDraw->x + pGC->patOrg.x;
++    yorg = pDraw->y + pGC->patOrg.y;
++
++    maxSpans = nspans * miFindMaxBand(clip);
++    if (maxSpans <= 0)
++        return;
++    clippedPts = (DDXPointPtr) ALLOCATE_LOCAL(maxSpans * sizeof(DDXPointRec));
++    clippedWidths = (int *) ALLOCATE_LOCAL(maxSpans * sizeof(int));
++    if (!clippedPts || !clippedWidths)
++    {
++        if (clippedPts)
++            DEALLOCATE_LOCAL(clippedPts);
++        if (clippedWidths)
++            DEALLOCATE_LOCAL(clippedWidths);
++        return;
++    }
++    nspans = miClipSpans(clip, ppts, pwidths, nspans,
++                         clippedPts, clippedWidths, fSorted);
++    if (pDraw->type == DRAWABLE_WINDOW)
++        BLIT_FLUSH();                   /* no queued blit may land on top */
++
++    for (i = 0; i < nspans; i++)
++    {
++        w = clippedWidths[i];
++        if (w <= 0)
++            continue;
++        x = clippedPts[i].x;
++        p = base + (long) clippedPts[i].y * stride + x;
++        py = (clippedPts[i].y - yorg) % ph;
++        if (py < 0)
++            py += ph;
++        px = (x - xorg) % pw;
++        if (px < 0)
++            px += pw;
++
++        if (tiled)
++        {
++            trow = (unsigned short *)((char *) pPat->devPrivate.ptr + (long) py * pstride);
++            for (; w > 0; w -= n, p += n, px = 0)
++            {
++                n = pw - px;
++                if (n > w)
++                    n = w;
++                if (alu == GXcopy)
++                    copyRun(p, trow + px, n);
++                else
++                    ropRun(p, trow + px, n, alu);
++            }
++        }
++        else
++        {
++            srow = (unsigned char *) pPat->devPrivate.ptr + (long) py * pstride;
++            for (; w > 0; w--, p++)
++            {
++                if (srow[px >> 3] & (0x80 >> (px & 7)))
++                {
++                    if (alu == GXcopy)
++                        *p = fg;
++                    else
++                        ropRun(p, &fg, 1, alu);
++                }
++                else if (opaque)
++                {
++                    if (alu == GXcopy)
++                        *p = bg;
++                    else
++                        ropRun(p, &bg, 1, alu);
++                }
++                if (++px == pw)
++                    px = 0;
++            }
++        }
++    }
++
++    DEALLOCATE_LOCAL(clippedWidths);
++    DEALLOCATE_LOCAL(clippedPts);
++}
++
+ /*
+ ** ZZ9000SetSpans - write packed 16-bit pixel data to the framebuffer.
+ **
+diff --git a/programs/Xserver/hw/amix/rtg/zz9000/zz9000screen.c b/programs/Xserver/hw/amix/rtg/zz9000/zz9000screen.c
+index 0aa8111..d92473e 100644
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000screen.c
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000screen.c
+@@ -11,7 +11,7 @@
+ **
+ ** Drawing ops installed in ValidateGC:
+ **   FillSolid        -> ZZ9000FillSpans / ZZ9000SolidRect  (ZZ9000draw.c)
+-**   Tile/Stipple     -> ZZ9000FillSpans as solid fallback  (TODO proper impls)
++**   Tile/Stipple     -> ZZ9000PatternSpans, rectangles through mi
+ **   CopyArea         -> ZZ9000CopyArea                     (ZZ9000draw.c)
+ **   Lines/poly/arcs  -> mi layer (miZeroLine, miPolyArc ...)
+ **   Text             -> mi layer (miPolyText8, miImageText8 ...)
+@@ -60,6 +60,7 @@ static void ZZ9000pixValidateGC();
+ 
+ /* ZZ9000draw.c */
+ extern void      ZZ9000FillSpans();
++extern void      ZZ9000PatternSpans();
+ extern void      ZZ9000SetSpans();
+ extern RegionPtr ZZ9000CopyArea();
+ extern void      ZZ9000CopyWindow();
+@@ -290,7 +291,9 @@ DrawablePtr   pDraw;
+         }
+     }
+ 
+-    pGC->ops->FillSpans     = ZZ9000FillSpans;  /* solid; tile/stip: TODO */
++    /* solid fills direct; tiles and stipples through ZZ9000PatternSpans */
++    pGC->ops->FillSpans     = (pGC->fillStyle == FillSolid) ? ZZ9000FillSpans
++                                                            : ZZ9000PatternSpans;
+     pGC->ops->SetSpans      = ZZ9000SetSpans;
+     pGC->ops->PutImage      = miPutImage;
+     pGC->ops->CopyArea      = ZZ9000CopyArea;
+@@ -301,7 +304,8 @@ DrawablePtr   pDraw;
+     pGC->ops->PolyRectangle = miPolyRectangle;
+     pGC->ops->PolyArc       = miPolyArc;
+     pGC->ops->FillPolygon   = miFillPolygon;
+-    pGC->ops->PolyFillRect  = ZZ9000SolidRect;
++    pGC->ops->PolyFillRect  = (pGC->fillStyle == FillSolid) ? ZZ9000SolidRect
++                                                            : miPolyFillRect;
+     pGC->ops->PolyFillArc   = miPolyFillArc;
+     pGC->ops->PolyText8     = miPolyText8;
+     pGC->ops->PolyText16    = miPolyText16;
+@@ -323,8 +327,8 @@ DrawablePtr   pDraw;
+ ** the appropriate ops:
+ **
+ **   FillSolid  -> ZZ9000FillSpans / ZZ9000SolidRect
+-**   FillTiled  -> ZZ9000FillSpans as solid fallback (TODO: real tile ops)
+-**   Stipple    -> ZZ9000FillSpans as solid fallback (TODO: real stip ops)
++**   FillTiled  -> ZZ9000PatternSpans (rectangles and polygons through mi)
++**   Stipple    -> ZZ9000PatternSpans
+ **   Lines      -> miZeroLine (zero-width) / miWideLine (wide)
+ **   Everything else -> mi
+ */
+@@ -407,7 +411,7 @@ DrawablePtr   pDraw;
+ #endif
+     pGC->ops->SetSpans   = ZZ9000SetSpans;
+ 
+-    /* Fill ops - tile/stipple fall back to solid colour (TODO) */
++    /* Fill ops: solid direct, tile/stipple spans through ZZ9000PatternSpans */
+     switch (pGC->fillStyle)
+     {
+     case FillSolid:
+@@ -419,8 +423,7 @@ DrawablePtr   pDraw;
+         break;
+ 
+     case FillTiled:
+-        /* TODO: implement ZZ9000FillTileSpans; using solid as placeholder */
+-        pGC->ops->FillSpans    = ZZ9000FillSpans;
++        pGC->ops->FillSpans    = ZZ9000PatternSpans;
+         pGC->ops->FillPolygon  = miFillPolygon;
+         pGC->ops->PolyFillRect = miPolyFillRect;
+         pGC->ops->PushPixels   = miPushPixels;
+@@ -429,8 +432,7 @@ DrawablePtr   pDraw;
+ 
+     case FillStippled:
+     case FillOpaqueStippled:
+-        /* TODO: implement ZZ9000FillStipSpans; using solid as placeholder */
+-        pGC->ops->FillSpans    = ZZ9000FillSpans;
++        pGC->ops->FillSpans    = ZZ9000PatternSpans;
+         pGC->ops->FillPolygon  = miFillPolygon;
+         pGC->ops->PolyFillRect = miPolyFillRect;
+         pGC->ops->PushPixels   = miPushPixels;

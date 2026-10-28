@@ -1,0 +1,100 @@
+diff --git a/programs/Xserver/hw/amix/amixKbd.c b/programs/Xserver/hw/amix/amixKbd.c
+index 34f6979..ff76546 100644
+--- a/programs/Xserver/hw/amix/amixKbd.c
++++ b/programs/Xserver/hw/amix/amixKbd.c
+@@ -55,6 +55,24 @@ static char sccsid[] = "%W %G Copyright 1987 Sun Micro";
+ #include "inputstr.h"
+ #include <signal.h>
+ #include <sys/ioctl.h>
++#include <fcntl.h>
++#include <sys/wait.h>
++
++/*
++** The bell: a square wave on /dev/audio, the Amiga's Paula through the
++** AMIX audio driver (one signed 8-bit mono channel per open(); the sample
++** rate is the Paula clock / AUDIO_PERIOD; AUDIO_VOLUME 0..64).  The ioctls
++** have no installed header -- these are usr/sys/amiga/driver/audio.h's, as
++** in libmikmod's drv_amix.c.
++*/
++#define BELL_AUIOC          ('U'<<8)
++#define BELL_AUDIO_VOLUME   (BELL_AUIOC|1)
++#define BELL_AUDIO_PERIOD   (BELL_AUIOC|2)
++#define BELL_PAULA_CLOCK    3546895L    /* PAL */
++#define BELL_PERIOD         256         /* 13855 Hz */
++#define BELL_MAX_MS         2000
++static int bellPitch = 400;             /* Hz; from KeybdCtrl */
++static int bellDuration = 100;          /* ms */
+ 
+ extern CARD8 amixModMap[];
+ extern KeySymsRec amixKeySyms;
+@@ -189,6 +207,60 @@ amixBell (loudness, pKeyboard)
+     int	    	  loudness;	    /* Percentage of full volume */
+     DevicePtr	  pKeyboard;	    /* Keyboard to ring */
+ {
++    /*
++    ** Played by a grandchild: the audio driver's close() waits until the
++    ** sound has played out, and the server must not wait on Paula.  The
++    ** child exits at once (reaped here, no zombie); the grandchild belongs
++    ** to init.  A busy /dev/audio (mikmod playing) just means no beep.
++    */
++    pid_t pid;
++    int   status;
++
++    if (loudness <= 0 || bellDuration <= 0 || bellPitch <= 0)
++	return;
++    pid = fork();
++    if (pid < 0)
++	return;
++    if (pid > 0) {
++	while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
++	    ;
++	return;
++    }
++    if (fork() != 0)
++	_exit(0);
++    {
++	long  rate = BELL_PAULA_CLOCK / BELL_PERIOD;
++	int   ms = bellDuration > BELL_MAX_MS ? BELL_MAX_MS : bellDuration;
++	long  n = rate * ms / 1000, i, half, done;
++	int   period = BELL_PERIOD, volume = loudness * 64 / 100;
++	int   fd;
++	char *buf;
++
++	setsid();
++	fd = open("/dev/audio", O_WRONLY);
++	if (fd < 0)
++	    _exit(0);
++	half = rate / (2 * bellPitch);
++	if (half < 1)
++	    half = 1;
++	buf = (char *) Xalloc(n > 0 ? n : 1);
++	if (!buf)
++	    _exit(0);
++	for (i = 0; i < n; i++)
++	    buf[i] = ((i / half) & 1) ? -96 : 96;
++	if (volume < 1)
++	    volume = 1;
++	(void) ioctl(fd, BELL_AUDIO_PERIOD, &period);
++	(void) ioctl(fd, BELL_AUDIO_VOLUME, &volume);
++	for (done = 0; done < n; ) {
++	    long k = n - done > 8192 ? 8192 : n - done;  /* driver buffer cap */
++	    if (write(fd, buf + done, k) != k)
++		break;
++	    done += k;
++	}
++	close(fd);              /* waits until it has played */
++	_exit(0);
++    }
+ }
+ 
+ /*-
+@@ -210,6 +282,9 @@ amixKbdCtrl (pKeyboard, ctrl)
+     DevicePtr	  pKeyboard;	    /* Keyboard to alter */
+     KeybdCtrl     *ctrl;
+ {
++    /* the bell's pitch and duration (xset b, the Style Manager's Beep) */
++    bellPitch = ctrl->bell_pitch;
++    bellDuration = ctrl->bell_duration;
+ }
+ 
+ 

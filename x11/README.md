@@ -30,6 +30,25 @@
 - `patches/rt10-console-keyboard.patch` — RT-10: when the server ends, it hands the screen
   manager's keyboard selection back to the console (SIOCBACK). Before this, typing on the console
   went nowhere after every RTG X session; a `kill -9` of the server still loses it.
+- `patches/rt11-*.patch` … `rt18-*.patch` — applied in name order after rt10, for the
+  A3000 + Z3660 060 setup (soft3D, CDE):
+  - `rt11-gc-trace-debug.patch` — the per-GC trace lines only with `-DZZ9000_DEBUG`.
+  - `rt12-copywindow-order.patch` — CopyWindow chose the box order the wrong way round, so
+    partly covered windows smeared on every move; it now walks the boxes as CopyArea does.
+  - `rt13-paintwindow-tile.patch` — PaintWindow filled pixmap backgrounds and borders with the
+    tile's first pixel; tiled backdrops (every CDE backdrop) now draw as tiles.
+  - `rt14-pattern-fill.patch` — FillTiled, FillStippled and FillOpaqueStippled spans were solid
+    fills; tiled and stippled rectangles (Motif's insensitive shading) now draw correctly.
+  - `rt15-bell.patch` — the keyboard bell: a short square wave on `/dev/audio` (CDE's beep
+    settings, ^G). It was an empty stub.
+  - `rt16-putimage-move16.patch` — PutImage of a 16-bit ZPixmap under GXcopy goes straight into
+    the drawable, the aligned middle of each row with move16 (a 512x320 MIT-SHM image swap went
+    from 43 ms toward 13 ms).
+  - `rt17-soft3d-swap.patch` — the ZZ9K-SOFT3D extension: a 3D client draws into off-screen
+    VRAM with the Z3660's soft3D, and the server copies the frame into its window through the
+    window's clip list with the card's blitter, so menus and overlapping windows stay intact.
+  - `rt18-mit-shm.patch` — MIT-SHM on in `amix.cf`. Needs the 68040/68060 port kernel with its
+    shared-memory fixes (ISSUE-62/66).
 - `rtg-kbdback.c` — RT-11: gives the console its keyboard back after a server that died without
   cleaning up (`kill -9`). It opens its own screen, selects it (`SIOCACTIVATE`), sends it to the
   back (`SIOCBACK`), and closes it. startx-rtg runs it from its exit trap, and only when the server

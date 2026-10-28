@@ -1,0 +1,15 @@
+diff --git a/config/cf/amix.cf b/config/cf/amix.cf
+index fb1029b..8238821 100644
+--- a/config/cf/amix.cf
++++ b/config/cf/amix.cf
+@@ -39,8 +39,8 @@ XCOMM operating system: OSName OSVendor
+ #define SharedDataSeparation YES
+ #define SharedCodeDef -DSHAREDCODE
+ #define SharedLibraryDef -DSUNSHLIB
+-/* MIT-SHM is independent of shared libraries and is unsafe on AMIX. */
+-#define HasShm NO
++/* MIT-SHM: safe since the port kernel's ISSUE-62/66 shm fixes */
++#define HasShm YES
+ #define CcCmd gcc
+ #define ServerCcCmd gcc
+ #define DefaultCCOptions -ansi -finline-functions
