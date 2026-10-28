@@ -126,6 +126,9 @@
 #define ZZ9K_CONSOLE_TEST      2
 #define ZZ9K_CONSOLE_REDIRECT  3
 #define ZZ9K_CONSOLE_MIRROR    ZZ9K_CONSOLE_REDIRECT
+/* ZZ9K_CONSOLE_QUERY changes nothing; the ioctl returns the state as one of
+ * ZZ9K_CONSOLE_DISABLE, _ENABLE or _REDIRECT (startx-z3 restores it after X) */
+#define ZZ9K_CONSOLE_QUERY     4
 
 
 struct zz9k_autocon_entry {

@@ -499,6 +499,18 @@ char **argv;
         close(fd);
         return 0;
     }
+    if (argc > 2 && streq(argv[2], "constate")) {
+        /* prints off, on or redirect -- for scripts (startx-z3) */
+        rc = ioctl(fd, ZZ9KIOC_CONSOLE, ZZ9K_CONSOLE_QUERY);
+        close(fd);
+        if (rc < 0) {
+            perror("ZZ9KIOC_CONSOLE query");
+            return 1;
+        }
+        printf("%s\n", rc == ZZ9K_CONSOLE_REDIRECT ? "redirect" :
+            rc == ZZ9K_CONSOLE_ENABLE ? "on" : "off");
+        return 0;
+    }
     if (argc > 2 && streq(argv[2], "consoletest")) {
         rc = ioctl(fd, ZZ9KIOC_CONSOLE, ZZ9K_CONSOLE_TEST);
         if (rc < 0) {

@@ -2276,6 +2276,11 @@ int *rvalp;
             printf("%s console redirect enabled\n", bp->bt->name);
             break;
         }
+        if (arg == ZZ9K_CONSOLE_QUERY) {
+            *rvalp = !zz9k_console_on ? ZZ9K_CONSOLE_DISABLE :
+                zz9k_console_redirect ? ZZ9K_CONSOLE_REDIRECT : ZZ9K_CONSOLE_ENABLE;
+            break;
+        }
         if (arg == ZZ9K_CONSOLE_TEST) {
             error = zz9k_console_test(bp);
             if (error)
