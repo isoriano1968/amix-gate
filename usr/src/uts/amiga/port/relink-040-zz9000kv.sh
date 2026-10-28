@@ -29,7 +29,10 @@ cp "$RTG/zz9000.c" "$RTG/zz9000.h" "$Z/amiga/driver/zz9000/"
 ln -s "$AMIX_ROOT/usr/sys/amiga/console" "$Z/amiga/console"
 CF=$(echo "$AMIX_KERNEL_CFLAGS" | sed 's/-m68020/-m68040/')
 echo "[*] cross-compiling zz9000.c (ZZ9K_TARGET_Z3660, ZZ9K_KVMAP: board above 1 GB mapped via dev_kvmap)"
-(cd "$Z/amiga/driver/zz9000" && m68k-cbm-sysv4-gcc $CF -DZZ9K_TARGET_Z3660 -DZZ9K_KVMAP \
+# ZZ9K_CFLAGS: optional extra driver defines, e.g. -DZZ9K_FB_NC (framebuffer
+# registered noncacheable-not-serialised, for the 68060 store buffer)
+[ -n "$ZZ9K_CFLAGS" ] && echo "[*] extra driver flags: $ZZ9K_CFLAGS"
+(cd "$Z/amiga/driver/zz9000" && m68k-cbm-sysv4-gcc $CF -DZZ9K_TARGET_Z3660 -DZZ9K_KVMAP $ZZ9K_CFLAGS \
 	-I"$AMIX_ROOT/usr/sys/amiga/inc" -c zz9000.c -o "$HERE/build/zz9000_040.o")
 $NM "$HERE/build/zz9000_040.o" | grep -qE ' U dev_kvmap$' \
 	|| { echo "[FAIL] zz9000_040.o does not import dev_kvmap -- built without -DZZ9K_KVMAP?"; exit 1; }

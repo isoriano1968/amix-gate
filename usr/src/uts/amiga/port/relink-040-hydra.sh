@@ -26,8 +26,10 @@ cp "$SRC/hydra.c" "$SRC/hydra.h" "$SRC/hydrauser.h" "$SRC/ne2000.h" "$B/"
 python3 - "$B/hydra.c" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
-a = s.find("    /* Method 2: Direct PROM probe at Zorro II I/O slots")
-b = s.find('    cmn_err(CE_NOTE, "hydra: no board found");')
+# the raw probe: from the comment line of probe method 2 (the direct PROM
+# probe) up to the line that reports no board found -- short markers
+a = s.rfind("\n", 0, s.find("/* Method 2: Direct PROM")) + 1
+b = s.rfind("\n", 0, s.find('"hydra: no board found"')) + 1
 if a < 0 or b < 0 or b < a or "HYDRA_AUTOCON_ONLY" in s[:a]:
     sys.exit("[FAIL] hydra.c: raw-probe block not found as expected")
 s = s[:a] + "#ifndef HYDRA_AUTOCON_ONLY\n" + s[a:b] + "#endif /* HYDRA_AUTOCON_ONLY */\n" + s[b:]

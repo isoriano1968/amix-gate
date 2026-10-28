@@ -2,9 +2,9 @@
 | integration/c1-console.txt), for a 68040/68060 kernel built by
 | relink-040-c1hook.sh.
 |
-| The hook belongs at the top of scrcon_put() in amiga/console/c1.c:
-|     if (sp == displayedscreen && zz9000consolewrite(p, n))
-|         return;
+| The hook belongs at the top of scrcon_put() in amiga/console/c1.c: for the
+| screen on display, zz9000consolewrite() is offered the text first, and when
+| it takes it, scrcon_put() returns without drawing.
 | A linked image cannot take a recompiled c1.o, so scrcon_put is weakened,
 | the stock body stays reachable as scrcon_put_stock, and this wrapper runs
 | first.  cp->screen is at offset 8 of struct console (flags, pad0, tty,
