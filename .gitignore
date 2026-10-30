@@ -1,0 +1,16 @@
+# fetched or built locally
+/ffmpeg-4.4.8/
+/build-arm/
+/src/
+/build/arm/
+/build/host/
+/build/amix/
+/build/amix-tools/
+/zzgl/gen/
+cores/*/build/
+*.o
+*.a
+*.bin
+*.elf
+*.map
+*.log

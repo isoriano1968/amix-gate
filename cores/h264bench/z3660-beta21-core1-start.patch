@@ -1,0 +1,29 @@
+diff --git a/z3660-firmware/Z-TURN/vitis_ide/Z3660/src/main.c b/z3660-firmware/Z-TURN/vitis_ide/Z3660/src/main.c
+index b1abe4f..418b17f 100644
+--- a/z3660-firmware/Z-TURN/vitis_ide/Z3660/src/main.c
++++ b/z3660-firmware/Z-TURN/vitis_ide/Z3660/src/main.c
+@@ -1775,6 +1775,24 @@ int main()
+    usb_read_pending = 0;
+    usb_write_pending = 0;
+ 
++   // h264bench (vplay-amix arm/h264bench): with a real 060, core 1 is idle; a test image
++   // loaded at 0x38000000 starts with the mark "H264" and its entry. It touches neither the
++   // bus nor the 68k, only board memory, and answers the same handshake as the emulator.
++#define H264BENCH_BASE 0x38000000
++   if(emu!=1 && *(volatile uint32_t *)H264BENCH_BASE==0x48323634)
++   {
++      volatile uint32_t *ack=(volatile uint32_t *)0xFFFF0000;
++      printf("Starting h264bench on Core1 at 0x%08lX\n",*(volatile uint32_t *)(H264BENCH_BASE+4));
++      *ack=1;
++      *(volatile uint32_t *)(0xFFFFFFF0)=*(volatile uint32_t *)(H264BENCH_BASE+4);
++      Xil_DCacheFlush();
++      Xil_ICacheInvalidate();
++      __asm__("sev");
++      for(int i=0;i<1000 && *ack==1;i++)
++         xc3_usleep(1000);
++      printf(*ack==1?"h264bench: no answer from Core1\n":"h264bench: Core1 runs\n");
++   }
++
+    if(emu==1) // EMUs
+    {
+       configure_clk(config.cpufreq,1,1);
