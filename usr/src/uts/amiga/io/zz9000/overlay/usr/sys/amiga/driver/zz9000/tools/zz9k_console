@@ -6,7 +6,25 @@
 # It deliberately does not participate in early kernel boot.
 
 DEV=${ZZ9K_DEV-/dev/zz9000}
-ZZ9K_TEST=${ZZ9K_TEST-/usr/amiga/bin/zz9k_test}
+# Find zz9k_test without depending on where these tools were installed:
+# $ZZ9K_TEST first, then this script's own directory, then the two
+# conventional places (upstream's /usr/amiga/bin and the demo card's
+# /opt/amix/bin).  A script that hardcodes one of them breaks on a machine
+# that chose the other, which is exactly what happened on the demo card.
+mydir=`dirname "$0" 2>/dev/null`
+if [ -z "$mydir" ]; then
+	mydir=.
+fi
+for c in "$ZZ9K_TEST" "$mydir/zz9k_test" /usr/amiga/bin/zz9k_test /opt/amix/bin/zz9k_test; do
+	if [ -n "$c" ] && [ -x "$c" ]; then
+		ZZ9K_TEST=$c
+		break
+	fi
+done
+if [ ! -x "$ZZ9K_TEST" ]; then
+	echo "`basename $0`: cannot find zz9k_test (set ZZ9K_TEST)" >&2
+	exit 1
+fi
 
 case "$1" in
 ''|start|redirect)

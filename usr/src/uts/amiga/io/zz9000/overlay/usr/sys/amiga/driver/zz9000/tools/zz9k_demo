@@ -1,0 +1,58 @@
+#!/bin/sh
+#
+# zz9k_demo - the no-X demonstration sequence on /dev/zz9000.
+#
+#   zz9k_demo [device] [hold-seconds] [resolution]
+#
+# Shows, in order: the RGB565 test bars, the CPU fill/copy test, and the
+# driver's framebuffer console test page, each held for HOLD seconds through
+# ZZ9K_HOLD -- so this script REQUIRES a zz9k_test that understands that
+# variable (2026-09-18 or later).  An older one ignores it and waits for a
+# newline on stdin instead, which never arrives over a telnet session.  Runs
+# after the system is up; it never touches the boot console.
+#
+# The framebuffer is mapped in one piece and is larger than the default
+# per-process memory limit of the login shell (16 MB), so the limit is
+# raised here for the tool alone.
+
+DEV=${1-/dev/zz9000}
+HOLD=${2-20}
+RES=${3-1920x1080}
+# Find zz9k_test without depending on where these tools were installed:
+# $ZZ9K_TEST first, then this script's own directory, then the two
+# conventional places (upstream's /usr/amiga/bin and the demo card's
+# /opt/amix/bin).  A script that hardcodes one of them breaks on a machine
+# that chose the other, which is exactly what happened on the demo card.
+mydir=`dirname "$0" 2>/dev/null`
+if [ -z "$mydir" ]; then
+	mydir=.
+fi
+for c in "$ZZ9K_TEST" "$mydir/zz9k_test" /usr/amiga/bin/zz9k_test /opt/amix/bin/zz9k_test; do
+	if [ -n "$c" ] && [ -x "$c" ]; then
+		ZZ9K_TEST=$c
+		break
+	fi
+done
+if [ ! -x "$ZZ9K_TEST" ]; then
+	echo "`basename $0`: cannot find zz9k_test (set ZZ9K_TEST)" >&2
+	exit 1
+fi
+
+ulimit -v 131072 2>/dev/null || ulimit -m 131072 2>/dev/null
+
+if [ ! -r "$DEV" ]; then
+	echo "zz9k_demo: $DEV not found"
+	exit 1
+fi
+
+ZZ9K_HOLD=$HOLD
+export ZZ9K_HOLD
+
+echo "zz9k_demo: bars $RES for $HOLD s"
+$ZZ9K_TEST $DEV 16 $RES || exit 1
+echo "zz9k_demo: fill/copy $RES for $HOLD s"
+$ZZ9K_TEST $DEV blit $RES || exit 1
+echo "zz9k_demo: console test page for $HOLD s"
+$ZZ9K_TEST $DEV console || exit 1
+echo "zz9k_demo: done"
+exit 0
