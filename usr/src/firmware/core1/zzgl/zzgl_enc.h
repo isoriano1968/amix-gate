@@ -25,6 +25,9 @@ int zzgl_open(const struct zzgl_transport *t, int w, int h, int depth, int stenc
    the picture's top, its size, double buffering by core 0) */
 void zzgl_overlay(uint32_t pitch, uint32_t row0, uint32_t maxw, uint32_t maxh, int dbuf);
 void zzgl_swap(void);
+/* instead of drawing and swapping: core 1 computes the frame for this time;
+   beat: 0 to 1 within the music's beat */
+void zzgl_effect(float time, float beat);
 void zzgl_flush(void);
 void zzgl_close(void);
 void *zzgl_GetProcAddress(const char *name);

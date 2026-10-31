@@ -832,16 +832,33 @@ zzgl_overlay(uint32_t pitch, uint32_t row0, uint32_t maxw, uint32_t maxh, int db
 }
 
 /* the frame: shown when core 1 gets there; waits only for the frame before */
-void
-zzgl_swap(void)
-{
-   static uint32_t sent;
+static uint32_t sent;
 
-   cmd(ZZ_SWAP, 0);
+/* at most one frame in hand on core 1 */
+static void
+frame_sent(void)
+{
    zzgl_flush();
    sent++;
    while ((int32_t)(sent - blk_get(ZB_FRAMES)) > 1)
       T->wait();
+}
+
+void
+zzgl_swap(void)
+{
+   cmd(ZZ_SWAP, 0);
+   frame_sent();
+}
+
+void
+zzgl_effect(float time, float beat)
+{
+   uint32_t *p = cmd(ZZ_EFFECT, 8);
+
+   p[0] = bef(time);
+   p[1] = bef(beat);
+   frame_sent();
 }
 
 void

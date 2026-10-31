@@ -26,8 +26,10 @@ static void copy(void *dst, const void *src, size_t n) { memcpy(dst, src, n); }
 
 static void present(const void *rgba, int w, int h);
 
+void spook_frame(uint32_t *fb, int w, int h, float time, float beat);
+
 static const struct zzgl_dec_env env = {
-   blk, NULL, NULL, copy, copy, present, NULL, NULL, NULL
+   blk, NULL, NULL, copy, copy, present, NULL, NULL, NULL, spook_frame
 };
 static struct zzgl_dec_env denv;
 

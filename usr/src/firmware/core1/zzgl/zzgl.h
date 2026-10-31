@@ -125,6 +125,8 @@ enum {
    ZQ_ISENABLED
 };
 
+#define ZZ_EFFECT 1000           /* time, beat (floats): core 1 draws a frame itself (spook.c) and shows it */
+
 /* ZZ_DRAW's arrays: a word of flags, then per array in this order
    size, type, element count, bytes (padded to 4) */
 enum { ZA_VERTEX, ZA_COLOR, ZA_NORMAL, ZA_TEX0, ZA_TEX1, ZA_N };

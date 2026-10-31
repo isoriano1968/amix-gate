@@ -19,6 +19,7 @@ struct zzgl_dec_env {
    void (*overlay)(uint32_t pitch, uint32_t row0, uint32_t maxw, uint32_t maxh, int dbuf);
    void (*idle)(void);          /* the ring is empty */
    void (*tick)(void);          /* every 4 commands, or NULL */
+   void (*effect)(uint32_t *fb, int w, int h, float time, float beat);     /* ZZ_EFFECT, or NULL */
 };
 
 void zzgl_dec_init(const struct zzgl_dec_env *env);

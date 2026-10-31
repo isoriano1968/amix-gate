@@ -119,6 +119,24 @@ int main(int argc, char **argv)
         }
         return 0;
     }
+    if (argc > 2 && !strcmp(argv[1], "-hdmi")) {
+        /* what the HDMI plays and the stream, as they are now, into a file */
+        const char *hd = (const char *)mmap(0, 0x8000, PROT_READ, MAP_SHARED, fd, (off_t)(ZZGL_HDMI_OFF - FB_PHYS));
+        const char *st = (const char *)mmap(0, ZZGL_SND_SIZE, PROT_READ, MAP_SHARED, fd, (off_t)(ZZGL_SND_OFF - FB_PHYS));
+        FILE *o = fopen(argv[2], "wb");
+        unsigned long pos = b[ZB_SND_POS], wr = b[ZB_SND_WR];
+
+        if (!o || hd == (void *)-1 || st == (void *)-1) {
+            perror("zzglstat -hdmi");
+            return 1;
+        }
+        fwrite(&pos, 4, 1, o);
+        fwrite(&wr, 4, 1, o);
+        fwrite(hd, 1, ZZGL_HDMI_SIZE, o);
+        fwrite(st, 1, ZZGL_SND_SIZE, o);
+        fclose(o);
+        return 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "-snd")) {
         /* the sound: positions, and how much of the stream and of the HDMI
            ring is not silence */

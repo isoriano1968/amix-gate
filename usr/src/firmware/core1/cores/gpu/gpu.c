@@ -147,7 +147,8 @@ static void present(const void *rgba, int w, int h)
 static struct {
     int on, div;
     uint32_t dma_last;
-    uint64_t dma_abs, wr_abs;                   /* HDMI bytes */
+    uint64_t dma_abs, wr_abs;                   /* HDMI bytes, multiples of the ring are its place */
+    uint64_t start;                             /* dma_abs at time 0 */
     unsigned long long last_us;
 } snd;
 
@@ -164,11 +165,11 @@ static void snd_fill(uint64_t abs, uint32_t n)
 
     for (k = 0; k < frames; k++) {
         const uint64_t f = abs / 4 + k;                         /* HDMI frame */
-        const uint64_t sf = f / (uint64_t)snd.div;              /* stream frame */
+        const uint64_t sf = (f - snd.start / 4) / (uint64_t)snd.div;    /* stream frame */
         const uint32_t i = (uint32_t)(sf % ZZGL_SND_FRAMES) * 2;
         int l = (int16_t)__builtin_bswap16(st[i]), r = (int16_t)__builtin_bswap16(st[i + 1]);
 
-        if (snd.div == 2 && (f & 1)) {                          /* halfway to the next one */
+        if (snd.div == 2 && ((f - snd.start / 4) & 1)) {                          /* halfway to the next one */
             const uint32_t j = (uint32_t)((sf + 1) % ZZGL_SND_FRAMES) * 2;
 
             l = (l + (int16_t)__builtin_bswap16(st[j])) / 2;
@@ -198,13 +199,14 @@ static void snd_service(void)
         snd.on = 1;
         snd.div = div;
         snd.dma_last = pos;
-        snd.dma_abs = 0;
-        snd.wr_abs = 0;
+        /* the DMA is somewhere in the ring already, core 0 started it: count
+           from where it is, or the samples land beside what it plays */
+        snd.dma_abs = snd.wr_abs = snd.start = pos;
         bput(ZB_SND_UNDER, 0);
     }
     snd.dma_abs += pos >= snd.dma_last ? pos - snd.dma_last : ZZGL_HDMI_SIZE - snd.dma_last + pos;
     snd.dma_last = pos;
-    bput(ZB_SND_POS, (uint32_t)snd.dma_abs);
+    bput(ZB_SND_POS, (uint32_t)(snd.dma_abs - snd.start));
     if (snd.wr_abs < snd.dma_abs) {             /* the DMA overtook us */
         snd.wr_abs = snd.dma_abs;
         bput(ZB_SND_UNDER, bget(ZB_SND_UNDER) + 1);
@@ -328,6 +330,8 @@ static void samp_stop(void)
     __asm__ volatile("mcr p15, 0, %0, c12, c0, 0\n isb" : : "r"((uint32_t)_vector_table));
 }
 
+void spook_frame(uint32_t *fb, int w, int h, float time, float beat);
+
 int hb_decode(const uint8_t *data, size_t size, int flags, hb_clock clock,
               void (*progress)(uint32_t frames), struct hb_result *r)
 {
@@ -353,6 +357,7 @@ int hb_decode(const uint8_t *data, size_t size, int flags, hb_clock clock,
     env.overlay = overlay;
     env.idle = idle;
     env.tick = tick;
+    env.effect = spook_frame;
     memset(&snd, 0, sizeof(snd));
     /* the cycle counter and event counter 0 = L1 data cache refills (0x03)
        for sp_fast.h's profile */

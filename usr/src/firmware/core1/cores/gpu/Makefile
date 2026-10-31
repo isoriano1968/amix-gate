@@ -46,11 +46,15 @@ $(G)/zzgl/gen/zzgl_gen_dec.h: $(G)/zzgl/zzgl.h $(G)/zzgl/gen.py
 	@mkdir -p $(G)/zzgl/gen
 	python3 -I $(G)/zzgl/gen.py $(G)/zzgl/gen
 
+build/spook.o: $(G)/zzgl/spook.c $(G)/zzgl/spook_font.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -O3 -c $< -o $@
+
 build/armgl_compat.o: $(G)/compat/arm/armgl_compat.c
 	@mkdir -p build
 	$(CC) $(CFLAGS) -I$(G)/compat/arm -c $< -o $@
 
-build/gpu.elf: build/arm_main.o build/gpu.o build/zzgl_dec.o build/armgl_compat.o build/xil-crt0.o $(G)/build/arm/libOSMesa.a
+build/gpu.elf: build/arm_main.o build/gpu.o build/zzgl_dec.o build/spook.o build/armgl_compat.o build/xil-crt0.o $(G)/build/arm/libOSMesa.a
 	$(CXX) $(LDFLAGS) $^ $(LIBS) -o $@
 	$(SIZE) $@
 

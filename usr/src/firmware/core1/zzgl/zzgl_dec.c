@@ -343,6 +343,15 @@ command(uint32_t op, uint32_t n)
       E->present(fb, fb_w, fb_h);
       blk_put(ZB_FRAMES, blk_get(ZB_FRAMES) + 1);
       break;
+   case ZZ_EFFECT:
+      if (E->effect) {
+         E->effect((uint32_t *)fb, fb_w, fb_h, F(0), F(1));
+         E->present(fb, fb_w, fb_h);
+         if (E->tick)
+            E->tick();          /* one command is a whole frame: the sound can't wait for four */
+      }
+      blk_put(ZB_FRAMES, blk_get(ZB_FRAMES) + 1);
+      break;
    case ZZ_OVERLAY:
       if (E->overlay)
          E->overlay(W(0), W(1), W(2), W(3), (int)W(4));
