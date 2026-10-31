@@ -1,0 +1,37 @@
+/* inttypes.h for AMIX (it has none): the PRI/SCN macros Mesa uses */
+#ifndef AMIX_INTTYPES_H
+#define AMIX_INTTYPES_H
+#include <stdint.h>
+/* xbuild.py makes int32_t int; int64_t and intmax_t are long long */
+#define PRId8 "d"
+#define PRIi8 "i"
+#define PRIu8 "u"
+#define PRIx8 "x"
+#define PRId16 "d"
+#define PRIi16 "i"
+#define PRIu16 "u"
+#define PRIx16 "x"
+#define PRId32 "d"
+#define PRIi32 "i"
+#define PRIu32 "u"
+#define PRIx32 "x"
+#define PRIX32 "X"
+#define PRId64 "lld"
+#define PRIi64 "lli"
+#define PRIu64 "llu"
+#define PRIx64 "llx"
+#define PRIX64 "llX"
+#define PRIdPTR "d"
+#define PRIuPTR "u"
+#define PRIxPTR "x"
+#define SCNd32 "d"
+#define SCNu32 "u"
+#define SCNx32 "x"
+#define SCNd64 "lld"
+#define SCNu64 "llu"
+#define SCNx64 "llx"
+#define PRIdMAX "lld"
+#define PRIiMAX "lli"
+#define PRIuMAX "llu"
+#define PRIxMAX "llx"
+#endif

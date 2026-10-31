@@ -1,0 +1,29 @@
+MIT License
+
+Copyright (c) 2026 isoriano1968 and contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+----------------------------------------------------------------------------
+Not covered above, each under its own licence:
+- cores/h264bench/z3660-beta21-core1-start.patch changes the Z3660 firmware: GPLv3.
+- patches/mesa-18.3.6-amix-z3660.patch changes Mesa: Mesa's licences (mainly MIT).
+- Programs built from this tree link FFmpeg (LGPL 2.1 or later) or Mesa, and
+  Xilinx's BSP from the firmware repository, which are not included here.
+- tools/ztop.c and tools/zz9000.h come from amix-z3660rtg: see that project.

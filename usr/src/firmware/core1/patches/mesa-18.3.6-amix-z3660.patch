@@ -1,0 +1,4715 @@
+diff --git a/src/gallium/auxiliary/Makefile.sources b/src/gallium/auxiliary/Makefile.sources
+index b60b25a..3bf3ad2 100644
+--- a/src/gallium/auxiliary/Makefile.sources
++++ b/src/gallium/auxiliary/Makefile.sources
+@@ -55,6 +55,8 @@ C_SOURCES := \
+ 	draw/draw_vertex.h \
+ 	draw/draw_vs.c \
+ 	draw/draw_vs_exec.c \
++	draw/draw_vs_fast.c \
++	draw/draw_vs_fast.h \
+ 	draw/draw_vs.h \
+ 	draw/draw_vs_variant.c \
+ 	driver_ddebug/dd_context.c \
+diff --git a/src/gallium/auxiliary/draw/draw_vs_exec.c b/src/gallium/auxiliary/draw/draw_vs_exec.c
+index 4f11ac7..a3fd712 100644
+--- a/src/gallium/auxiliary/draw/draw_vs_exec.c
++++ b/src/gallium/auxiliary/draw/draw_vs_exec.c
+@@ -38,6 +38,7 @@
+ #include "draw_private.h"
+ #include "draw_context.h"
+ #include "draw_vs.h"
++#include "draw_vs_fast.h"
+ 
+ #include "tgsi/tgsi_parse.h"
+ #include "tgsi/tgsi_scan.h"
+@@ -47,6 +48,7 @@
+ struct exec_vertex_shader {
+    struct draw_vertex_shader base;
+    struct tgsi_exec_machine *machine;
++   struct draw_vs_fast *fast;    /* draw_vs_fast.c, or NULL */
+ };
+ 
+ 
+@@ -102,6 +104,11 @@ vs_exec_run_linear(struct draw_vertex_shader *shader,
+    boolean clamp_vertex_color = shader->draw->rasterizer->clamp_vertex_color;
+ 
+    debug_assert(!shader->draw->llvm);
++   if (evs->fast) {
++      draw_vs_fast_run(evs->fast, input, output, constants, const_size, count,
++                       input_stride, output_stride, clamp_vertex_color);
++      return;
++   }
+    tgsi_exec_set_constant_buffers(machine, PIPE_MAX_CONSTANT_BUFFERS,
+                                   constants, const_size);
+ 
+@@ -207,6 +214,7 @@ vs_exec_run_linear(struct draw_vertex_shader *shader,
+ static void
+ vs_exec_delete(struct draw_vertex_shader *dvs)
+ {
++   draw_vs_fast_destroy(exec_vertex_shader(dvs)->fast);
+    FREE((void*) dvs->state.tokens);
+    FREE(dvs);
+ }
+@@ -237,6 +245,7 @@ draw_create_vs_exec(struct draw_context *draw,
+    vs->base.delete = vs_exec_delete;
+    vs->base.create_variant = draw_vs_create_variant_generic;
+    vs->machine = draw->vs.tgsi.machine;
++   vs->fast = draw_vs_fast_compile(vs->base.state.tokens, &vs->base.info);
+ 
+    return &vs->base;
+ }
+diff --git a/src/gallium/auxiliary/draw/draw_vs_fast.c b/src/gallium/auxiliary/draw/draw_vs_fast.c
+new file mode 100644
+index 0000000..a437cfb
+--- /dev/null
++++ b/src/gallium/auxiliary/draw/draw_vs_fast.c
+@@ -0,0 +1,361 @@
++/*
++ * draw_vs_fast.c -- see draw_vs_fast.h.
++ *
++ * Registers live in one array of float[4]: inputs, temporaries, outputs,
++ * immediates, then the constants of buffer 0 (copied in per run).  The
++ * maths is tgsi_exec's (powf, logf), so the results are the same.
++ */
++#include "draw_vs_fast.h"
++#include "pipe/p_shader_tokens.h"
++#include "tgsi/tgsi_parse.h"
++#include "tgsi/tgsi_scan.h"
++#include "tgsi/tgsi_util.h"
++#include "util/u_debug.h"
++#include "util/u_math.h"
++#include "util/u_memory.h"
++
++#define VSF_MAX_REGS 1024
++
++struct vsf_src {
++   unsigned short reg;
++   unsigned char swz[4];
++   unsigned char neg, abs;
++   unsigned char plain;          /* no swizzle, no modifiers */
++};
++
++struct vsf_op {
++   unsigned short opcode;
++   unsigned char wmask, sat;
++   unsigned short dst;
++   unsigned char nsrc;
++   struct vsf_src src[3];
++};
++
++struct draw_vs_fast {
++   struct vsf_op *ops;
++   unsigned nops;
++   unsigned nregs;
++   unsigned in_base, ninputs;
++   unsigned temp_base;
++   unsigned out_base, noutputs;
++   unsigned imm_base;
++   unsigned const_base, nconsts;
++   boolean out_color[PIPE_MAX_SHADER_OUTPUTS];
++   float (*init)[4];             /* immediates, set once */
++};
++
++static boolean
++op_supported(unsigned opcode, unsigned *nsrc)
++{
++   switch (opcode) {
++   case TGSI_OPCODE_MOV: case TGSI_OPCODE_RSQ: case TGSI_OPCODE_RCP: case TGSI_OPCODE_SQRT:
++   case TGSI_OPCODE_FLR: case TGSI_OPCODE_FRC: case TGSI_OPCODE_EX2: case TGSI_OPCODE_LG2:
++   case TGSI_OPCODE_LIT:
++      *nsrc = 1;
++      return TRUE;
++   case TGSI_OPCODE_ADD: case TGSI_OPCODE_MUL: case TGSI_OPCODE_DP2: case TGSI_OPCODE_DP3:
++   case TGSI_OPCODE_DP4: case TGSI_OPCODE_MAX: case TGSI_OPCODE_MIN: case TGSI_OPCODE_SLT:
++   case TGSI_OPCODE_SGE: case TGSI_OPCODE_SEQ: case TGSI_OPCODE_SNE: case TGSI_OPCODE_POW:
++      *nsrc = 2;
++      return TRUE;
++   case TGSI_OPCODE_MAD: case TGSI_OPCODE_LRP: case TGSI_OPCODE_CMP:
++      *nsrc = 3;
++      return TRUE;
++   default:
++      return FALSE;
++   }
++}
++
++struct draw_vs_fast *
++draw_vs_fast_compile(const struct tgsi_token *tokens, const struct tgsi_shader_info *info)
++{
++   struct draw_vs_fast *p;
++   struct tgsi_parse_context parse;
++   unsigned i, nimm = 0, max_ops, ntemps, nconsts;
++   boolean ok = TRUE;
++
++   if (debug_get_bool_option("DRAW_NO_FAST_VS", FALSE))
++      return NULL;
++   if (info->num_system_values || info->indirect_files || info->uses_kill ||
++       info->file_max[TGSI_FILE_SAMPLER] >= 0 || info->file_max[TGSI_FILE_SAMPLER_VIEW] >= 0 ||
++       info->file_max[TGSI_FILE_ADDRESS] >= 0 || info->num_outputs > PIPE_MAX_SHADER_OUTPUTS ||
++       info->const_buffers_declared > 1)
++      return NULL;
++
++   ntemps = info->file_max[TGSI_FILE_TEMPORARY] + 1;
++   nconsts = info->file_max[TGSI_FILE_CONSTANT] + 1;
++   max_ops = info->num_instructions;
++
++   p = CALLOC_STRUCT(draw_vs_fast);
++   if (!p)
++      return NULL;
++   p->ninputs = info->num_inputs;
++   p->noutputs = info->num_outputs;
++   p->in_base = 0;
++   p->temp_base = p->in_base + MAX2(p->ninputs, info->file_max[TGSI_FILE_INPUT] + 1);
++   p->out_base = p->temp_base + ntemps;
++   p->imm_base = p->out_base + MAX2(p->noutputs, info->file_max[TGSI_FILE_OUTPUT] + 1);
++   p->const_base = p->imm_base + info->immediate_count;
++   p->nconsts = nconsts;
++   p->nregs = p->const_base + nconsts;
++   p->ops = CALLOC(max_ops ? max_ops : 1, sizeof(*p->ops));
++   p->init = CALLOC(p->nregs, sizeof(*p->init));
++   if (!p->ops || !p->init || p->nregs > VSF_MAX_REGS) {
++      draw_vs_fast_destroy(p);
++      return NULL;
++   }
++   for (i = 0; i < p->noutputs; i++)
++      p->out_color[i] = info->output_semantic_name[i] == TGSI_SEMANTIC_COLOR ||
++                        info->output_semantic_name[i] == TGSI_SEMANTIC_BCOLOR;
++
++   tgsi_parse_init(&parse, tokens);
++   while (ok && !tgsi_parse_end_of_tokens(&parse)) {
++      tgsi_parse_token(&parse);
++      switch (parse.FullToken.Token.Type) {
++      case TGSI_TOKEN_TYPE_IMMEDIATE: {
++         const struct tgsi_full_immediate *imm = &parse.FullToken.FullImmediate;
++         unsigned c;
++
++         if (imm->Immediate.DataType != TGSI_IMM_FLOAT32 || nimm >= info->immediate_count) {
++            ok = FALSE;
++            break;
++         }
++         for (c = 0; c < imm->Immediate.NrTokens - 1 && c < 4; c++)
++            p->init[p->imm_base + nimm][c] = imm->u[c].Float;
++         nimm++;
++         break;
++      }
++      case TGSI_TOKEN_TYPE_INSTRUCTION: {
++         const struct tgsi_full_instruction *inst = &parse.FullToken.FullInstruction;
++         struct vsf_op *op;
++         unsigned nsrc, s, c;
++
++         if (inst->Instruction.Opcode == TGSI_OPCODE_END)
++            break;
++         if (!op_supported(inst->Instruction.Opcode, &nsrc) || inst->Instruction.NumDstRegs != 1 ||
++             inst->Instruction.NumSrcRegs != nsrc || inst->Instruction.Saturate > 1 ||
++             inst->Dst[0].Register.Indirect || inst->Dst[0].Register.Dimension ||
++             p->nops >= max_ops) {
++            ok = FALSE;
++            break;
++         }
++         op = &p->ops[p->nops++];
++         op->opcode = inst->Instruction.Opcode;
++         op->sat = inst->Instruction.Saturate;
++         op->wmask = inst->Dst[0].Register.WriteMask;
++         op->nsrc = nsrc;
++         switch (inst->Dst[0].Register.File) {
++         case TGSI_FILE_TEMPORARY: op->dst = p->temp_base + inst->Dst[0].Register.Index; break;
++         case TGSI_FILE_OUTPUT: op->dst = p->out_base + inst->Dst[0].Register.Index; break;
++         default: ok = FALSE;
++         }
++         for (s = 0; ok && s < nsrc; s++) {
++            const struct tgsi_full_src_register *src = &inst->Src[s];
++            struct vsf_src *d = &op->src[s];
++            const int idx = src->Register.Index;
++
++            if (src->Register.Indirect ||
++                (src->Register.Dimension && (src->Dimension.Indirect || src->Dimension.Index != 0))) {
++               ok = FALSE;
++               break;
++            }
++            switch (src->Register.File) {
++            case TGSI_FILE_INPUT: d->reg = p->in_base + idx; break;
++            case TGSI_FILE_TEMPORARY: d->reg = p->temp_base + idx; break;
++            case TGSI_FILE_OUTPUT: d->reg = p->out_base + idx; break;
++            case TGSI_FILE_IMMEDIATE: d->reg = p->imm_base + idx; break;
++            case TGSI_FILE_CONSTANT: d->reg = p->const_base + idx; break;
++            default: ok = FALSE;
++            }
++            for (c = 0; c < 4; c++)
++               d->swz[c] = (unsigned char)tgsi_util_get_full_src_register_swizzle(src, c);
++            d->neg = src->Register.Negate;
++            d->abs = src->Register.Absolute;
++            d->plain = !d->neg && !d->abs && d->swz[0] == 0 && d->swz[1] == 1 && d->swz[2] == 2 &&
++                       d->swz[3] == 3;
++         }
++         break;
++      }
++      default:
++         break;
++      }
++   }
++   tgsi_parse_free(&parse);
++   if (!ok) {
++      draw_vs_fast_destroy(p);
++      return NULL;
++   }
++   return p;
++}
++
++void
++draw_vs_fast_destroy(struct draw_vs_fast *p)
++{
++   if (!p)
++      return;
++   FREE(p->ops);
++   FREE(p->init);
++   FREE(p);
++}
++
++static inline void
++fetch(float (*r)[4], const struct vsf_src *s, float v[4])
++{
++   const float *x = r[s->reg];
++   int c;
++
++   if (s->plain) {
++      v[0] = x[0]; v[1] = x[1]; v[2] = x[2]; v[3] = x[3];
++      return;
++   }
++   for (c = 0; c < 4; c++) {
++      float a = x[s->swz[c]];
++
++      if (s->abs)
++         a = fabsf(a);
++      if (s->neg)
++         a = -a;
++      v[c] = a;
++   }
++}
++
++static void
++run_vertex(const struct draw_vs_fast *p, float (*r)[4])
++{
++   const struct vsf_op *op = p->ops, *end = p->ops + p->nops;
++
++   for (; op < end; op++) {
++      float a[4], b[4], c[4], d[4];
++      float *dst = r[op->dst];
++      int i;
++
++      fetch(r, &op->src[0], a);
++      if (op->nsrc > 1)
++         fetch(r, &op->src[1], b);
++      if (op->nsrc > 2)
++         fetch(r, &op->src[2], c);
++
++      switch (op->opcode) {
++      case TGSI_OPCODE_MOV:
++         d[0] = a[0]; d[1] = a[1]; d[2] = a[2]; d[3] = a[3];
++         break;
++      case TGSI_OPCODE_ADD:
++         for (i = 0; i < 4; i++) d[i] = a[i] + b[i];
++         break;
++      case TGSI_OPCODE_MUL:
++         for (i = 0; i < 4; i++) d[i] = a[i] * b[i];
++         break;
++      case TGSI_OPCODE_MAD:
++         for (i = 0; i < 4; i++) d[i] = a[i] * b[i] + c[i];
++         break;
++      case TGSI_OPCODE_DP2:
++         d[0] = d[1] = d[2] = d[3] = a[0] * b[0] + a[1] * b[1];
++         break;
++      case TGSI_OPCODE_DP3:
++         d[0] = d[1] = d[2] = d[3] = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
++         break;
++      case TGSI_OPCODE_DP4:
++         d[0] = d[1] = d[2] = d[3] = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
++         break;
++      case TGSI_OPCODE_RSQ:
++         d[0] = d[1] = d[2] = d[3] = 1.0f / sqrtf(a[0]);
++         break;
++      case TGSI_OPCODE_RCP:
++         d[0] = d[1] = d[2] = d[3] = 1.0f / a[0];
++         break;
++      case TGSI_OPCODE_SQRT:
++         d[0] = d[1] = d[2] = d[3] = sqrtf(a[0]);
++         break;
++      case TGSI_OPCODE_EX2:
++         d[0] = d[1] = d[2] = d[3] = powf(2.0f, a[0]);
++         break;
++      case TGSI_OPCODE_LG2:
++         d[0] = d[1] = d[2] = d[3] = logf(a[0]) * 1.442695f;
++         break;
++      case TGSI_OPCODE_POW:
++         d[0] = d[1] = d[2] = d[3] = powf(a[0], b[0]);
++         break;
++      case TGSI_OPCODE_FLR:
++         for (i = 0; i < 4; i++) d[i] = floorf(a[i]);
++         break;
++      case TGSI_OPCODE_FRC:
++         for (i = 0; i < 4; i++) d[i] = a[i] - floorf(a[i]);
++         break;
++      case TGSI_OPCODE_MAX:
++         for (i = 0; i < 4; i++) d[i] = a[i] > b[i] ? a[i] : b[i];
++         break;
++      case TGSI_OPCODE_MIN:
++         for (i = 0; i < 4; i++) d[i] = a[i] < b[i] ? a[i] : b[i];
++         break;
++      case TGSI_OPCODE_SLT:
++         for (i = 0; i < 4; i++) d[i] = a[i] < b[i] ? 1.0f : 0.0f;
++         break;
++      case TGSI_OPCODE_SGE:
++         for (i = 0; i < 4; i++) d[i] = a[i] >= b[i] ? 1.0f : 0.0f;
++         break;
++      case TGSI_OPCODE_SEQ:
++         for (i = 0; i < 4; i++) d[i] = a[i] == b[i] ? 1.0f : 0.0f;
++         break;
++      case TGSI_OPCODE_SNE:
++         for (i = 0; i < 4; i++) d[i] = a[i] != b[i] ? 1.0f : 0.0f;
++         break;
++      case TGSI_OPCODE_LRP:
++         for (i = 0; i < 4; i++) d[i] = a[i] * (b[i] - c[i]) + c[i];
++         break;
++      case TGSI_OPCODE_CMP:
++         for (i = 0; i < 4; i++) d[i] = a[i] < 0.0f ? b[i] : c[i];
++         break;
++      case TGSI_OPCODE_LIT:
++         d[0] = 1.0f;
++         d[1] = MAX2(a[0], 0.0f);
++         d[2] = a[0] > 0.0f ? powf(MAX2(a[1], 0.0f), CLAMP(a[3], -128.0f, 128.0f)) : 0.0f;
++         d[3] = 1.0f;
++         break;
++      }
++      if (op->sat)
++         for (i = 0; i < 4; i++)
++            d[i] = CLAMP(d[i], 0.0f, 1.0f);
++      for (i = 0; i < 4; i++)
++         if (op->wmask & (1 << i))
++            dst[i] = d[i];
++   }
++}
++
++void
++draw_vs_fast_run(const struct draw_vs_fast *p, const float (*input)[4], float (*output)[4],
++                 const void *constants[PIPE_MAX_CONSTANT_BUFFERS],
++                 const unsigned const_size[PIPE_MAX_CONSTANT_BUFFERS],
++                 unsigned count, unsigned input_stride, unsigned output_stride,
++                 boolean clamp_color)
++{
++   float r[VSF_MAX_REGS][4];
++   const unsigned have = constants[0] ? const_size[0] / (4 * sizeof(float)) : 0;
++   unsigned i, slot;
++
++   /* immediates; constants beyond the buffer read as 0, as in tgsi_exec */
++   memcpy(r, p->init, p->nregs * sizeof(r[0]));
++   if (p->nconsts)
++      memcpy(r[p->const_base], constants[0], MIN2(have, p->nconsts) * sizeof(r[0]));
++
++   for (i = 0; i < count; i++) {
++      memcpy(r[p->in_base], input, p->ninputs * sizeof(r[0]));
++      run_vertex(p, r);
++      for (slot = 0; slot < p->noutputs; slot++) {
++         const float *o = r[p->out_base + slot];
++
++         if (clamp_color && p->out_color[slot]) {
++            output[slot][0] = CLAMP(o[0], 0.0f, 1.0f);
++            output[slot][1] = CLAMP(o[1], 0.0f, 1.0f);
++            output[slot][2] = CLAMP(o[2], 0.0f, 1.0f);
++            output[slot][3] = CLAMP(o[3], 0.0f, 1.0f);
++         } else {
++            output[slot][0] = o[0];
++            output[slot][1] = o[1];
++            output[slot][2] = o[2];
++            output[slot][3] = o[3];
++         }
++      }
++      input = (const float (*)[4])((const char *)input + input_stride);
++      output = (float (*)[4])((char *)output + output_stride);
++   }
++}
+diff --git a/src/gallium/auxiliary/draw/draw_vs_fast.h b/src/gallium/auxiliary/draw/draw_vs_fast.h
+new file mode 100644
+index 0000000..91826b6
+--- /dev/null
++++ b/src/gallium/auxiliary/draw/draw_vs_fast.h
+@@ -0,0 +1,36 @@
++/*
++ * draw_vs_fast.h -- vertex shaders run one vertex at a time.
++ *
++ * The TGSI of a vertex shader made of plain float arithmetic (what the GL
++ * fixed-function pipeline produces: transforms, lighting) is decoded once
++ * into a short list of operations on float[4] registers and run per vertex,
++ * instead of through the tgsi_exec machine.  Anything else (flow control,
++ * integers, textures, system values, indirect addressing) is refused and
++ * stays with tgsi_exec.
++ *
++ * DRAW_NO_FAST_VS=1 turns it off.
++ */
++#ifndef DRAW_VS_FAST_H
++#define DRAW_VS_FAST_H
++
++#include "pipe/p_compiler.h"
++#include "pipe/p_state.h"
++
++struct tgsi_token;
++struct tgsi_shader_info;
++struct draw_vs_fast;
++
++struct draw_vs_fast *
++draw_vs_fast_compile(const struct tgsi_token *tokens, const struct tgsi_shader_info *info);
++
++void
++draw_vs_fast_run(const struct draw_vs_fast *p, const float (*input)[4], float (*output)[4],
++                 const void *constants[PIPE_MAX_CONSTANT_BUFFERS],
++                 const unsigned const_size[PIPE_MAX_CONSTANT_BUFFERS],
++                 unsigned count, unsigned input_stride, unsigned output_stride,
++                 boolean clamp_color);
++
++void
++draw_vs_fast_destroy(struct draw_vs_fast *p);
++
++#endif
+diff --git a/src/gallium/auxiliary/meson.build b/src/gallium/auxiliary/meson.build
+index e149799..1d0f21b 100644
+--- a/src/gallium/auxiliary/meson.build
++++ b/src/gallium/auxiliary/meson.build
+@@ -75,6 +75,8 @@ files_libgallium = files(
+   'draw/draw_vertex.h',
+   'draw/draw_vs.c',
+   'draw/draw_vs_exec.c',
++  'draw/draw_vs_fast.c',
++  'draw/draw_vs_fast.h',
+   'draw/draw_vs.h',
+   'draw/draw_vs_variant.c',
+   'driver_ddebug/dd_context.c',
+diff --git a/src/gallium/auxiliary/tgsi/tgsi_exec.c b/src/gallium/auxiliary/tgsi/tgsi_exec.c
+index 5db515a..1cea615 100644
+--- a/src/gallium/auxiliary/tgsi/tgsi_exec.c
++++ b/src/gallium/auxiliary/tgsi/tgsi_exec.c
+@@ -138,14 +138,40 @@ micro_cmp(union tgsi_exec_channel *dst,
+    dst->f[3] = src0->f[3] < 0.0f ? src1->f[3] : src2->f[3];
+ }
+ 
++#if defined(__z3660core__) || defined(__amix__)
++/*
++ * sin(2 pi y) for any y: the libm's sinf()/cosf() are slow on the Z3660's
++ * core 1 and on the 68060, and shaders call them per pixel.  y is reduced
++ * to [-1/4, 1/4] and a 9th order polynomial does the rest (error < 4e-6).
++ */
++static inline float
++sin_turns(float y)
++{
++   float z;
++
++   y -= (float)(int)(y + (y >= 0.0f ? 0.5f : -0.5f));
++   if (y > 0.25f)
++      y = 0.5f - y;
++   else if (y < -0.25f)
++      y = -0.5f - y;
++   z = y * y;
++   return y * (6.28318531f + z * (-41.3417022f + z * (81.6052492f + z * (-76.7058597f + z * 42.0586940f))));
++}
++#define SP_SINF(x) sin_turns((x) * 0.159154943f)
++#define SP_COSF(x) sin_turns((x) * 0.159154943f + 0.25f)
++#else
++#define SP_SINF(x) sinf(x)
++#define SP_COSF(x) cosf(x)
++#endif
++
+ static void
+ micro_cos(union tgsi_exec_channel *dst,
+           const union tgsi_exec_channel *src)
+ {
+-   dst->f[0] = cosf(src->f[0]);
+-   dst->f[1] = cosf(src->f[1]);
+-   dst->f[2] = cosf(src->f[2]);
+-   dst->f[3] = cosf(src->f[3]);
++   dst->f[0] = SP_COSF(src->f[0]);
++   dst->f[1] = SP_COSF(src->f[1]);
++   dst->f[2] = SP_COSF(src->f[2]);
++   dst->f[3] = SP_COSF(src->f[3]);
+ }
+ 
+ static void
+@@ -633,10 +659,10 @@ static void
+ micro_sin(union tgsi_exec_channel *dst,
+           const union tgsi_exec_channel *src)
+ {
+-   dst->f[0] = sinf(src->f[0]);
+-   dst->f[1] = sinf(src->f[1]);
+-   dst->f[2] = sinf(src->f[2]);
+-   dst->f[3] = sinf(src->f[3]);
++   dst->f[0] = SP_SINF(src->f[0]);
++   dst->f[1] = SP_SINF(src->f[1]);
++   dst->f[2] = SP_SINF(src->f[2]);
++   dst->f[3] = SP_SINF(src->f[3]);
+ }
+ 
+ static void
+diff --git a/src/gallium/drivers/softpipe/Makefile.sources b/src/gallium/drivers/softpipe/Makefile.sources
+index e405ef2..2986d26 100644
+--- a/src/gallium/drivers/softpipe/Makefile.sources
++++ b/src/gallium/drivers/softpipe/Makefile.sources
+@@ -12,6 +12,8 @@ C_SOURCES := \
+ 	sp_flush.c \
+ 	sp_flush.h \
+ 	sp_fs_exec.c \
++	sp_fs_fast.c \
++	sp_fs_fast.h \
+ 	sp_fs.h \
+ 	sp_image.c \
+ 	sp_image.h \
+@@ -31,6 +33,8 @@ C_SOURCES := \
+ 	sp_query.h \
+ 	sp_screen.c \
+ 	sp_screen.h \
++	sp_fast.c \
++	sp_fast.h \
+ 	sp_setup.c \
+ 	sp_setup.h \
+ 	sp_state_blend.c \
+diff --git a/src/gallium/drivers/softpipe/meson.build b/src/gallium/drivers/softpipe/meson.build
+index a345ff6..bf337fc 100644
+--- a/src/gallium/drivers/softpipe/meson.build
++++ b/src/gallium/drivers/softpipe/meson.build
+@@ -32,6 +32,8 @@ files_softpipe = files(
+   'sp_flush.c',
+   'sp_flush.h',
+   'sp_fs_exec.c',
++  'sp_fs_fast.c',
++  'sp_fs_fast.h',
+   'sp_fs.h',
+   'sp_image.c',
+   'sp_image.h',
+@@ -51,6 +53,8 @@ files_softpipe = files(
+   'sp_query.h',
+   'sp_screen.c',
+   'sp_screen.h',
++  'sp_fast.c',
++  'sp_fast.h',
+   'sp_setup.c',
+   'sp_setup.h',
+   'sp_state_blend.c',
+diff --git a/src/gallium/drivers/softpipe/sp_context.c b/src/gallium/drivers/softpipe/sp_context.c
+index 48f87e6..8c3dc0f 100644
+--- a/src/gallium/drivers/softpipe/sp_context.c
++++ b/src/gallium/drivers/softpipe/sp_context.c
+@@ -254,14 +254,9 @@ softpipe_create_context(struct pipe_screen *screen,
+       softpipe->cbuf_cache[i] = sp_create_tile_cache( &softpipe->pipe );
+    softpipe->zsbuf_cache = sp_create_tile_cache( &softpipe->pipe );
+ 
+-   /* Allocate texture caches */
+-   for (sh = 0; sh < ARRAY_SIZE(softpipe->tex_cache); sh++) {
+-      for (i = 0; i < ARRAY_SIZE(softpipe->tex_cache[0]); i++) {
+-         softpipe->tex_cache[sh][i] = sp_create_tex_tile_cache(&softpipe->pipe);
+-         if (!softpipe->tex_cache[sh][i])
+-            goto fail;
+-      }
+-   }
++   /* Texture caches are made when a sampler view is first set
++    * (sp_state_sampler.c): all of them up front are 6 x 128 x 256 KB, which
++    * a PC only reserves but AMIX and core 1 would have to provide. */
+ 
+    softpipe->fs_machine = tgsi_exec_machine_create(PIPE_SHADER_FRAGMENT);
+ 
+diff --git a/src/gallium/drivers/softpipe/sp_draw_arrays.c b/src/gallium/drivers/softpipe/sp_draw_arrays.c
+index 6363701..3ae99a6 100644
+--- a/src/gallium/drivers/softpipe/sp_draw_arrays.c
++++ b/src/gallium/drivers/softpipe/sp_draw_arrays.c
+@@ -38,6 +38,7 @@
+ #include "util/u_prim.h"
+ 
+ #include "sp_context.h"
++#include "sp_fast.h"
+ #include "sp_query.h"
+ #include "sp_state.h"
+ #include "sp_texture.h"
+@@ -141,7 +142,11 @@ softpipe_draw_vbo(struct pipe_context *pipe,
+                                     sp->active_statistics_queries > 0);
+ 
+    /* draw! */
+-   draw_vbo(draw, info);
++   {
++      SPF_PROF_BEGIN(t0);
++      draw_vbo(draw, info);
++      SPF_PROF_END(3, t0);
++   }
+ 
+    /* unmap vertex/index buffers - will cause draw module to flush */
+    for (i = 0; i < sp->num_vertex_buffers; i++) {
+diff --git a/src/gallium/drivers/softpipe/sp_fast.c b/src/gallium/drivers/softpipe/sp_fast.c
+new file mode 100644
+index 0000000..61373d5
+--- /dev/null
++++ b/src/gallium/drivers/softpipe/sp_fast.c
+@@ -0,0 +1,2443 @@
++/*
++ * sp_fast.c -- see sp_fast.h.
++ *
++ * Coverage, attribute planes and the Z values are softpipe's own (the
++ * triangle setup is shared, Z is evaluated per 2x2 quad as in
++ * sp_quad_depth_test.c), so fast and slow passes over the same geometry
++ * meet with GL_EQUAL.  Colour maths is 8-bit integer: results can differ
++ * from softpipe's float pipeline by one step per channel.
++ */
++#include "sp_context.h"
++#include "sp_state.h"
++#include "sp_texture.h"
++#include "sp_tile_cache.h"
++#include "sp_fast.h"
++#include "pipe/p_defines.h"
++#include "pipe/p_shader_tokens.h"
++#include "tgsi/tgsi_parse.h"
++#include "tgsi/tgsi_util.h"
++#include "tgsi/tgsi_dump.h"
++#include "util/u_debug.h"
++#include "util/u_format.h"
++#include "util/u_math.h"
++#include "util/u_inlines.h"
++
++#ifdef __z3660core__
++int sp_fast_evt_on;
++uint64_t sp_fast_prof[16];
++#endif
++
++extern unsigned sp_fast_why[16];
++
++enum { CPACK_RGBA = 1, CPACK_BGRA, CPACK_OTHER };
++
++static void choose_span(struct sp_fast *f);
++static void pick_level(const struct sp_fast_tex *t, float lambda, int *level, int *linear);
++static inline unsigned to8(float v);
++static inline uint32_t pack(unsigned r, unsigned g, unsigned b, unsigned a);
++enum { BLEND_NONE, BLEND_MODULATE, BLEND_ALPHA, BLEND_ADD, BLEND_GENERIC };
++enum { FOG_NONE, FOG_EXP, FOG_LINEAR };
++
++
++#include <stdio.h>
++#include <stdlib.h>
++
++static void
++print_why(void)
++{
++   int k;
++
++   fprintf(stderr, "sp_fast: draws refused by reason:");
++   for (k = 1; k < 16; k++)
++      if (sp_fast_why[k])
++         fprintf(stderr, " %d:%u", k, sp_fast_why[k]);
++   fprintf(stderr, "\n");
++}
++
++void
++sp_fast_init(struct sp_fast *f)
++{
++   static int registered;
++
++   if (!registered && debug_get_bool_option("SOFTPIPE_FAST_WHY", FALSE)) {
++      registered = 1;
++      atexit(print_why);
++   }
++   memset(f, 0, sizeof(*f));
++   f->enabled = !debug_get_bool_option("SOFTPIPE_NO_FAST", FALSE);
++   f->neon_ok = !debug_get_bool_option("SOFTPIPE_FAST_NONEON", FALSE);
++   f->pairs = !debug_get_bool_option("SOFTPIPE_FAST_NOPAIR", FALSE);
++}
++
++
++/*
++ * The fragment shader: a straight run of MOV, MUL, TEX and TXP whose
++ * output channels are each a product of at most one colour input channel
++ * and one texel channel of each texture unit (2D, units 0 and 1: the
++ * fixed-function texture * colour and multitexture with GL_MODULATE).
++ * Every value is tracked per channel as such a product.
++ */
++struct sym {
++   signed char in, in_chan;      /* in = -1: factor 1 */
++   signed char tex[SP_FAST_UNITS];   /* texel channel of unit u, -1: factor 1 */
++   boolean def;
++};
++
++#define FAST_TEMPS 16
++#define FAST_CONST 64           /* sym.in >= this: constant FAST_CONST + n of buffer 0 */
++
++static boolean
++src_value(const struct tgsi_full_src_register *src, const struct sym (*temp)[4],
++          unsigned chan, struct sym *out)
++{
++   const unsigned swz = tgsi_util_get_full_src_register_swizzle(src, chan);
++   int u;
++
++   if (src->Register.Indirect || src->Register.Negate || src->Register.Absolute ||
++       (src->Register.Dimension && (src->Register.File != TGSI_FILE_CONSTANT ||
++                                    src->Dimension.Indirect || src->Dimension.Index != 0)))
++      return FALSE;
++   switch (src->Register.File) {
++   case TGSI_FILE_INPUT:
++      out->in = (signed char)src->Register.Index;
++      out->in_chan = (signed char)swz;
++      for (u = 0; u < SP_FAST_UNITS; u++)
++         out->tex[u] = -1;
++      out->def = TRUE;
++      return TRUE;
++   case TGSI_FILE_TEMPORARY:
++      if (src->Register.Index >= FAST_TEMPS || !temp[src->Register.Index][swz].def)
++         return FALSE;
++      *out = temp[src->Register.Index][swz];
++      return TRUE;
++   case TGSI_FILE_CONSTANT:
++      /* glColor without a colour array: Mesa's constant; a colour per draw */
++      if (src->Register.Index >= 32)
++         return FALSE;
++      out->in = (signed char)(FAST_CONST + src->Register.Index);
++      out->in_chan = (signed char)swz;
++      for (u = 0; u < SP_FAST_UNITS; u++)
++         out->tex[u] = -1;
++      out->def = TRUE;
++      return TRUE;
++   default:
++      return FALSE;
++   }
++}
++
++static boolean
++plain_input(const struct sym *s)
++{
++   int u;
++
++   for (u = 0; u < SP_FAST_UNITS; u++)
++      if (s->tex[u] >= 0)
++         return FALSE;
++   return s->in >= 0 && s->in < FAST_CONST;
++}
++
++/* word of a constant the instruction reads, or -1 */
++static int
++const_word(const struct tgsi_full_src_register *src)
++{
++   if (src->Register.File != TGSI_FILE_CONSTANT || src->Register.Indirect || src->Register.Index >= 32 ||
++       (src->Register.Dimension && (src->Dimension.Indirect || src->Dimension.Index != 0)))
++      return -1;
++   return src->Register.Index * 4 + tgsi_util_get_full_src_register_swizzle(src, 0);
++}
++
++/*
++ * The end of a fixed-function shader with fog, as Mesa writes it:
++ *    MOV  out.w, alpha
++ *    MUL  t.x, fogcoord, scale; EX2 t.x, -t.x         (GL_EXP)
++ *    or MAD t.x, fogcoord, scale, offset              (GL_LINEAR)
++ *    MOV_SAT t.x, t.x; ADD u.x, 1, -t.x; MUL u.xyz, fogcolor, u.x
++ *    MAD  out.xyz, colour, t.x, u.xyz; MOV OUT[0], out; END
++ * Sets fog_kind and the rest; returns the index of the first MOV (the
++ * program before it is the colour), and the final MAD in *mad.
++ */
++static int
++find_fog(struct sp_fast *f, const struct sp_fragment_shader_variant *v,
++         const struct tgsi_full_instruction *in, int n, int *mad)
++{
++   static const unsigned exp_ops[] = { TGSI_OPCODE_MUL, TGSI_OPCODE_EX2, TGSI_OPCODE_MOV, TGSI_OPCODE_ADD,
++                                       TGSI_OPCODE_MUL, TGSI_OPCODE_MAD, TGSI_OPCODE_MOV, TGSI_OPCODE_END };
++   static const unsigned lin_ops[] = { TGSI_OPCODE_MAD, TGSI_OPCODE_MOV, TGSI_OPCODE_ADD,
++                                       TGSI_OPCODE_MUL, TGSI_OPCODE_MAD, TGSI_OPCODE_MOV, TGSI_OPCODE_END };
++   int i, k;
++
++   for (i = 1; i < n; i++) {
++      const struct tgsi_full_src_register *s = &in[i].Src[0];
++      const boolean lin = in[i].Instruction.Opcode == TGSI_OPCODE_MAD;
++      const unsigned *ops = lin ? lin_ops : exp_ops;
++      const int nops = lin ? 7 : 8;
++
++      if ((!lin && in[i].Instruction.Opcode != TGSI_OPCODE_MUL) || s->Register.File != TGSI_FILE_INPUT ||
++          s->Register.Index >= (int)v->info.num_inputs ||
++          v->info.input_semantic_name[s->Register.Index] != TGSI_SEMANTIC_FOG)
++         continue;
++      if (i + nops != n || in[i - 1].Instruction.Opcode != TGSI_OPCODE_MOV ||
++          in[i - 1].Dst[0].Register.WriteMask != TGSI_WRITEMASK_W)
++         return -1;
++      for (k = 0; k < nops; k++)
++         if (in[i + k].Instruction.Opcode != ops[k])
++            return -1;
++      f->fog_in = s->Register.Index;
++      f->fog_ka = const_word(&in[i].Src[1]);
++      f->fog_kb = lin ? const_word(&in[i].Src[2]) : 0;
++      f->fog_kc = const_word(&in[i + nops - 4].Src[0]);
++      if (f->fog_ka < 0 || f->fog_kb < 0 || f->fog_kc < 0 || (f->fog_kc & 3) ||
++          in[i + nops - 3].Src[0].Register.File != TGSI_FILE_TEMPORARY)
++         return -1;
++      f->fog_kind = lin ? FOG_LINEAR : FOG_EXP;
++      *mad = i + nops - 3;
++      return i - 1;
++   }
++   return -1;
++}
++
++#define FAST_INSNS 32
++
++static boolean
++analyse_fs(struct sp_fast *f, const struct sp_fragment_shader_variant *v)
++{
++   struct sym temp[FAST_TEMPS][4], outv[4];
++   struct tgsi_parse_context parse;
++   struct tgsi_full_instruction insns[FAST_INSNS];
++   boolean ok = TRUE;
++   unsigned c;
++   int u, n = 0, k, fog_at = -1, fog_mad = 0;
++
++   if (v->info.num_outputs != 1 ||
++       v->info.output_semantic_name[0] != TGSI_SEMANTIC_COLOR ||
++       v->info.output_semantic_index[0] != 0 ||
++       v->info.uses_kill || v->info.writes_z || v->info.writes_stencil)
++      return FALSE;
++
++   memset(temp, 0, sizeof(temp));
++   memset(outv, 0, sizeof(outv));
++   f->col_in = -1;
++   f->fog_kind = FOG_NONE;
++   for (u = 0; u < SP_FAST_UNITS; u++) {
++      f->u[u].in = -1;
++      f->u[u].txp = FALSE;
++   }
++
++   tgsi_parse_init(&parse, v->tokens);
++   while (!tgsi_parse_end_of_tokens(&parse)) {
++      tgsi_parse_token(&parse);
++      if (parse.FullToken.Token.Type != TGSI_TOKEN_TYPE_INSTRUCTION)
++         continue;
++      if (n == FAST_INSNS) {
++         tgsi_parse_free(&parse);
++         return FALSE;
++      }
++      insns[n++] = parse.FullToken.FullInstruction;
++   }
++   tgsi_parse_free(&parse);
++   fog_at = find_fog(f, v, insns, n, &fog_mad);
++
++   for (k = 0; ok && k < n; k++) {
++      const struct tgsi_full_instruction *inst = &insns[k];
++      struct sym res[4];
++
++      if (inst->Instruction.Opcode == TGSI_OPCODE_END)
++         break;
++      if (k == fog_at) {
++         /* the colour before the fog */
++         const int t = insns[fog_mad].Src[0].Register.Index;
++
++         if (t >= FAST_TEMPS || !src_value(&inst->Src[0], temp, 3, &outv[3])) {
++            ok = FALSE;
++            break;
++         }
++         for (c = 0; c < 3; c++) {
++            if (!temp[t][c].def) {
++               ok = FALSE;
++               break;
++            }
++            outv[c] = temp[t][c];
++         }
++         break;
++      }
++      if (inst->Instruction.NumDstRegs != 1 || inst->Dst[0].Register.Indirect ||
++          inst->Dst[0].Register.Dimension) {
++         ok = FALSE;
++         break;
++      }
++
++      switch (inst->Instruction.Opcode) {
++      case TGSI_OPCODE_MOV:
++         for (c = 0; ok && c < 4; c++)
++            if (inst->Dst[0].Register.WriteMask & (1 << c))
++               ok = src_value(&inst->Src[0], temp, c, &res[c]);
++         break;
++      case TGSI_OPCODE_MUL:
++         for (c = 0; ok && c < 4; c++) {
++            struct sym a, b;
++
++            if (!(inst->Dst[0].Register.WriteMask & (1 << c)))
++               continue;
++            ok = src_value(&inst->Src[0], temp, c, &a) && src_value(&inst->Src[1], temp, c, &b);
++            if (!ok)
++               break;
++            /* one input factor and one texel factor per unit at most */
++            if (a.in >= 0 && b.in >= 0) {
++               ok = FALSE;
++               break;
++            }
++            res[c].def = TRUE;
++            res[c].in = a.in >= 0 ? a.in : b.in;
++            res[c].in_chan = a.in >= 0 ? a.in_chan : b.in_chan;
++            for (u = 0; u < SP_FAST_UNITS; u++) {
++               if (a.tex[u] >= 0 && b.tex[u] >= 0)
++                  ok = FALSE;
++               res[c].tex[u] = a.tex[u] >= 0 ? a.tex[u] : b.tex[u];
++            }
++         }
++         break;
++      case TGSI_OPCODE_TEX:
++      case TGSI_OPCODE_TXP: {
++         const boolean txp = inst->Instruction.Opcode == TGSI_OPCODE_TXP;
++         struct sym s, t, q;
++         struct sp_fast_unit *un;
++
++         u = inst->Src[1].Register.Index;
++         if (inst->Texture.Texture != TGSI_TEXTURE_2D ||
++             inst->Src[1].Register.File != TGSI_FILE_SAMPLER || u < 0 || u >= SP_FAST_UNITS ||
++             f->u[u].in >= 0 ||
++             !src_value(&inst->Src[0], temp, 0, &s) || !src_value(&inst->Src[0], temp, 1, &t) ||
++             (txp && !src_value(&inst->Src[0], temp, 3, &q)) ||
++             !plain_input(&s) || !plain_input(&t) || t.in != s.in ||
++             (txp && (!plain_input(&q) || q.in != s.in))) {
++            ok = FALSE;
++            break;
++         }
++         un = &f->u[u];
++         un->in = s.in;
++         un->coord_chan[0] = s.in_chan;
++         un->coord_chan[1] = t.in_chan;
++         un->coord_chan[2] = txp ? q.in_chan : -1;
++         un->txp = txp;
++         for (c = 0; c < 4; c++) {
++            int k;
++
++            res[c].def = TRUE;
++            res[c].in = -1;
++            res[c].in_chan = 0;
++            for (k = 0; k < SP_FAST_UNITS; k++)
++               res[c].tex[k] = -1;
++            res[c].tex[u] = (signed char)c;
++         }
++         break;
++      }
++      default:
++         ok = FALSE;
++      }
++      if (!ok)
++         break;
++
++      for (c = 0; c < 4; c++) {
++         if (!(inst->Dst[0].Register.WriteMask & (1 << c)))
++            continue;
++         if (inst->Dst[0].Register.File == TGSI_FILE_TEMPORARY &&
++             inst->Dst[0].Register.Index < FAST_TEMPS)
++            temp[inst->Dst[0].Register.Index][c] = res[c];
++         else if (inst->Dst[0].Register.File == TGSI_FILE_OUTPUT && inst->Dst[0].Register.Index == 0)
++            outv[c] = res[c];
++         else
++            ok = FALSE;
++      }
++   }
++   if (!ok)
++      return FALSE;
++
++   /* unit 1 alone: not here (the spans' single texture is unit 0) */
++   if (f->u[1].in >= 0 && f->u[0].in < 0)
++      return FALSE;
++
++   f->mixed = FALSE;
++   for (c = 0; c < 4; c++) {
++      if (!outv[c].def)
++         return FALSE;
++      if (outv[c].in >= 0) {
++         if (f->col_in >= 0 && f->col_in != outv[c].in)
++            return FALSE;
++         f->col_in = outv[c].in;
++      }
++      f->col_chan[c] = outv[c].in >= 0 ? outv[c].in_chan : -1;
++      for (u = 0; u < SP_FAST_UNITS; u++)
++         f->u[u].chan[c] = outv[c].tex[u];
++   }
++   /* channel c from a channel other than c (a swizzle): the general way.
++      A factor that is not there (-1) is 1.0: for a unit, its texel byte is
++      ORed to 255 (ormask, e.g. alpha of an RGB texture under GL_MODULATE);
++      for the colour the setups make it 255 already. */
++   for (u = 0; u < SP_FAST_UNITS; u++)
++      f->u[u].ormask = 0;
++   for (c = 0; c < 4; c++) {
++      for (u = 0; u < SP_FAST_UNITS; u++)
++         if (f->u[u].in >= 0) {
++            if (f->u[u].chan[c] < 0)
++               f->u[u].ormask |= 0xffu << (8 * c);
++            else if (f->u[u].chan[c] != (int)c)
++               f->mixed = TRUE;
++         }
++      if (f->col_in >= 0 && f->col_chan[c] >= 0 && f->col_chan[c] != (int)c)
++         f->mixed = TRUE;
++   }
++   return TRUE;
++}
++
++
++/* bytes of r, g, b, a in a pixel of an 8-bit unorm array format, or FALSE */
++static boolean
++byte_map(enum pipe_format format, int *bpp, signed char map[4])
++{
++   const struct util_format_description *d = util_format_description(format);
++   unsigned c;
++
++   if (!d || d->layout != UTIL_FORMAT_LAYOUT_PLAIN || !d->is_array ||
++       d->colorspace != UTIL_FORMAT_COLORSPACE_RGB || d->block.width != 1 ||
++       d->block.height != 1 || (d->block.bits & 7) || d->block.bits > 32)
++      return FALSE;
++   for (c = 0; c < d->nr_channels; c++)
++      if (d->channel[c].type != UTIL_FORMAT_TYPE_VOID &&
++          (d->channel[c].type != UTIL_FORMAT_TYPE_UNSIGNED || !d->channel[c].normalized ||
++           d->channel[c].size != 8))
++         return FALSE;
++   *bpp = d->block.bits / 8;
++   for (c = 0; c < 4; c++) {
++      const unsigned s = d->swizzle[c];
++
++      if (s <= PIPE_SWIZZLE_W && d->channel[s].type != UTIL_FORMAT_TYPE_VOID)
++         map[c] = (signed char)(d->channel[s].shift / 8);
++      else
++         map[c] = s == PIPE_SWIZZLE_0 ? -1 : -2;
++   }
++   return TRUE;
++}
++
++static boolean
++blend_factor_ok(unsigned f)
++{
++   switch (f) {
++   case PIPE_BLENDFACTOR_ONE:
++   case PIPE_BLENDFACTOR_ZERO:
++   case PIPE_BLENDFACTOR_SRC_COLOR:
++   case PIPE_BLENDFACTOR_INV_SRC_COLOR:
++   case PIPE_BLENDFACTOR_SRC_ALPHA:
++   case PIPE_BLENDFACTOR_INV_SRC_ALPHA:
++   case PIPE_BLENDFACTOR_DST_COLOR:
++   case PIPE_BLENDFACTOR_INV_DST_COLOR:
++   case PIPE_BLENDFACTOR_DST_ALPHA:
++   case PIPE_BLENDFACTOR_INV_DST_ALPHA:
++   case PIPE_BLENDFACTOR_SRC_ALPHA_SATURATE:
++      return TRUE;
++   default:
++      return FALSE;
++   }
++}
++
++static boolean
++blend_func_ok(unsigned f)
++{
++   return f == PIPE_BLEND_ADD || f == PIPE_BLEND_SUBTRACT || f == PIPE_BLEND_REVERSE_SUBTRACT ||
++          f == PIPE_BLEND_MIN || f == PIPE_BLEND_MAX;
++}
++
++static boolean
++prepare_texture(struct sp_fast *f, struct softpipe_context *sp, int unit)
++{
++   struct sp_fast_tex *t = &f->u[unit].tex;
++   const struct pipe_sampler_view *view = sp->sampler_views[PIPE_SHADER_FRAGMENT][unit];
++   const struct pipe_sampler_state *samp = sp->samplers[PIPE_SHADER_FRAGMENT][unit];
++   const struct softpipe_resource *res;
++   const unsigned vswz[4] = { view ? view->swizzle_r : 0, view ? view->swizzle_g : 0,
++                              view ? view->swizzle_b : 0, view ? view->swizzle_a : 0 };
++   signed char fmap[4];
++   int l, c;
++
++   if (!view || !samp || !view->texture || view->target != PIPE_TEXTURE_2D ||
++       view->texture->target != PIPE_TEXTURE_2D || !samp->normalized_coords ||
++       samp->compare_mode != PIPE_TEX_COMPARE_NONE || samp->max_anisotropy > 1)
++      return FALSE;
++   res = softpipe_resource(view->texture);
++   if (!res->data || !byte_map(view->format, &t->bpp, fmap))
++      return FALSE;
++   for (c = 0; c < 4; c++)
++      t->map[c] = vswz[c] <= PIPE_SWIZZLE_W ? fmap[vswz[c]] : vswz[c] == PIPE_SWIZZLE_0 ? -1 : -2;
++#ifdef PIPE_ARCH_LITTLE_ENDIAN
++   t->ident = t->bpp == 4 && t->map[0] == 0 && t->map[1] == 1 && t->map[2] == 2 && t->map[3] == 3;
++#else
++   t->ident = FALSE;
++#endif
++
++   /* GL_CLAMP is taken as GL_CLAMP_TO_EDGE (the border colour is not blended in) */
++   if (samp->wrap_s == PIPE_TEX_WRAP_REPEAT)
++      t->clamp_s = 0;
++   else if (samp->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_EDGE || samp->wrap_s == PIPE_TEX_WRAP_CLAMP)
++      t->clamp_s = 1;
++   else
++      return FALSE;
++   if (samp->wrap_t == PIPE_TEX_WRAP_REPEAT)
++      t->clamp_t = 0;
++   else if (samp->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_EDGE || samp->wrap_t == PIPE_TEX_WRAP_CLAMP)
++      t->clamp_t = 1;
++   else
++      return FALSE;
++
++   /* one word per texel: r, g, b in bytes 0-2, alpha in 3 or none (x) */
++#ifdef PIPE_ARCH_LITTLE_ENDIAN
++   t->fast4 = t->bpp == 4 && t->map[0] == 0 && t->map[1] == 1 && t->map[2] == 2 &&
++              (t->map[3] == 3 || t->map[3] == -2);
++#else
++   t->fast4 = FALSE;
++#endif
++   t->amask = t->map[3] == -2 ? 0xff000000u : 0;
++   if (debug_get_bool_option("SOFTPIPE_FAST_WHY", FALSE)) {
++      static unsigned seen[PIPE_FORMAT_COUNT][2][2];
++
++      if (!seen[view->format][t->fast4][t->clamp_s]++)
++         fprintf(stderr, "sp_fast: texture %s fast4 %d clamp %d/%d mip %d\n",
++                 util_format_name(view->format), t->fast4, t->clamp_s, t->clamp_t, t->mip);
++   }
++   t->first = view->u.tex.first_level;
++   t->last = MIN2(view->u.tex.last_level, view->texture->last_level);
++   if (t->last < t->first || t->last >= SP_FAST_LEVELS)
++      return FALSE;
++   for (l = t->first; l <= t->last; l++) {
++      t->data[l] = (const ubyte *)res->data + res->level_offset[l];
++      t->stride[l] = res->stride[l];
++      t->w[l] = u_minify(view->texture->width0, l);
++      t->h[l] = u_minify(view->texture->height0, l);
++      t->fsize[l][0] = (float)t->w[l];
++      t->fsize[l][1] = (float)t->h[l];
++      if ((!t->clamp_s && !util_is_power_of_two_or_zero(t->w[l])) ||
++          (!t->clamp_t && !util_is_power_of_two_or_zero(t->h[l])))
++         return FALSE;
++   }
++   t->min_linear = samp->min_img_filter == PIPE_TEX_FILTER_LINEAR;
++   t->mag_linear = samp->mag_img_filter == PIPE_TEX_FILTER_LINEAR;
++   t->mip = t->last > t->first ? samp->min_mip_filter : PIPE_TEX_MIPFILTER_NONE;
++   t->need_lambda = t->mip != PIPE_TEX_MIPFILTER_NONE || t->min_linear != t->mag_linear;
++   t->lod_bias = samp->lod_bias;
++   t->min_lod = MAX2(samp->min_lod, 0.0f);
++   t->max_lod = MIN2(samp->max_lod, (float)(t->last - t->first));
++   return TRUE;
++}
++
++/* fixed-point fraction bits of Z in fixed_span(), -1: not there */
++static inline int
++zfrac_bits(int format)
++{
++   switch (format) {
++   case PIPE_FORMAT_Z16_UNORM: return 16;
++   case PIPE_FORMAT_Z24X8_UNORM:
++   case PIPE_FORMAT_Z24_UNORM_S8_UINT:
++   case PIPE_FORMAT_X8Z24_UNORM:
++   case PIPE_FORMAT_S8_UINT_Z24_UNORM: return 8;
++   default: return -1;
++   }
++}
++
++/* write back and drop the cached tiles: the fast path works on the buffers */
++static void
++tile_cache_release(struct softpipe_tile_cache *tc)
++{
++   int pos;
++
++
++   /* sp_flush_tile_cache() fills a scratch tile with the clear value each
++      time: only when a clear or softpipe's own drawing left something */
++   if (!tc || !tc->num_maps || tc->fast_clean)
++      return;
++   sp_flush_tile_cache(tc);
++   for (pos = 0; pos < NUM_ENTRIES; pos++)
++      tc->tile_addrs[pos].bits.invalid = 1;
++   tc->last_tile_addr.bits.invalid = 1;
++   tc->fast_clean = TRUE;
++}
++
++/* why draws miss the fast path: counts per fast_prepare() check (the GPU
++   program publishes them; SOFTPIPE_FAST_WHY=1 prints them on the PC) */
++unsigned sp_fast_why[16];
++
++static boolean
++why(int k)
++{
++   sp_fast_why[k & 15]++;
++   return FALSE;
++}
++
++static boolean
++fast_prepare(struct sp_fast *f, struct softpipe_context *sp)
++{
++   const struct sp_setup_info *sinfo = &sp->setup_info;
++   const struct pipe_framebuffer_state *fb = &sp->framebuffer;
++   const struct pipe_depth_stencil_alpha_state *dsa = sp->depth_stencil;
++   const struct pipe_rasterizer_state *rast = sp->rasterizer;
++   const struct pipe_rt_blend_state *rt;
++   struct softpipe_tile_cache *ctc, *ztc;
++   int unit;
++
++   f->on = FALSE;
++   if (!f->enabled || !sp->fs_variant || !dsa || !rast || !sp->blend)
++      return why(1);
++   if (f->fs != sp->fs_variant) {
++      f->fs = sp->fs_variant;
++      f->fs_ok = analyse_fs(f, sp->fs_variant);
++      if (!f->fs_ok && debug_get_bool_option("SOFTPIPE_FAST_WHY", FALSE))
++         tgsi_dump(sp->fs_variant->tokens, 0);
++   }
++   if (!f->fs_ok)
++      return why(2);
++
++   if (sp->reduced_api_prim != PIPE_PRIM_TRIANGLES || rast->poly_stipple_enable ||
++       rast->multisample || sp->active_query_count || sp->active_statistics_queries ||
++       sp->layer_slot > 0 || sp->viewport_index_slot > 0 || sp->fs_variant->key.polygon_stipple)
++      return why(3);
++
++   /* interpolation of the inputs used */
++   f->col_const = f->col_in >= FAST_CONST;
++   if (f->col_const) {
++      /* the colour from the constant buffer: the same for the whole draw */
++      const float *cb = (const float *)sp->mapped_constants[PIPE_SHADER_FRAGMENT][0];
++      const unsigned k = f->col_in - FAST_CONST;
++      unsigned c8[4] = { 255, 255, 255, 255 }, c;
++
++      if (!cb || (k + 1) * 16 > sp->const_buffer_size[PIPE_SHADER_FRAGMENT][0])
++         return why(14);
++      for (c = 0; c < 4; c++)
++         if (f->col_chan[c] >= 0)
++            c8[c] = to8(cb[k * 4 + f->col_chan[c]]);
++      f->const_col = pack(c8[0], c8[1], c8[2], c8[3]);
++      f->col_interp = SP_INTERP_CONSTANT;
++      f->col_slot = 0;
++   } else {
++      f->col_interp = f->col_in >= 0 ? sinfo->attrib[f->col_in].interp : SP_INTERP_CONSTANT;
++      f->col_slot = f->col_in >= 0 ? sinfo->attrib[f->col_in].src_index : 0;
++   }
++   if (f->col_interp == SP_INTERP_POS)
++      return why(4);
++   if (f->fog_kind) {
++      const float *cb = (const float *)sp->mapped_constants[PIPE_SHADER_FRAGMENT][0];
++      const int top = MAX3(f->fog_ka, f->fog_kb, f->fog_kc + 2);
++
++      if (!cb || (top + 1) * 4 > (int)sp->const_buffer_size[PIPE_SHADER_FRAGMENT][0])
++         return why(14);
++      f->fog_slot = sinfo->attrib[f->fog_in].src_index;
++      f->fog_scale = cb[f->fog_ka];
++      f->fog_off = f->fog_kind == FOG_LINEAR ? cb[f->fog_kb] : 0.0f;
++      f->fog_rgba = pack(to8(cb[f->fog_kc]), to8(cb[f->fog_kc + 1]), to8(cb[f->fog_kc + 2]), 0);
++   }
++   for (unit = 0; unit < SP_FAST_UNITS; unit++) {
++      struct sp_fast_unit *u = &f->u[unit];
++
++      if (u->in < 0)
++         continue;
++      u->interp = sinfo->attrib[u->in].interp;
++      if (u->interp == SP_INTERP_POS || sp->fs_variant->info.input_cylindrical_wrap[u->in] ||
++          !prepare_texture(f, sp, unit))
++         return why(5);
++      u->tex.amask |= u->ormask;     /* channels the shader takes as 1.0 */
++   }
++   if (f->col_in >= 0 && !f->col_const && sp->fs_variant->info.input_cylindrical_wrap[f->col_in])
++      return why(6);
++
++   /* colour buffer */
++   if (fb->nr_cbufs != 1 || !fb->cbufs[0] || !(ctc = sp->cbuf_cache[0]) || ctc->num_maps != 1 ||
++       !byte_map(fb->cbufs[0]->format, &f->cbpp, f->cmap))
++      return why(7);
++   rt = &sp->blend->rt[0];
++   if (sp->blend->logicop_enable || sp->blend->alpha_to_coverage || sp->blend->alpha_to_one)
++      return why(8);
++   f->colormask = rt->colormask;
++   f->cpack = CPACK_OTHER;
++#ifdef PIPE_ARCH_LITTLE_ENDIAN
++   if (f->cbpp == 4 && f->colormask == 0xf && f->cmap[1] == 1 && f->cmap[3] == 3) {
++      if (f->cmap[0] == 0 && f->cmap[2] == 2)
++         f->cpack = CPACK_RGBA;
++      else if (f->cmap[0] == 2 && f->cmap[2] == 0)
++         f->cpack = CPACK_BGRA;
++   }
++#endif
++   f->blend = rt->blend_enable;
++   f->blend_kind = BLEND_NONE;
++   if (f->blend) {
++      if (!blend_func_ok(rt->rgb_func) || !blend_func_ok(rt->alpha_func) ||
++          !blend_factor_ok(rt->rgb_src_factor) || !blend_factor_ok(rt->rgb_dst_factor) ||
++          !blend_factor_ok(rt->alpha_src_factor) || !blend_factor_ok(rt->alpha_dst_factor))
++         return why(9);
++      f->rgb_func = rt->rgb_func;
++      f->rgb_src = rt->rgb_src_factor;
++      f->rgb_dst = rt->rgb_dst_factor;
++      f->a_func = rt->alpha_func;
++      f->a_src = rt->alpha_src_factor;
++      f->a_dst = rt->alpha_dst_factor;
++      f->blend_kind = BLEND_GENERIC;
++      if (f->rgb_func == PIPE_BLEND_ADD && f->a_func == PIPE_BLEND_ADD) {
++         const unsigned rs = f->rgb_src, rd = f->rgb_dst, as = f->a_src, ad = f->a_dst;
++
++         if (((rs == PIPE_BLENDFACTOR_DST_COLOR && rd == PIPE_BLENDFACTOR_ZERO) ||
++              (rs == PIPE_BLENDFACTOR_ZERO && rd == PIPE_BLENDFACTOR_SRC_COLOR)) &&
++             (((as == PIPE_BLENDFACTOR_DST_COLOR || as == PIPE_BLENDFACTOR_DST_ALPHA) &&
++               ad == PIPE_BLENDFACTOR_ZERO) ||
++              (as == PIPE_BLENDFACTOR_ZERO &&
++               (ad == PIPE_BLENDFACTOR_SRC_COLOR || ad == PIPE_BLENDFACTOR_SRC_ALPHA))))
++            f->blend_kind = BLEND_MODULATE;
++         else if (rs == PIPE_BLENDFACTOR_SRC_ALPHA && rd == PIPE_BLENDFACTOR_INV_SRC_ALPHA &&
++                  as == PIPE_BLENDFACTOR_SRC_ALPHA && ad == PIPE_BLENDFACTOR_INV_SRC_ALPHA)
++            f->blend_kind = BLEND_ALPHA;
++         else if (rs == PIPE_BLENDFACTOR_ONE && rd == PIPE_BLENDFACTOR_ONE &&
++                  as == PIPE_BLENDFACTOR_ONE && ad == PIPE_BLENDFACTOR_ONE)
++            f->blend_kind = BLEND_ADD;
++      }
++   }
++
++   /* depth, stencil, alpha */
++   if (dsa->stencil[0].enabled || dsa->depth.bounds_test)
++      return why(10);
++   f->zformat = 0;
++   ztc = NULL;
++   if (dsa->depth.enabled && fb->zsbuf) {
++      switch (fb->zsbuf->format) {
++      case PIPE_FORMAT_Z16_UNORM:
++      case PIPE_FORMAT_Z32_UNORM:
++      case PIPE_FORMAT_Z24X8_UNORM:
++      case PIPE_FORMAT_Z24_UNORM_S8_UINT:
++      case PIPE_FORMAT_X8Z24_UNORM:
++      case PIPE_FORMAT_S8_UINT_Z24_UNORM:
++      case PIPE_FORMAT_Z32_FLOAT:
++         break;
++      default:
++         return why(11);
++      }
++      ztc = sp->zsbuf_cache;
++      if (!ztc || ztc->num_maps != 1)
++         return why(12);
++      f->zformat = fb->zsbuf->format;
++      f->zfunc = dsa->depth.func;
++      f->zwrite = dsa->depth.writemask;
++      f->zbuf = (ubyte *)ztc->transfer_map[0];
++      f->zstride = ztc->transfer[0]->stride;
++      f->zclamp = !rast->depth_clip_near;
++      {
++         const float n = sp->viewports[0].translate[2] - sp->viewports[0].scale[2];
++         const float fa = n + sp->viewports[0].scale[2] * 2.0f;
++
++         f->zmin = MIN2(n, fa);
++         f->zmax = MAX2(n, fa);
++      }
++   }
++   f->afunc = dsa->alpha.enabled ? dsa->alpha.func : PIPE_FUNC_ALWAYS;
++   f->areff = dsa->alpha.ref_value;
++
++   f->cbuf = (ubyte *)ctc->transfer_map[0];
++   f->cstride = ctc->transfer[0]->stride;
++
++   /* fixed_span() unless trilinear, 32-bit Z or depth clamping */
++   f->fixed = !(f->u[0].in >= 0 && f->u[0].tex.mip == PIPE_TEX_MIPFILTER_LINEAR) &&
++              !(f->u[1].in >= 0 && f->u[1].tex.mip == PIPE_TEX_MIPFILTER_LINEAR) &&
++              (!f->zformat || (zfrac_bits(f->zformat) >= 0 && !f->zclamp)) &&
++              !debug_get_bool_option("SOFTPIPE_FAST_FLOAT", FALSE);
++
++   if ((f->u[1].in >= 0 || f->fog_kind) && !f->fixed)
++      return why(13);             /* fast_span() has one unit and no fog */
++   if (f->fixed)
++      choose_span(f);
++
++   tile_cache_release(ctc);
++   if (ztc)
++      tile_cache_release(ztc);
++   f->on = TRUE;
++   return TRUE;
++}
++
++
++boolean
++sp_fast_prepare(struct sp_fast *f, struct softpipe_context *sp)
++{
++   SPF_PROF_BEGIN(t0);
++   const boolean on = fast_prepare(f, sp);
++
++   SPF_PROF_END(2, t0);
++   return on;
++}
++
++
++/* round(a * b / 255) for a, b in 0..255 */
++static inline unsigned
++mul255(unsigned a, unsigned b)
++{
++   unsigned t = a * b + 128;
++
++   return (t + (t >> 8)) >> 8;
++}
++
++static inline unsigned
++to8(float v)
++{
++   if (!(v > 0.0f))
++      return 0;
++   if (v >= 1.0f)
++      return 255;
++   return (unsigned)(v * 255.0f + 0.5f);
++}
++
++static inline int
++wrap(int i, int size, int clamp)
++{
++   if (clamp)
++      return i < 0 ? 0 : i >= size ? size - 1 : i;
++   return i & (size - 1);
++}
++
++static inline boolean
++test(int func, unsigned a, unsigned b)
++{
++   switch (func) {
++   case PIPE_FUNC_NEVER: return FALSE;
++   case PIPE_FUNC_LESS: return a < b;
++   case PIPE_FUNC_EQUAL: return a == b;
++   case PIPE_FUNC_LEQUAL: return a <= b;
++   case PIPE_FUNC_GREATER: return a > b;
++   case PIPE_FUNC_NOTEQUAL: return a != b;
++   case PIPE_FUNC_GEQUAL: return a >= b;
++   default: return TRUE;
++   }
++}
++
++static inline boolean
++testf(int func, float a, float b)
++{
++   switch (func) {
++   case PIPE_FUNC_NEVER: return FALSE;
++   case PIPE_FUNC_LESS: return a < b;
++   case PIPE_FUNC_EQUAL: return a == b;
++   case PIPE_FUNC_LEQUAL: return a <= b;
++   case PIPE_FUNC_GREATER: return a > b;
++   case PIPE_FUNC_NOTEQUAL: return a != b;
++   case PIPE_FUNC_GEQUAL: return a >= b;
++   default: return TRUE;
++   }
++}
++
++static inline unsigned
++factor(int f, const unsigned src[4], const unsigned dst[4], int c)
++{
++   switch (f) {
++   case PIPE_BLENDFACTOR_ONE: return 255;
++   case PIPE_BLENDFACTOR_SRC_COLOR: return src[c];
++   case PIPE_BLENDFACTOR_INV_SRC_COLOR: return 255 - src[c];
++   case PIPE_BLENDFACTOR_SRC_ALPHA: return src[3];
++   case PIPE_BLENDFACTOR_INV_SRC_ALPHA: return 255 - src[3];
++   case PIPE_BLENDFACTOR_DST_COLOR: return dst[c];
++   case PIPE_BLENDFACTOR_INV_DST_COLOR: return 255 - dst[c];
++   case PIPE_BLENDFACTOR_DST_ALPHA: return dst[3];
++   case PIPE_BLENDFACTOR_INV_DST_ALPHA: return 255 - dst[3];
++   case PIPE_BLENDFACTOR_SRC_ALPHA_SATURATE: return c == 3 ? 255 : MIN2(src[3], 255 - dst[3]);
++   default: return 0;
++   }
++}
++
++static inline unsigned
++combine(int func, unsigned s, unsigned d)
++{
++   int v;
++
++   switch (func) {
++   case PIPE_BLEND_ADD: v = (int)(s + d); break;
++   case PIPE_BLEND_SUBTRACT: v = (int)s - (int)d; break;
++   case PIPE_BLEND_REVERSE_SUBTRACT: v = (int)d - (int)s; break;
++   case PIPE_BLEND_MIN: return MIN2(s, d);
++   default: return MAX2(s, d);
++   }
++   return v < 0 ? 0 : v > 255 ? 255 : (unsigned)v;
++}
++
++/* the integer Z softpipe stores for depth value z */
++static inline unsigned
++zvalue(int format, float z)
++{
++   switch (format) {
++   case PIPE_FORMAT_Z16_UNORM:
++      return (unsigned)(z * 65535.0f);
++   case PIPE_FORMAT_Z32_UNORM:
++      return (unsigned)(z * (double)0xffffffffu);
++   case PIPE_FORMAT_Z32_FLOAT: {
++      union fi fi;
++
++      fi.f = z;
++      return fi.ui;
++   }
++   default:
++      return (unsigned)(z * (float)((1 << 24) - 1));
++   }
++}
++
++static inline unsigned
++zread(int format, const ubyte *p)
++{
++   switch (format) {
++   case PIPE_FORMAT_Z16_UNORM: return *(const ushort *)p;
++   case PIPE_FORMAT_Z24X8_UNORM:
++   case PIPE_FORMAT_Z24_UNORM_S8_UINT: return *(const uint *)p & 0xffffff;
++   case PIPE_FORMAT_X8Z24_UNORM:
++   case PIPE_FORMAT_S8_UINT_Z24_UNORM: return *(const uint *)p >> 8;
++   default: return *(const uint *)p;
++   }
++}
++
++static inline void
++zwrite(int format, ubyte *p, unsigned z)
++{
++   switch (format) {
++   case PIPE_FORMAT_Z16_UNORM: *(ushort *)p = (ushort)z; break;
++   case PIPE_FORMAT_Z24X8_UNORM:
++   case PIPE_FORMAT_Z24_UNORM_S8_UINT: *(uint *)p = (*(uint *)p & 0xff000000u) | z; break;
++   case PIPE_FORMAT_X8Z24_UNORM:
++   case PIPE_FORMAT_S8_UINT_Z24_UNORM: *(uint *)p = (*(uint *)p & 0xffu) | (z << 8); break;
++   default: *(uint *)p = z;
++   }
++}
++
++static inline int
++zbytes(int format)
++{
++   return format == PIPE_FORMAT_Z16_UNORM ? 2 : 4;
++}
++
++/* canonical packed colour: r | g << 8 | b << 16 | a << 24 */
++#define R(v) ((v) & 0xff)
++#define G(v) (((v) >> 8) & 0xff)
++#define B(v) (((v) >> 16) & 0xff)
++#define A(v) ((v) >> 24)
++
++static inline uint32_t
++pack(unsigned r, unsigned g, unsigned b, unsigned a)
++{
++   return r | g << 8 | b << 16 | a << 24;
++}
++
++static inline uint32_t
++mod4(uint32_t a, uint32_t b)
++{
++   return pack(mul255(R(a), R(b)), mul255(G(a), G(b)), mul255(B(a), B(b)), mul255(A(a), A(b)));
++}
++
++/* (a * (256 - f) + b * f) / 256 per channel, f 0..256 */
++static inline uint32_t
++lerp4(uint32_t a, uint32_t b, unsigned f)
++{
++   const uint32_t rb = ((((a & 0xff00ffu) * (256 - f) + (b & 0xff00ffu) * f) + 0x800080u) >> 8) & 0xff00ffu;
++   const uint32_t ag = ((((a >> 8) & 0xff00ffu) * (256 - f) + ((b >> 8) & 0xff00ffu) * f) + 0x800080u) & 0xff00ff00u;
++
++   return rb | ag;
++}
++
++static inline uint32_t
++load_texel(const struct sp_fast_tex *t, int l, int x, int y)
++{
++   const ubyte *p = t->data[l] + (unsigned)y * t->stride[l] + (unsigned)x * t->bpp;
++   unsigned c[4];
++   int i;
++
++   if (t->ident)
++      return *(const uint32_t *)p;
++   for (i = 0; i < 4; i++)
++      c[i] = t->map[i] >= 0 ? p[t->map[i]] : t->map[i] == -1 ? 0 : 255;
++   return pack(c[0], c[1], c[2], c[3]);
++}
++
++/* u, v: texel coordinates, 16.16, the half-texel offset taken off for linear */
++static inline uint32_t
++fetch(const struct sp_fast_tex *t, int l, int linear, int u, int v)
++{
++   const int w = t->w[l], h = t->h[l];
++   int x0 = u >> 16, y0 = v >> 16;
++
++   if (!linear)
++      return load_texel(t, l, wrap(x0, w, t->clamp_s), wrap(y0, h, t->clamp_t));
++   {
++      const unsigned fx = (u >> 8) & 0xff, fy = (v >> 8) & 0xff;
++      const int x1 = wrap(x0 + 1, w, t->clamp_s), y1 = wrap(y0 + 1, h, t->clamp_t);
++
++      x0 = wrap(x0, w, t->clamp_s);
++      y0 = wrap(y0, h, t->clamp_t);
++      return lerp4(lerp4(load_texel(t, l, x0, y0), load_texel(t, l, x1, y0), fx),
++                   lerp4(load_texel(t, l, x0, y1), load_texel(t, l, x1, y1), fx), fy);
++   }
++}
++
++/* fetch() for one word per texel (fast4): masks (repeat, a power of two)
++   or min/max (clamp) and whole-word loads, inline in the spans */
++static inline __attribute__((always_inline)) int
++coord(int i, unsigned size, int clamp)
++{
++   if (clamp)
++      return i < 0 ? 0 : i >= (int)size ? (int)size - 1 : i;
++   return (int)((unsigned)i & (size - 1));
++}
++
++static inline __attribute__((always_inline)) uint32_t
++fetch_fast(const struct sp_fast_tex *t, int l, int linear, int u, int v)
++{
++   if (t->fast4) {
++      const unsigned w = (unsigned)t->w[l], h = (unsigned)t->h[l];
++      const ubyte *base = t->data[l];
++      const unsigned stride = t->stride[l];
++      const int xi = u >> 16, yi = v >> 16;
++      const unsigned x0 = coord(xi, w, t->clamp_s), y0 = coord(yi, h, t->clamp_t);
++      const uint32_t *r0 = (const uint32_t *)(base + y0 * stride), *r1;
++      unsigned x1;
++
++      if (!linear)
++         return r0[x0] | t->amask;
++      x1 = coord(xi + 1, w, t->clamp_s);
++      r1 = (const uint32_t *)(base + coord(yi + 1, h, t->clamp_t) * stride);
++      return lerp4(lerp4(r0[x0], r0[x1], (u >> 8) & 0xff), lerp4(r1[x0], r1[x1], (u >> 8) & 0xff),
++                   (v >> 8) & 0xff) | t->amask;
++   }
++   return fetch(t, l, linear, u, v) | t->amask;
++}
++
++static inline uint32_t
++load_pixel(const struct sp_fast *f, const ubyte *p)
++{
++   unsigned c[4];
++   int i;
++
++   switch (f->cpack) {
++   case CPACK_RGBA: return *(const uint32_t *)p;
++   case CPACK_BGRA: {
++      const uint32_t v = *(const uint32_t *)p;
++
++      return (v & 0xff00ff00u) | (v >> 16 & 0xff) | (v & 0xff) << 16;
++   }
++   default:
++      for (i = 0; i < 4; i++)
++         c[i] = f->cmap[i] >= 0 ? p[f->cmap[i]] : 255;
++      return pack(c[0], c[1], c[2], c[3]);
++   }
++}
++
++static inline void
++store_pixel(const struct sp_fast *f, ubyte *p, uint32_t v)
++{
++   int i;
++
++   switch (f->cpack) {
++   case CPACK_RGBA: *(uint32_t *)p = v; return;
++   case CPACK_BGRA: *(uint32_t *)p = (v & 0xff00ff00u) | (v >> 16 & 0xff) | (v & 0xff) << 16; return;
++   default:
++      for (i = 0; i < 4; i++)
++         if (f->cmap[i] >= 0 && (f->colormask & (1 << i)))
++            p[f->cmap[i]] = (ubyte)(v >> (8 * i));
++   }
++}
++
++static uint32_t
++blend_generic(const struct sp_fast *f, uint32_t s, uint32_t d)
++{
++   const unsigned src[4] = { R(s), G(s), B(s), A(s) }, dst[4] = { R(d), G(d), B(d), A(d) };
++   unsigned o[4];
++   int c;
++
++   for (c = 0; c < 3; c++)
++      o[c] = f->rgb_func >= PIPE_BLEND_MIN ? combine(f->rgb_func, src[c], dst[c]) :
++             combine(f->rgb_func, mul255(src[c], factor(f->rgb_src, src, dst, c)),
++                     mul255(dst[c], factor(f->rgb_dst, src, dst, c)));
++   o[3] = f->a_func >= PIPE_BLEND_MIN ? combine(f->a_func, src[3], dst[3]) :
++          combine(f->a_func, mul255(src[3], factor(f->a_src, src, dst, 3)),
++                  mul255(dst[3], factor(f->a_dst, src, dst, 3)));
++   return pack(o[0], o[1], o[2], o[3]);
++}
++
++/* the fog factor of a vertex, 0..1 */
++static inline float
++fog_factor(const struct sp_fast *f, const float (*v)[4])
++{
++   const float c = v[f->fog_slot][0] * f->fog_scale;
++   const float r = f->fog_kind == FOG_EXP ? util_fast_exp2(-c) : c + f->fog_off;
++
++   return CLAMP(r, 0.0f, 1.0f);
++}
++
++static inline int32_t
++fog_fix(float v)
++{
++   const float m = 65536.0f * 255.0f;
++   const float r = v * m;
++
++   return (int32_t)CLAMP(r, -m, m);
++}
++
++/* the factor is exact at the corners and linear between them, as fog per
++   vertex is: a shader's exponential per pixel costs a thousand cycles */
++static void
++fog_plane(struct sp_fast *f, const float (*v0)[4], const float (*v1)[4], const float (*v2)[4])
++{
++   const float f0 = fog_factor(f, v0), f1 = fog_factor(f, v1) - f0, f2 = fog_factor(f, v2) - f0;
++   const float ax = v1[0][0] - v0[0][0], ay = v1[0][1] - v0[0][1];
++   const float bx = v2[0][0] - v0[0][0], by = v2[0][1] - v0[0][1];
++   const float det = ax * by - bx * ay;
++   float dx = 0.0f, dy = 0.0f;
++
++   if (det != 0.0f) {
++      const float r = 1.0f / det;
++
++      dx = (f1 * by - f2 * ay) * r;
++      dy = (f2 * ax - f1 * bx) * r;
++   }
++   f->FDX = fog_fix(dx);
++   f->FDY = fog_fix(dy);
++   f->FO = fog_fix(f0 + dx * ((float)(int)v0[0][0] - v0[0][0]) + dy * ((float)(int)v0[0][1] - v0[0][1]));
++}
++
++void
++sp_fast_tri(struct sp_fast *f, const float (*provoke)[4],
++            const float (*v0)[4], const float (*v1)[4], const float (*v2)[4])
++{
++   unsigned c8[4] = { 255, 255, 255, 255 };
++   int c;
++
++   if (f->fog_kind)
++      fog_plane(f, v0, v1, v2);
++   f->tri_const = TRUE;
++   if (f->col_in < 0) {
++      f->tri_col = 0xffffffffu;
++      return;
++   }
++   if (f->col_const) {
++      f->tri_col = f->const_col;
++      return;
++   }
++   for (c = 0; c < 4; c++) {
++      const int ch = f->col_chan[c];
++
++      if (ch < 0)
++         continue;
++      if (f->col_interp == SP_INTERP_CONSTANT) {
++         c8[c] = to8(provoke[f->col_slot][ch]);
++      } else {
++         const float a = v0[f->col_slot][ch];
++
++         if (v1[f->col_slot][ch] != a || v2[f->col_slot][ch] != a) {
++            /* the spans interpolate it: no constant colour on top */
++            f->tri_const = FALSE;
++            f->tri_col = 0xffffffffu;
++            return;
++         }
++         c8[c] = to8(a);
++      }
++   }
++   f->tri_col = pack(c8[0], c8[1], c8[2], c8[3]);
++}
++
++/* texel of level l at normalized (s, t) */
++static inline uint32_t
++tex_at(const struct sp_fast_tex *t, int l, int linear, float s, float tt)
++{
++   const float off = linear ? 0.5f : 0.0f;
++
++   /* keep the 16.16 texel coordinates in range */
++   if (t->clamp_s)
++      s = CLAMP(s, -4.0f, 4.0f);
++   else
++      s -= (float)util_ifloor(s);
++   if (t->clamp_t)
++      tt = CLAMP(tt, -4.0f, 4.0f);
++   else
++      tt -= (float)util_ifloor(tt);
++   return fetch(t, l, linear, (int)((s * (float)t->w[l] - off) * 65536.0f),
++                (int)((tt * (float)t->h[l] - off) * 65536.0f));
++}
++
++static inline uint32_t
++tex_sample(const struct sp_fast_tex *t, float s, float tt, float lambda)
++{
++   int l;
++
++   if (!t->need_lambda || !(lambda > 0.0f))      /* (not a number too) */
++      return tex_at(t, t->first, t->mag_linear, s, tt);
++   lambda = MIN2(lambda, 15.0f);
++   switch (t->mip) {
++   case PIPE_TEX_MIPFILTER_NEAREST:
++      l = t->first + (int)(lambda + 0.5f);
++      return tex_at(t, MIN2(l, t->last), t->min_linear, s, tt);
++   case PIPE_TEX_MIPFILTER_LINEAR:
++      l = t->first + (int)lambda;
++      if (l >= t->last)
++         return tex_at(t, t->last, t->min_linear, s, tt);
++      return lerp4(tex_at(t, l, t->min_linear, s, tt), tex_at(t, l + 1, t->min_linear, s, tt),
++                   (unsigned)((lambda - (float)(int)lambda) * 256.0f));
++   default:
++      return tex_at(t, t->first, t->min_linear, s, tt);
++   }
++}
++
++/* output channel c: colour channel col_chan[c] times texel channel chan[c] of each unit */
++static uint32_t
++combine_mixed(const struct sp_fast *f, uint32_t cv, uint32_t tv0, uint32_t tv1)
++{
++   const uint32_t tv[SP_FAST_UNITS] = { tv0, tv1 };
++   unsigned o[4];
++   int c, k;
++
++   for (c = 0; c < 4; c++) {
++      unsigned v = f->col_in >= 0 && f->col_chan[c] >= 0 ? (cv >> (8 * c)) & 0xff : 255;
++
++      for (k = 0; k < SP_FAST_UNITS; k++)
++         if (f->u[k].in >= 0 && f->u[k].chan[c] >= 0)
++            v = mul255(v, (tv[k] >> (8 * f->u[k].chan[c])) & 0xff);
++      o[c] = v;
++   }
++   return pack(o[0], o[1], o[2], o[3]);
++}
++
++static void fast_span(const struct sp_fast *f, const struct tgsi_interp_coef *coef,
++                      const struct tgsi_interp_coef *pos, int y, int x0, int x1);
++
++/*
++ * The span in integers: Z, texel coordinates and colours are evaluated
++ * exactly (in float) at the start of the span and every SEG pixels, and
++ * stepped in fixed point in between.  The Cortex-A9's VFP has long
++ * latencies (16 cycles a divide, 11 a dependent multiply-add), so the
++ * float work is per span, not per pixel.  Z: Z16 as 16.16, Z24 as 24.8.
++ */
++#define SEG 16
++
++/* level, filter and 16.16 texel coordinates (u, v, du, dv) at pixel x */
++static inline void
++tex_setup(const struct sp_fast_unit *un, const struct tgsi_interp_coef *tc,
++          const struct tgsi_interp_coef *pos, float fx, float fy, int *level, int *linear,
++          int32_t *u, int32_t *v, int32_t *du, int32_t *dv, boolean pick, float *rq_share)
++{
++   const struct sp_fast_tex *t = &un->tex;
++   const int cs = un->coord_chan[0], ct = un->coord_chan[1];
++   float S = tc->a0[cs] + tc->dadx[cs] * fx + tc->dady[cs] * fy;
++   float T = tc->a0[ct] + tc->dadx[ct] * fx + tc->dady[ct] * fy;
++   float Q = 1.0f, dQdx = 0.0f, dQdy = 0.0f, rq, s, tt, dsdx, dtdx, w, h, off;
++
++   if (un->txp) {
++      const int cq = un->coord_chan[2];
++
++      Q = tc->a0[cq] + tc->dadx[cq] * fx + tc->dady[cq] * fy;
++      dQdx = tc->dadx[cq];
++      dQdy = tc->dady[cq];
++   } else if (un->interp == SP_INTERP_PERSPECTIVE) {
++      Q = pos->a0[3] + pos->dadx[3] * fx + pos->dady[3] * fy;
++      dQdx = pos->dadx[3];
++      dQdy = pos->dady[3];
++   }
++   /* 1/Q: the other unit's when their Q planes are the same (rq_share) */
++   if (rq_share && *rq_share != 0.0f)
++      rq = *rq_share;
++   else {
++      rq = 1.0f / Q;
++      if (rq_share)
++         *rq_share = rq;
++   }
++   s = S * rq;
++   tt = T * rq;
++   dsdx = (tc->dadx[cs] - s * dQdx) * rq;
++   dtdx = (tc->dadx[ct] - tt * dQdx) * rq;
++   if (pick) {
++      float lambda = 0.0f;
++
++      if (t->need_lambda) {
++         const float dsdy = (tc->dady[cs] - s * dQdy) * rq;
++         const float dtdy = (tc->dady[ct] - tt * dQdy) * rq;
++         const float rs = MAX2(fabsf(dsdx), fabsf(dsdy)) * (float)t->w[t->first];
++         const float rt = MAX2(fabsf(dtdx), fabsf(dtdy)) * (float)t->h[t->first];
++
++         lambda = util_fast_log2(MAX2(rs, rt)) + t->lod_bias;
++         lambda = CLAMP(lambda, t->min_lod, t->max_lod);
++      }
++      pick_level(t, lambda, level, linear);
++   }
++   w = (float)t->w[*level];
++   h = (float)t->h[*level];
++   off = *linear ? 0.5f : 0.0f;
++   if (t->clamp_s)
++      s = CLAMP(s, -4.0f, 4.0f);
++   else
++      s -= (float)util_ifloor(s);
++   if (t->clamp_t)
++      tt = CLAMP(tt, -4.0f, 4.0f);
++   else
++      tt -= (float)util_ifloor(tt);
++   dsdx = CLAMP(dsdx, -1.0f, 1.0f);
++   dtdx = CLAMP(dtdx, -1.0f, 1.0f);
++   *u = (int32_t)((s * w - off) * 65536.0f);
++   *v = (int32_t)((tt * h - off) * 65536.0f);
++   *du = (int32_t)(dsdx * w * 65536.0f);
++   *dv = (int32_t)(dtdx * h * 65536.0f);
++}
++
++/* colour channels as 8.16 (0..255) and their steps at pixel x */
++static inline void
++col_setup(const struct sp_fast *f, const struct tgsi_interp_coef *cc,
++          const struct tgsi_interp_coef *pos, float fx, float fy, int32_t c[4], int32_t dc[4])
++{
++   const boolean persp = f->col_interp == SP_INTERP_PERSPECTIVE;
++   const float oow = persp ? pos->a0[3] + pos->dadx[3] * fx + pos->dady[3] * fy : 1.0f;
++   const float w = persp ? 1.0f / oow : 1.0f;
++   const float doow = persp ? pos->dadx[3] : 0.0f;
++   int i;
++
++   for (i = 0; i < 4; i++) {
++      const int ch = f->col_chan[i];
++      float v, dv;
++
++      if (ch < 0) {
++         c[i] = 255 << 16;
++         dc[i] = 0;
++         continue;
++      }
++      v = (cc->a0[ch] + cc->dadx[ch] * fx + cc->dady[ch] * fy) * w;
++      dv = (cc->dadx[ch] - v * doow) * w;
++      v = CLAMP(v, 0.0f, 1.0f);
++      dv = CLAMP(dv, -1.0f, 1.0f);
++      c[i] = (int32_t)(v * (255.0f * 65536.0f)) + 32768;
++      dc[i] = (int32_t)(dv * (255.0f * 65536.0f));
++   }
++}
++
++static inline unsigned
++col8(int32_t v)
++{
++   return v <= 0 ? 0 : v >= (255 << 16) ? 255 : (unsigned)v >> 16;
++}
++
++#ifdef __ARM_NEON
++/*
++ * The pixel arithmetic in NEON: a pixel is the low half of a uint8x8_t
++ * (r, g, b, a bytes).  Values stay in NEON from the texel loads to the
++ * store: moving them to ARM registers costs ~20 cycles on the Cortex-A9.
++ */
++#include <arm_neon.h>
++
++/* round(a * b / 255) per byte */
++static inline uint8x8_t
++n_mod(uint8x8_t a, uint8x8_t b)
++{
++   uint16x8_t t = vmull_u8(a, b);
++
++   return vrshrn_n_u16(vaddq_u16(t, vrshrq_n_u16(t, 8)), 8);
++}
++
++/* round(t / 255) of products */
++static inline uint8x8_t
++n_div255(uint16x8_t t)
++{
++   return vrshrn_n_u16(vaddq_u16(t, vrshrq_n_u16(t, 8)), 8);
++}
++
++static inline uint8x8_t
++n_word(uint32_t v)
++{
++   return vreinterpret_u8_u32(vdup_n_u32(v));
++}
++
++/* fetch_fast() in NEON; bilinear weights of 7 bits */
++static inline __attribute__((always_inline)) uint8x8_t
++fetch_neon(const struct sp_fast_tex *t, int l, int linear, int u, int v)
++{
++   if (t->fast4) {
++      const unsigned w = (unsigned)t->w[l], h = (unsigned)t->h[l];
++      const ubyte *base = t->data[l];
++      const unsigned stride = t->stride[l];
++      const int xi = u >> 16, yi = v >> 16;
++      const unsigned x0 = coord(xi, w, t->clamp_s), y0 = coord(yi, h, t->clamp_t);
++      const uint32_t *r0 = (const uint32_t *)(base + y0 * stride), *r1;
++      const uint8x8_t am = vreinterpret_u8_u32(vdup_n_u32(t->amask));
++      unsigned x1, fx, fy;
++      uint32x2_t top, bot;
++      uint16x8_t m;
++      uint32x4_t wv;
++
++      if (!linear)
++         return vorr_u8(vreinterpret_u8_u32(vld1_dup_u32(r0 + x0)), am);
++      x1 = coord(xi + 1, w, t->clamp_s);
++      r1 = (const uint32_t *)(base + coord(yi + 1, h, t->clamp_t) * stride);
++      fx = (u >> 9) & 0x7f;
++      fy = (v >> 9) & 0x7f;
++      top = vld1_lane_u32(r0 + x1, vld1_dup_u32(r0 + x0), 1);
++      bot = vld1_lane_u32(r1 + x1, vld1_dup_u32(r1 + x0), 1);
++      m = vmull_u8(vreinterpret_u8_u32(top), vdup_n_u8((uint8_t)(128 - fy)));
++      m = vmlal_u8(m, vreinterpret_u8_u32(bot), vdup_n_u8((uint8_t)fy));
++      wv = vmull_n_u16(vget_low_u16(m), (uint16_t)(128 - fx));
++      wv = vmlal_n_u16(wv, vget_high_u16(m), (uint16_t)fx);
++      {
++         const uint16x4_t r = vrshrn_n_u32(wv, 14);
++
++         return vorr_u8(vmovn_u16(vcombine_u16(r, r)), am);
++      }
++   }
++   return n_word(fetch(t, l, linear, u, v) | t->amask);
++}
++
++/* a level of a texture as the pixel loop needs it: copied into locals per
++   segment, so the stores to the colour and Z buffers (which may alias
++   anything) do not make the compiler reload it for every pixel */
++struct texl {
++   const struct sp_fast_tex *t;
++   const ubyte *base;
++   unsigned stride, w, h;
++   uint32_t amask;
++   int l, linear, clamp_s, clamp_t, fast4;
++   int wm, hm;                  /* w - 1, h - 1 */
++   uint8x8_t am;
++};
++
++static inline __attribute__((always_inline)) void
++texl_set(struct texl *L, const struct sp_fast_tex *t, int l, int linear)
++{
++   L->t = t;
++   L->base = t->data[l];
++   L->stride = t->stride[l];
++   L->w = (unsigned)t->w[l];
++   L->h = (unsigned)t->h[l];
++   L->amask = t->amask;
++   L->l = l;
++   L->linear = linear;
++   L->clamp_s = t->clamp_s;
++   L->clamp_t = t->clamp_t;
++   L->fast4 = t->fast4;
++   L->wm = (int)L->w - 1;
++   L->hm = (int)L->h - 1;
++   L->am = vreinterpret_u8_u32(vdup_n_u32(t->amask));
++}
++
++/* what fetch_k() can be compiled for: TK_DIRECT, bilinear fast4 whose
++   texel pairs of a segment all lie inside the level (no wrap, no clamp:
++   each row's two texels one load), else fetch_l() */
++enum { TK_ANY, TK_DIRECT };
++
++static inline int
++tex_kind(const struct texl *L, int32_t u, int32_t v, int32_t du, int32_t dv, int n)
++{
++   const int64_t ue = (int64_t)u + (int64_t)du * (n - 1), ve = (int64_t)v + (int64_t)dv * (n - 1);
++   const int64_t um = (int64_t)L->wm << 16, vm = (int64_t)L->hm << 16;
++
++   if (!L->fast4 || !L->linear)
++      return TK_ANY;
++   return u >= 0 && u < um && ue >= 0 && ue < um && v >= 0 && v < vm && ve >= 0 && ve < vm ?
++          TK_DIRECT : TK_ANY;
++}
++
++static inline __attribute__((always_inline)) uint8x8_t
++fetch_l(const struct texl *L, int u, int v)
++{
++   if (L->fast4) {
++      const int xi = u >> 16, yi = v >> 16;
++      const unsigned x0 = coord(xi, L->w, L->clamp_s), y0 = coord(yi, L->h, L->clamp_t);
++      const uint32_t *r0 = (const uint32_t *)(L->base + y0 * L->stride), *r1;
++      const uint8x8_t am = L->am;
++      unsigned x1, fx, fy;
++      uint32x2_t top, bot;
++      uint16x8_t m;
++      uint32x4_t wv;
++
++      if (!L->linear)
++         return vorr_u8(vreinterpret_u8_u32(vld1_dup_u32(r0 + x0)), am);
++      x1 = coord(xi + 1, L->w, L->clamp_s);
++      r1 = (const uint32_t *)(L->base + coord(yi + 1, L->h, L->clamp_t) * L->stride);
++      fx = (u >> 9) & 0x7f;
++      fy = (v >> 9) & 0x7f;
++      top = vld1_lane_u32(r0 + x1, vld1_dup_u32(r0 + x0), 1);
++      bot = vld1_lane_u32(r1 + x1, vld1_dup_u32(r1 + x0), 1);
++      m = vmull_u8(vreinterpret_u8_u32(top), vdup_n_u8((uint8_t)(128 - fy)));
++      m = vmlal_u8(m, vreinterpret_u8_u32(bot), vdup_n_u8((uint8_t)fy));
++      wv = vmull_n_u16(vget_low_u16(m), (uint16_t)(128 - fx));
++      wv = vmlal_n_u16(wv, vget_high_u16(m), (uint16_t)fx);
++      {
++         const uint16x4_t r = vrshrn_n_u32(wv, 14);
++
++         return vorr_u8(vmovn_u16(vcombine_u16(r, r)), am);
++      }
++   }
++   return n_word(fetch(L->t, L->l, L->linear, u, v) | L->amask);
++}
++
++static inline __attribute__((always_inline)) int
++clampi(int i, int m)
++{
++   return i < 0 ? 0 : i > m ? m : i;
++}
++
++/* fetch_l() for a kind known when compiling: no tests per pixel */
++static inline __attribute__((always_inline)) uint8x8_t
++fetch_k(const struct texl *L, const int K, int u, int v)
++{
++   const ubyte *p;
++   unsigned fx, fy;
++   uint32x2_t top, bot;
++   uint16x8_t m;
++   uint32x4_t wv;
++
++   if (K == TK_ANY)
++      return fetch_l(L, u, v);
++   p = L->base + (unsigned)(v >> 16) * L->stride + (unsigned)(u >> 16) * 4;
++   fx = (u >> 9) & 0x7f;
++   fy = (v >> 9) & 0x7f;
++   top = vld1_u32((const uint32_t *)p);
++   bot = vld1_u32((const uint32_t *)(p + L->stride));
++   m = vmull_u8(vreinterpret_u8_u32(top), vdup_n_u8((uint8_t)(128 - fy)));
++   m = vmlal_u8(m, vreinterpret_u8_u32(bot), vdup_n_u8((uint8_t)fy));
++   wv = vmull_n_u16(vget_low_u16(m), (uint16_t)(128 - fx));
++   wv = vmlal_n_u16(wv, vget_high_u16(m), (uint16_t)fx);
++   {
++      const uint16x4_t r = vrshrn_n_u32(wv, 14);
++
++      return vorr_u8(vmovn_u16(vcombine_u16(r, r)), L->am);
++   }
++}
++
++/* the colour the texels are multiplied by: none, the triangle's constant
++   one (tri_col) or the interpolated one */
++enum { CM_WHITE, CM_CONST, CM_INTERP };
++
++/* a pixel's colour before blending: texels times the colour (NEON) */
++static inline __attribute__((always_inline)) uint8x8_t
++px_color(const struct texl *L0, const struct texl *L1, const int NT, const int K0, const int K1,
++         int u0, int v0, int u1, int v1, const int CM, int32x4_t cvec, uint8x8_t tcol)
++{
++   uint8x8_t s8 = tcol;
++
++   if (NT >= 1) {
++      const uint8x8_t t8 = fetch_k(L0, K0, u0, v0);
++
++      s8 = CM != CM_CONST ? t8 : n_mod(t8, s8);
++   }
++   if (NT >= 2)
++      s8 = n_mod(s8, fetch_k(L1, K1, u1, v1));
++   if (CM == CM_INTERP) {
++      const uint8x8_t c8 = vqmovn_u16(vcombine_u16(vqshrun_n_s32(cvec, 16), vdup_n_u16(0)));
++
++      s8 = NT ? n_mod(s8, c8) : c8;
++   }
++   return s8;
++}
++#endif
++
++#ifdef __ARM_NEON
++/*
++ * tex_setup() for both units at once, in NEON lanes s0 t0 s1 t1: one
++ * dependent chain instead of two, one division (f->share_q).  The levels
++ * are chosen already (l, lin); out: u0 v0 u1 v1, du0 dv0 du1 dv1.
++ */
++static inline __attribute__((always_inline)) void
++tex_setup2(const struct sp_fast *f, float fx, float fy, int l0, int lin0, int l1, int lin1,
++           int32x4_t *uv, int32x4_t *duv)
++{
++   const struct sp_fast_tex *t0 = &f->u[0].tex, *t1 = &f->u[1].tex;
++   const float32x4_t dx = vld1q_f32(f->vq_dx);
++   const float32x4_t st = vmlaq_n_f32(vmlaq_n_f32(vld1q_f32(f->vq_a0), dx, fx), vld1q_f32(f->vq_dy), fy);
++   const float rq = 1.0f / (f->vq_q[0] + f->vq_q[1] * fx + f->vq_q[2] * fy);
++   const float32x4_t one = vdupq_n_f32(1.0f);
++   float32x4_t s = vmulq_n_f32(st, rq), d, fl, size, off;
++   const float32x2_t of0 = vdup_n_f32(lin0 ? 0.5f : 0.0f), of1 = vdup_n_f32(lin1 ? 0.5f : 0.0f);
++
++   d = vmulq_n_f32(vmlsq_n_f32(dx, s, f->vq_q[1]), rq);
++   /* repeat: s - floor(s); clamp: kept in -4..4 */
++   fl = vcvtq_f32_s32(vcvtq_s32_f32(s));
++   fl = vsubq_f32(fl, vreinterpretq_f32_u32(vandq_u32(vcgtq_f32(fl, s), vreinterpretq_u32_f32(one))));
++   s = vbslq_f32(vld1q_u32(f->vq_clamp), vminq_f32(vmaxq_f32(s, vdupq_n_f32(-4.0f)), vdupq_n_f32(4.0f)),
++                 vsubq_f32(s, fl));
++   d = vminq_f32(vmaxq_f32(d, vnegq_f32(one)), one);
++   size = vcombine_f32(vld1_f32(t0->fsize[l0]), vld1_f32(t1->fsize[l1]));
++   off = vcombine_f32(of0, of1);
++   *uv = vcvtq_n_s32_f32(vmlsq_f32(vmulq_f32(s, size), one, off), 16);
++   *duv = vcvtq_n_s32_f32(vmulq_f32(d, size), 16);
++}
++#endif
++
++#ifdef __ARM_NEON
++/* the fog factor of an 8.16 plane value */
++static inline unsigned
++fog8(int32_t v)
++{
++   const int i = v >> 16;
++
++   return i < 0 ? 0 : i > 255 ? 255 : (unsigned)i;
++}
++
++/* two pixels to the fog colour by factors a and b; alpha stays (fogc has
++   alpha 0, the weight is 255) */
++static inline __attribute__((always_inline)) uint8x8_t
++n_fog(uint8x8_t s, int32_t a, int32_t b, uint8x8_t fogc)
++{
++   const uint32_t wa = fog8(a) * 0x010101u | 0xff000000u, wb = fog8(b) * 0x010101u | 0xff000000u;
++   const uint8x8_t w = vreinterpret_u8_u32(vset_lane_u32(wb, vdup_n_u32(wa), 1));
++
++   return n_div255(vmlal_u8(vmull_u8(s, w), fogc, vmvn_u8(w)));
++}
++
++/* the state pair_run() carries along a span segment */
++struct pstate {
++   ubyte *cp, *zp;
++   uint32_t zacc;
++   int32_t u0, v0, u1, v1;
++   int x;
++   int32_t fogv;
++};
++
++/*
++ * span_tmpl()'s pixels two a turn: both Z tests, then both pixels'
++ * arithmetic without branches between (the A9 runs NEON in order: two
++ * independent chains hide each other's latencies), then the stores.  Also
++ * compiled per texture kind (K0, K1) and colour (CM).
++ */
++static inline __attribute__((always_inline)) void
++pair_run(const struct sp_fast *f, struct pstate *ps, int end, int32_t dz, int zsh,
++         int32_t du0, int32_t dv0, int32_t du1, int32_t dv1, int32_t *c, const int32_t *dc,
++         const struct texl *L0, const struct texl *L1, int z16, int zlow, int zb,
++         const int ZK, const int NT, const int BK, const int K0, const int K1, const int CM)
++{
++   static const uint8_t bgra2[8] = { 2, 1, 0, 3, 6, 5, 4, 7 };
++   const uint32_t tri_col = f->tri_col;
++   const int zwrite = f->zwrite, afunc = f->afunc, cpack = f->cpack, cbpp = f->cbpp;
++   const float areff = f->areff;
++   const uint8x8_t tcol = n_word(tri_col), fogc = n_word(f->fog_rgba);
++   const int fog = f->fog_kind;
++   const int32_t fogd = f->FDX;
++   int32_t fogv = ps->fogv;
++   int32x4_t cva = vld1q_s32(c);
++   const int32x4_t dcv = vld1q_s32(dc), dcv2 = vshlq_n_s32(dcv, 1);
++   ubyte *cp = ps->cp, *zp = ps->zp;
++   uint32_t zacc = ps->zacc;
++   int32_t u0 = ps->u0, v0 = ps->v0, u1 = ps->u1, v1 = ps->v1;
++   int x = ps->x;
++
++      for (; x + 1 < end; x += 2, cp += 2 * cbpp, zp += 2 * zb, zacc += 2 * (uint32_t)dz,
++           u0 += 2 * du0, v0 += 2 * dv0, u1 += 2 * du1, v1 += 2 * dv1, cva = vaddq_s32(cva, dcv2),
++           fogv += 2 * fogd) {
++         unsigned za = 0, zbv = 0;
++         int la = 1, lb = 1;
++         uint8x8_t sa, sb;
++
++         if (ZK) {
++            const unsigned oa = z16 ? ((const ushort *)zp)[0] :
++                                zlow ? ((const uint *)zp)[0] & 0xffffff : ((const uint *)zp)[0] >> 8;
++            const unsigned ob = z16 ? ((const ushort *)zp)[1] :
++                                zlow ? ((const uint *)zp)[1] & 0xffffff : ((const uint *)zp)[1] >> 8;
++
++            za = zacc >> zsh;
++            zbv = (zacc + (uint32_t)dz) >> zsh;
++            if (ZK == 1) {
++               la = za <= oa;
++               lb = zbv <= ob;
++            } else if (ZK == 2) {
++               la = za == oa;
++               lb = zbv == ob;
++            } else if (ZK == 3) {
++               la = za < oa;
++               lb = zbv < ob;
++            } else {
++               la = test(f->zfunc, za, oa);
++               lb = test(f->zfunc, zbv, ob);
++            }
++            if (!(la | lb))
++               continue;
++         }
++         sa = px_color(L0, L1, NT, K0, K1, u0, v0, u1, v1, CM, cva, tcol);
++         sb = px_color(L0, L1, NT, K0, K1, u0 + du0, v0 + dv0, u1 + du1, v1 + dv1, CM,
++                       vaddq_s32(cva, dcv), tcol);
++         if (afunc != PIPE_FUNC_ALWAYS) {
++            la = la && testf(afunc, (float)vget_lane_u8(sa, 3) * (1.0f / 255.0f), areff);
++            lb = lb && testf(afunc, (float)vget_lane_u8(sb, 3) * (1.0f / 255.0f), areff);
++         }
++         if (ZK && zwrite) {
++            if (z16) {
++               if (la)
++                  ((ushort *)zp)[0] = (ushort)za;
++               if (lb)
++                  ((ushort *)zp)[1] = (ushort)zbv;
++            } else if (zlow) {
++               if (la)
++                  ((uint *)zp)[0] = (((uint *)zp)[0] & 0xff000000u) | za;
++               if (lb)
++                  ((uint *)zp)[1] = (((uint *)zp)[1] & 0xff000000u) | zbv;
++            } else {
++               if (la)
++                  ((uint *)zp)[0] = (((uint *)zp)[0] & 0xffu) | (za << 8);
++               if (lb)
++                  ((uint *)zp)[1] = (((uint *)zp)[1] & 0xffu) | (zbv << 8);
++            }
++         }
++         {
++            /* both pixels in one register: a in the low half, b in the high */
++            uint8x8_t s2 = vreinterpret_u8_u32(vzip_u32(vreinterpret_u32_u8(sa),
++                                                        vreinterpret_u32_u8(sb)).val[0]);
++            if (fog)
++               s2 = n_fog(s2, fogv, fogv + fogd, fogc);
++            if (BK != BLEND_NONE) {
++               uint8x8_t d2 = vreinterpret_u8_u32(vld1_u32((const uint32_t *)cp));
++
++               if (cpack == CPACK_BGRA)
++                  d2 = vtbl1_u8(d2, vld1_u8(bgra2));
++               if (BK == BLEND_MODULATE) {
++                  s2 = n_mod(s2, d2);
++               } else if (BK == BLEND_ALPHA) {
++                  static const uint8_t alpha_idx[8] = { 3, 3, 3, 3, 7, 7, 7, 7 };
++                  const uint8x8_t a = vtbl1_u8(s2, vld1_u8(alpha_idx));
++
++                  s2 = n_div255(vmlal_u8(vmull_u8(s2, a), d2, vmvn_u8(a)));
++               } else {
++                  s2 = vqadd_u8(s2, d2);
++               }
++            }
++            if (cpack == CPACK_BGRA)
++               s2 = vtbl1_u8(s2, vld1_u8(bgra2));
++            if (la && lb) {
++               vst1_u32((uint32_t *)cp, vreinterpret_u32_u8(s2));
++            } else if (la) {
++               vst1_lane_u32((uint32_t *)cp, vreinterpret_u32_u8(s2), 0);
++            } else if (lb) {
++               vst1_lane_u32((uint32_t *)cp + 1, vreinterpret_u32_u8(s2), 1);
++            }
++         }
++      }
++   vst1q_s32(c, cva);
++   ps->cp = cp;
++   ps->zp = zp;
++   ps->zacc = zacc;
++   ps->u0 = u0;
++   ps->v0 = v0;
++   ps->u1 = u1;
++   ps->v1 = v1;
++   ps->x = x;
++   ps->fogv = fogv;
++}
++#endif
++
++/* the Q planes of units 0 and 1 are the same */
++static inline boolean
++same_q(const struct sp_fast *f, const struct tgsi_interp_coef *coef, const struct tgsi_interp_coef *pos)
++{
++   const struct sp_fast_unit *a = &f->u[0], *b = &f->u[1];
++   const float *qa0, *qa1, *qa2, *qb0, *qb1, *qb2;
++
++   if (a->txp != b->txp || a->interp != b->interp)
++      return FALSE;
++   if (!a->txp)
++      return a->interp == SP_INTERP_PERSPECTIVE;    /* both 1/w */
++   qa0 = &coef[a->in].a0[a->coord_chan[2]]; qa1 = &coef[a->in].dadx[a->coord_chan[2]];
++   qa2 = &coef[a->in].dady[a->coord_chan[2]];
++   qb0 = &coef[b->in].a0[b->coord_chan[2]]; qb1 = &coef[b->in].dadx[b->coord_chan[2]];
++   qb2 = &coef[b->in].dady[b->coord_chan[2]];
++   (void)pos;
++   return *qa0 == *qb0 && *qa1 == *qb1 && *qa2 == *qb2;
++}
++
++/* the start of a span from the affine planes: wrapped (repeat) or kept in
++   range (clamp) */
++static inline __attribute__((always_inline)) void
++aff_setup(const struct sp_fast_unit *un, int dx, int dy, int *level, int *linear,
++          int32_t *u, int32_t *v, int32_t *du, int32_t *dv)
++{
++   const struct sp_fast_tex *t = &un->tex;
++   const int32_t wl = t->w[un->aff_level] << 16, hl = t->h[un->aff_level] << 16;
++
++   *level = un->aff_level;
++   *linear = un->aff_linear;
++   if (t->clamp_s) {
++      const int64_t U = (int64_t)un->UO + (int64_t)un->UDX * dx + (int64_t)un->UDY * dy;
++
++      *u = (int32_t)(U < -4 * (int64_t)wl ? -4 * (int64_t)wl : U > 4 * (int64_t)wl ? 4 * (int64_t)wl : U);
++   } else {
++      *u = (int32_t)(((uint32_t)un->UO + (uint32_t)un->UDX * (uint32_t)dx +
++                      (uint32_t)un->UDY * (uint32_t)dy) & (uint32_t)(wl - 1));
++   }
++   if (t->clamp_t) {
++      const int64_t V = (int64_t)un->VO + (int64_t)un->VDX * dx + (int64_t)un->VDY * dy;
++
++      *v = (int32_t)(V < -4 * (int64_t)hl ? -4 * (int64_t)hl : V > 4 * (int64_t)hl ? 4 * (int64_t)hl : V);
++   } else {
++      *v = (int32_t)(((uint32_t)un->VO + (uint32_t)un->VDX * (uint32_t)dx +
++                      (uint32_t)un->VDY * (uint32_t)dy) & (uint32_t)(hl - 1));
++   }
++   *du = un->UDX;
++   *dv = un->VDX;
++}
++
++/*
++ * The span, compiled per depth test (ZK: 0 none, 1-3 Z16 with LEQUAL,
++ * EQUAL, LESS, 4 any), texture units (NT) and blend (BK, BLEND_x): the
++ * per-pixel choices become constants.
++ */
++static inline __attribute__((always_inline)) void
++span_tmpl(const struct sp_fast *f, const struct tgsi_interp_coef *coef,
++          const struct tgsi_interp_coef *pos, int y, int x0, int x1,
++          const int ZK, const int NT, const int BK, const int NEON)
++{
++   const struct sp_fast_tex *t0 = &f->u[0].tex, *t1 = &f->u[1].tex;
++   const float fy = (float)y;
++   const struct tgsi_interp_coef *cc = f->col_in >= 0 && !f->tri_const ? &coef[f->col_in] : NULL;
++   const struct tgsi_interp_coef *tc0 = NT >= 1 ? &coef[f->u[0].in] : NULL;
++   const struct tgsi_interp_coef *tc1 = NT >= 2 ? &coef[f->u[1].in] : NULL;
++   const int zb = f->zformat ? zbytes(f->zformat) : 0;
++   const int cbpp = f->cbpp;
++   const int z16 = (ZK >= 1 && ZK <= 3) || f->zformat == PIPE_FORMAT_Z16_UNORM;
++   const int zlow = f->zformat == PIPE_FORMAT_Z24X8_UNORM || f->zformat == PIPE_FORMAT_Z24_UNORM_S8_UINT;
++   ubyte *cp = f->cbuf + (unsigned)y * f->cstride + (unsigned)x0 * cbpp;
++   ubyte *zp = ZK ? f->zbuf + (unsigned)y * f->zstride + (unsigned)x0 * zb : NULL;
++   uint32_t zacc = 0;
++   int32_t dz = 0;
++   int zsh = 0, zfloat = 0, x;
++   int level0 = 0, linear0 = 0, level1 = 0, linear1 = 0;
++   int32_t u0 = 0, v0 = 0, du0 = 0, dv0 = 0, u1 = 0, v1 = 0, du1 = 0, dv1 = 0;
++   int32_t c[4] = { 0, 0, 0, 0 }, dc[4] = { 0, 0, 0, 0 };
++   /* what the pixels read, in locals (see struct texl) */
++   const int zwrite = f->zwrite, afunc = f->afunc, cpack = f->cpack;
++   const float areff = f->areff;
++   const uint32_t tri_col = f->tri_col;
++#ifdef __ARM_NEON
++   struct texl L0, L1;
++#endif
++   /* both units divide by the same Q (texture q 1.0 on both, as GL1 games
++      send them): one division for the two */
++   const boolean share = NT >= 2 && f->share_q;
++   const int32_t fogd = f->fog_kind ? f->FDX : 0;
++   int32_t fogv = f->fog_kind ? f->FO + f->FDX * (x0 - f->ox) + f->FDY * (y - f->oy) : 0;
++
++   if (zp) {
++      const int fb = zfrac_bits(f->zformat);
++      const int64_t z0 = (int64_t)f->ZO + (int64_t)f->ZDX * (x0 - f->ox) + (int64_t)f->ZDY * (y - f->oy);
++      const int64_t zl = z0 + (int64_t)f->ZDX * (x1 - x0 - 1), top = (int64_t)(z16 ? 65535 : 16777215) << fb;
++
++      /* stepping off the ends of the range: Z per pixel in float, clamped */
++      zfloat = !f->zplane || z0 < 0 || z0 > top || zl < 0 || zl > top;
++      zacc = (uint32_t)z0;
++      dz = f->ZDX;
++      zsh = fb;
++   }
++
++   for (x = x0; x < x1; ) {
++      int end;
++
++      if (f->tri_affine) {
++         /* small and nearly flat: the planes, in integers */
++         end = x1;
++         const int ax = x0 - f->ox, ay = y - f->oy;
++
++         if (NT >= 1)
++            aff_setup(&f->u[0], ax, ay, &level0, &linear0, &u0, &v0, &du0, &dv0);
++         if (NT >= 2)
++            aff_setup(&f->u[1], ax, ay, &level1, &linear1, &u1, &v1, &du1, &dv1);
++         if (cc) {
++            int i;
++
++            for (i = 0; i < 4; i++) {
++               c[i] = f->CO[i] + f->CDX[i] * ax + f->CDY[i] * ay;
++               dc[i] = f->CDX[i];
++            }
++         }
++      } else {
++         const boolean pick = x == x0 && !f->tri_level;
++
++         SPF_PROF_BEGIN(ts);
++         end = MIN2(x1, x + f->seg);
++         if (x == x0 && f->tri_level) {
++            level0 = f->u[0].aff_level;
++            linear0 = f->u[0].aff_linear;
++            level1 = f->u[1].aff_level;
++            linear1 = f->u[1].aff_linear;
++         }
++         float rq = 0.0f;
++
++#ifdef __ARM_NEON
++         if (NEON && share && !pick) {
++            int32x4_t uv, duv;
++
++            tex_setup2(f, (float)x, fy, level0, linear0, level1, linear1, &uv, &duv);
++            u0 = vgetq_lane_s32(uv, 0);
++            v0 = vgetq_lane_s32(uv, 1);
++            u1 = vgetq_lane_s32(uv, 2);
++            v1 = vgetq_lane_s32(uv, 3);
++            du0 = vgetq_lane_s32(duv, 0);
++            dv0 = vgetq_lane_s32(duv, 1);
++            du1 = vgetq_lane_s32(duv, 2);
++            dv1 = vgetq_lane_s32(duv, 3);
++         } else
++#endif
++         {
++            if (tc0)
++               tex_setup(&f->u[0], tc0, pos, (float)x, fy, &level0, &linear0, &u0, &v0, &du0, &dv0, pick,
++                         share ? &rq : NULL);
++            if (tc1)
++               tex_setup(&f->u[1], tc1, pos, (float)x, fy, &level1, &linear1, &u1, &v1, &du1, &dv1, pick,
++                         share ? &rq : NULL);
++         }
++         if (cc)
++            col_setup(f, cc, pos, (float)x, fy, c, dc);
++         SPF_PROF_END(12, ts);
++         SPF_PROF_ADD(13, 1);
++      }
++
++#ifdef __ARM_NEON
++      if (NEON) {
++         if (NT >= 1)
++            texl_set(&L0, t0, level0, linear0);
++         if (NT >= 2)
++            texl_set(&L1, t1, level1, linear1);
++      }
++#endif
++#ifdef __ARM_NEON
++      /* two pixels a turn (pair_run()) */
++      if (NEON && !zfloat && x + 1 < end && f->pairs) {
++         struct pstate ps = { cp, zp, zacc, u0, v0, u1, v1, x, fogv };
++
++         SPF_PROF_ADD(8, (end - x) & ~1);       /* pixels two a turn */
++         const int cm = cc ? CM_INTERP : tri_col == 0xffffffffu ? CM_WHITE : CM_CONST;
++#define PAIRS(K0, K1, CM) pair_run(f, &ps, end, dz, zsh, du0, dv0, du1, dv1, c, dc, &L0, &L1, \
++                                   z16, zlow, zb, ZK, NT, BK, K0, K1, CM)
++#define PAIRS_CM(K0, K1) do { \
++            if (cm == CM_WHITE) PAIRS(K0, K1, CM_WHITE); \
++            else if (cm == CM_CONST) PAIRS(K0, K1, CM_CONST); \
++            else PAIRS(K0, K1, CM_INTERP); \
++         } while (0)
++
++         /* the common cases compiled each: Z16 with a fixed test, no
++            generic blend */
++         if (ZK >= 1 && ZK <= 3 && NT >= 1) {
++            const int n = end - x;
++            const int k0 = tex_kind(&L0, u0, v0, du0, dv0, n);
++            const int k1 = NT >= 2 ? tex_kind(&L1, u1, v1, du1, dv1, n) : TK_DIRECT;
++
++            if (k0 == TK_DIRECT && k1 == TK_DIRECT) {
++               SPF_PROF_ADD(15, n & ~1);
++               PAIRS_CM(TK_DIRECT, TK_DIRECT);
++            }
++            else if (NT >= 2 && k0 == TK_DIRECT)
++               PAIRS_CM(TK_DIRECT, TK_ANY);
++            else if (NT >= 2 && k1 == TK_DIRECT)
++               PAIRS_CM(TK_ANY, TK_DIRECT);
++            else
++               PAIRS_CM(TK_ANY, TK_ANY);
++         } else {
++            PAIRS(TK_ANY, TK_ANY, cc ? CM_INTERP : CM_CONST);
++         }
++#undef PAIRS_CM
++#undef PAIRS
++         cp = ps.cp;
++         zp = ps.zp;
++         zacc = ps.zacc;
++         u0 = ps.u0;
++         v0 = ps.v0;
++         u1 = ps.u1;
++         v1 = ps.v1;
++         x = ps.x;
++         fogv = ps.fogv;
++      }
++#endif
++      for (; x < end; x++, cp += cbpp, zp += zb, zacc += (uint32_t)dz, u0 += du0, v0 += dv0,
++           u1 += du1, v1 += dv1, c[0] += dc[0], c[1] += dc[1], c[2] += dc[2], c[3] += dc[3],
++           fogv += fogd) {
++         unsigned z = 0;
++         uint32_t src, tv0 = 0xffffffffu, tv1 = 0xffffffffu, cv = f->tri_col;
++
++         if (zp) {
++            unsigned old;
++
++            if (zfloat) {
++               float zf = pos->a0[2] + pos->dadx[2] * (float)x + pos->dady[2] * fy;
++
++               zf = CLAMP(zf, 0.0f, 1.0f);
++               z = (unsigned)(zf * (z16 ? 65535.0f : 16777215.0f));
++            } else {
++               z = zacc >> zsh;
++            }
++            old = z16 ? *(const ushort *)zp :
++                  zlow ? *(const uint *)zp & 0xffffff : *(const uint *)zp >> 8;
++            if (ZK == 1 ? !(z <= old) : ZK == 2 ? z != old : ZK == 3 ? !(z < old) :
++                !test(f->zfunc, z, old))
++               continue;
++         }
++#ifdef __ARM_NEON
++         if (NEON) {
++            /* f->mixed is off, the pixels are RGBA or BGRA, BK is not BLEND_GENERIC */
++            static const uint8_t bgra[8] = { 2, 1, 0, 3, 6, 5, 4, 7 };
++            uint8x8_t s8 = n_word(tri_col), d8;
++            boolean white = !cc && tri_col == 0xffffffffu;
++
++            if (NT >= 1) {
++               const uint8x8_t t8 = fetch_l(&L0, u0, v0);
++
++               s8 = white ? t8 : n_mod(t8, s8);
++               white = FALSE;
++            }
++            if (NT >= 2)
++               s8 = n_mod(s8, fetch_l(&L1, u1, v1));
++            if (cc) {
++               const uint8x8_t c8 = vqmovn_u16(vcombine_u16(vqshrun_n_s32(vld1q_s32(c), 16),
++                                                            vdup_n_u16(0)));
++
++               s8 = NT ? n_mod(s8, c8) : c8;
++            }
++            if (afunc != PIPE_FUNC_ALWAYS &&
++                !testf(afunc, (float)vget_lane_u8(s8, 3) * (1.0f / 255.0f), areff))
++               continue;
++            if (zp && zwrite) {
++               if (z16)
++                  *(ushort *)zp = (ushort)z;
++               else if (zlow)
++                  *(uint *)zp = (*(uint *)zp & 0xff000000u) | z;
++               else
++                  *(uint *)zp = (*(uint *)zp & 0xffu) | (z << 8);
++            }
++            if (f->fog_kind)
++               s8 = n_fog(s8, fogv, fogv, n_word(f->fog_rgba));
++            if (BK != BLEND_NONE) {
++               d8 = vreinterpret_u8_u32(vld1_dup_u32((const uint32_t *)cp));
++               if (cpack == CPACK_BGRA)
++                  d8 = vtbl1_u8(d8, vld1_u8(bgra));
++               if (BK == BLEND_MODULATE) {
++                  s8 = n_mod(s8, d8);
++               } else if (BK == BLEND_ALPHA) {
++                  const uint8x8_t a = vdup_lane_u8(s8, 3);
++
++                  s8 = n_div255(vmlal_u8(vmull_u8(s8, a), d8, vmvn_u8(a)));
++               } else {
++                  s8 = vqadd_u8(s8, d8);
++               }
++            }
++            if (cpack == CPACK_BGRA)
++               s8 = vtbl1_u8(s8, vld1_u8(bgra));
++            vst1_lane_u32((uint32_t *)cp, vreinterpret_u32_u8(s8), 0);
++            continue;
++         }
++#endif
++         if (tc0)
++            tv0 = fetch_fast(t0, level0, linear0, u0, v0);
++         if (tc1)
++            tv1 = fetch_fast(t1, level1, linear1, u1, v1);
++         if (cc)
++            cv = pack(col8(c[0]), col8(c[1]), col8(c[2]), col8(c[3]));
++
++         if (f->mixed) {
++            src = combine_mixed(f, cv, tv0, tv1);
++         } else {
++            src = tv1 == 0xffffffffu ? tv0 : tv0 == 0xffffffffu ? tv1 : mod4(tv0, tv1);
++            if (cv != 0xffffffffu)
++               src = src == 0xffffffffu ? cv : mod4(src, cv);
++         }
++
++         if (f->afunc != PIPE_FUNC_ALWAYS &&
++             !testf(f->afunc, (float)A(src) * (1.0f / 255.0f), f->areff))
++            continue;
++
++         if (zp && f->zwrite) {
++            if (z16)
++               *(ushort *)zp = (ushort)z;
++            else if (zlow)
++               *(uint *)zp = (*(uint *)zp & 0xff000000u) | z;
++            else
++               *(uint *)zp = (*(uint *)zp & 0xffu) | (z << 8);
++         }
++
++         if (f->fog_kind) {
++            const unsigned w = fog8(fogv), iw = 255 - w;
++
++            src = pack(mul255(R(src), w) + mul255(R(f->fog_rgba), iw),
++                       mul255(G(src), w) + mul255(G(f->fog_rgba), iw),
++                       mul255(B(src), w) + mul255(B(f->fog_rgba), iw), A(src));
++         }
++
++         switch (BK) {
++         case BLEND_NONE:
++            break;
++         case BLEND_MODULATE:
++            src = mod4(src, load_pixel(f, cp));
++            break;
++         case BLEND_ALPHA: {
++            const unsigned a = A(src);
++
++            src = lerp4(load_pixel(f, cp), src, a + (a >> 7));
++            break;
++         }
++         case BLEND_ADD: {
++            const uint32_t d = load_pixel(f, cp);
++
++            src = pack(MIN2(R(src) + R(d), 255), MIN2(G(src) + G(d), 255),
++                       MIN2(B(src) + B(d), 255), MIN2(A(src) + A(d), 255));
++            break;
++         }
++         default:
++            src = blend_generic(f, src, load_pixel(f, cp));
++         }
++         store_pixel(f, cp, src);
++      }
++   }
++}
++
++#define SPAN_ARGS const struct sp_fast *f, const struct tgsi_interp_coef *coef, \
++                  const struct tgsi_interp_coef *pos, int y, int x0, int x1
++#define SPAN_FN(Z, N, B) \
++   static void span_##Z##_##N##_##B(SPAN_ARGS) { span_tmpl(f, coef, pos, y, x0, x1, Z, N, B, 0); } \
++   static void nspan_##Z##_##N##_##B(SPAN_ARGS) { span_tmpl(f, coef, pos, y, x0, x1, Z, N, B, B != BLEND_GENERIC); }
++#define SPAN_B(Z, N) SPAN_FN(Z, N, 0) SPAN_FN(Z, N, 1) SPAN_FN(Z, N, 2) SPAN_FN(Z, N, 3) SPAN_FN(Z, N, 4)
++#define SPAN_N(Z) SPAN_B(Z, 0) SPAN_B(Z, 1) SPAN_B(Z, 2)
++SPAN_N(0) SPAN_N(1) SPAN_N(2) SPAN_N(3) SPAN_N(4)
++
++#define TAB_B(Z, N) { span_##Z##_##N##_0, span_##Z##_##N##_1, span_##Z##_##N##_2, \
++                      span_##Z##_##N##_3, span_##Z##_##N##_4 }
++#define TAB_N(Z) { TAB_B(Z, 0), TAB_B(Z, 1), TAB_B(Z, 2) }
++static void (*const span_tab[5][3][5])(SPAN_ARGS) = {
++   TAB_N(0), TAB_N(1), TAB_N(2), TAB_N(3), TAB_N(4)
++};
++#define NTAB_B(Z, N) { nspan_##Z##_##N##_0, nspan_##Z##_##N##_1, nspan_##Z##_##N##_2, \
++                       nspan_##Z##_##N##_3, nspan_##Z##_##N##_4 }
++#define NTAB_N(Z) { NTAB_B(Z, 0), NTAB_B(Z, 1), NTAB_B(Z, 2) }
++static void (*const nspan_tab[5][3][5])(SPAN_ARGS) = {
++   NTAB_N(0), NTAB_N(1), NTAB_N(2), NTAB_N(3), NTAB_N(4)
++};
++
++void
++sp_fast_span(const struct sp_fast *f, const struct tgsi_interp_coef *coef,
++             const struct tgsi_interp_coef *pos, int y, int x0, int x1)
++{
++   SPF_PROF_BEGIN(t0);
++#ifdef __z3660core__
++   /* event counter reads cost ~19 cycles each: only when asked */
++   const uint32_t e0 = sp_fast_evt_on ? sp_fast_evt(0) : 0, e1 = sp_fast_evt_on ? sp_fast_evt(1) : 0;
++#endif
++   if (f->fixed)
++      f->span(f, coef, pos, y, x0, x1);
++   else
++      fast_span(f, coef, pos, y, x0, x1);
++   SPF_PROF_END(1, t0);
++#ifdef __z3660core__
++   if (sp_fast_evt_on) {
++      sp_fast_prof[8] += sp_fast_evt(0) - e0;
++      sp_fast_prof[14] += sp_fast_evt(1) - e1;
++   }
++   /* pixels by path: 9 affine NEON, 10 perspective NEON, 11 the rest */
++   sp_fast_prof[!f->fixed || !f->neon_span ? 11 : f->tri_affine ? 9 : 10] += x1 - x0;
++#endif
++   SPF_PROF_ADD(4, 1);
++   SPF_PROF_ADD(5, x1 - x0);
++}
++
++static void
++fast_span(const struct sp_fast *f, const struct tgsi_interp_coef *coef,
++          const struct tgsi_interp_coef *pos, int y, int x0, int x1)
++{
++   const struct sp_fast_tex *t = &f->u[0].tex;
++   const float fy = (float)y, fyq = (float)(y & ~1);
++   const float dzdx = pos->dadx[2], dzrow = (y & 1) ? pos->dady[2] : 0.0f;
++   const struct tgsi_interp_coef *cc = f->col_in >= 0 && !f->tri_const ? &coef[f->col_in] : NULL;
++   const struct tgsi_interp_coef *tc = f->u[0].in >= 0 ? &coef[f->u[0].in] : NULL;
++   const boolean col_persp = cc && f->col_interp == SP_INTERP_PERSPECTIVE;
++   const boolean tex_oow = tc && !f->u[0].txp && f->u[0].interp == SP_INTERP_PERSPECTIVE;
++   const int cs = f->u[0].coord_chan[0], ct = f->u[0].coord_chan[1], cq = f->u[0].coord_chan[2];
++   const int zb = f->zformat ? zbytes(f->zformat) : 0;
++   const int cbpp = f->cbpp;
++   ubyte *cp = f->cbuf + (unsigned)y * f->cstride + (unsigned)x0 * cbpp;
++   ubyte *zp = f->zformat ? f->zbuf + (unsigned)y * f->zstride + (unsigned)x0 * zb : NULL;
++   /* the planes at the start of the span, stepped per pixel */
++   const float fx0 = (float)x0;
++   float S = 0.0f, T = 0.0f, Q = 1.0f, oow = 1.0f;
++   float dSdx = 0.0f, dTdx = 0.0f, dQdx = 0.0f, dQdy = 0.0f;
++   int x;
++
++   if (tc) {
++      S = tc->a0[cs] + tc->dadx[cs] * fx0 + tc->dady[cs] * fy;
++      T = tc->a0[ct] + tc->dadx[ct] * fx0 + tc->dady[ct] * fy;
++      dSdx = tc->dadx[cs];
++      dTdx = tc->dadx[ct];
++      if (f->u[0].txp) {
++         Q = tc->a0[cq] + tc->dadx[cq] * fx0 + tc->dady[cq] * fy;
++         dQdx = tc->dadx[cq];
++         dQdy = tc->dady[cq];
++      } else if (tex_oow) {
++         dQdx = pos->dadx[3];
++         dQdy = pos->dady[3];
++      }
++   }
++   if (tex_oow || col_persp)
++      oow = pos->a0[3] + pos->dadx[3] * fx0 + pos->dady[3] * fy;
++
++   for (x = x0; x < x1; x++, cp += cbpp, zp += zb,
++        S += dSdx, T += dTdx, Q += f->u[0].txp ? dQdx : 0.0f, oow += pos->dadx[3]) {
++      unsigned z = 0;
++      uint32_t src, tv = 0xffffffffu, cv = f->tri_col;
++
++      /* depth test: softpipe's per-quad Z (see interpolate_quad_depth) */
++      if (zp) {
++         float zf = pos->a0[2] + dzdx * (float)(x & ~1) + pos->dady[2] * fyq;
++
++         if (x & 1)
++            zf += dzdx;
++         zf += dzrow;
++         if (f->zclamp)
++            zf = CLAMP(zf, f->zmin, f->zmax);
++         z = zvalue(f->zformat, zf);
++         if (f->zformat == PIPE_FORMAT_Z16_UNORM) {
++            const unsigned old = *(const ushort *)zp;
++
++            switch (f->zfunc) {
++            case PIPE_FUNC_LESS: if (!(z < old)) continue; break;
++            case PIPE_FUNC_LEQUAL: if (!(z <= old)) continue; break;
++            case PIPE_FUNC_EQUAL: if (z != old) continue; break;
++            default: if (!test(f->zfunc, z, old)) continue;
++            }
++         } else if (!test(f->zfunc, z, zread(f->zformat, zp))) {
++            continue;
++         }
++      }
++
++      if (tc) {
++         const float q = tex_oow ? oow : Q;
++         const float rq = 1.0f / q;
++         const float s = S * rq, tt = T * rq;
++         float lambda = 0.0f;
++
++         if (t->need_lambda) {
++            const float fx = (float)x;
++            const float dsdx = fabsf((dSdx - s * dQdx) * rq);
++            const float dsdy = fabsf((tc->dady[cs] - s * dQdy) * rq);
++            const float dtdx = fabsf((dTdx - tt * dQdx) * rq);
++            const float dtdy = fabsf((tc->dady[ct] - tt * dQdy) * rq);
++            const float rs = MAX2(dsdx, dsdy) * (float)t->w[t->first];
++            const float rt = MAX2(dtdx, dtdy) * (float)t->h[t->first];
++
++            (void)fx;
++            lambda = util_fast_log2(MAX2(rs, rt)) + t->lod_bias;
++            lambda = CLAMP(lambda, t->min_lod, t->max_lod);
++         }
++         tv = tex_sample(t, s, tt, lambda) | t->amask;
++      }
++
++      if (cc) {
++         const float fx = (float)x;
++         const float w = col_persp ? 1.0f / oow : 1.0f;
++         unsigned c8[4] = { 255, 255, 255, 255 };
++         int c;
++
++         for (c = 0; c < 4; c++) {
++            const int ch = f->col_chan[c];
++
++            if (ch >= 0)
++               c8[c] = to8((cc->a0[ch] + cc->dadx[ch] * fx + cc->dady[ch] * fy) * w);
++         }
++         cv = pack(c8[0], c8[1], c8[2], c8[3]);
++      }
++
++      if (f->mixed)
++         src = combine_mixed(f, cv, tv, 0xffffffffu);
++      else if (!tc)
++         src = cv;
++      else
++         src = cv == 0xffffffffu ? tv : mod4(tv, cv);
++
++      if (f->afunc != PIPE_FUNC_ALWAYS &&
++          !testf(f->afunc, (float)A(src) * (1.0f / 255.0f), f->areff))
++         continue;
++
++      if (zp && f->zwrite) {
++         if (f->zformat == PIPE_FORMAT_Z16_UNORM)
++            *(ushort *)zp = (ushort)z;
++         else
++            zwrite(f->zformat, zp, z);
++      }
++
++      switch (f->blend_kind) {
++      case BLEND_NONE:
++         break;
++      case BLEND_MODULATE:
++         src = mod4(src, load_pixel(f, cp));
++         break;
++      case BLEND_ALPHA: {
++         const unsigned a = A(src);
++
++         src = lerp4(load_pixel(f, cp), src, a + (a >> 7));
++         break;
++      }
++      case BLEND_ADD: {
++         const uint32_t d = load_pixel(f, cp);
++
++         src = pack(MIN2(R(src) + R(d), 255), MIN2(G(src) + G(d), 255),
++                    MIN2(B(src) + B(d), 255), MIN2(A(src) + A(d), 255));
++         break;
++      }
++      default:
++         src = blend_generic(f, src, load_pixel(f, cp));
++      }
++      store_pixel(f, cp, src);
++   }
++}
++
++
++static void
++choose_span(struct sp_fast *f)
++{
++   const int z16 = f->zformat == PIPE_FORMAT_Z16_UNORM;
++   const int zk = !f->zformat ? 0 : z16 && f->zfunc == PIPE_FUNC_LEQUAL ? 1 :
++                  z16 && f->zfunc == PIPE_FUNC_EQUAL ? 2 : z16 && f->zfunc == PIPE_FUNC_LESS ? 3 : 4;
++   const int nt = (f->u[0].in >= 0) + (f->u[1].in >= 0);
++
++   /* NEON for RGBA/BGRA pixels without channel mixing (and SOFTPIPE_FAST_NONEON
++      not set); on the PC the two tables are the same code */
++   const boolean neon = !f->mixed && (f->cpack == CPACK_RGBA || f->cpack == CPACK_BGRA) &&
++                        f->neon_ok;
++
++   f->span = (neon ? nspan_tab : span_tab)[zk][nt][f->blend_kind];
++   f->neon_span = neon && f->blend_kind != BLEND_GENERIC;
++   if (debug_get_bool_option("SOFTPIPE_FAST_WHY", FALSE) && !f->neon_span) {
++      /* why not NEON: one line per kind */
++      static unsigned seen[64];
++      const unsigned k = (f->mixed ? 1 : 0) | (f->cpack == CPACK_OTHER ? 2 : 0) |
++                         (!f->neon_ok ? 4 : 0) | (f->blend_kind == BLEND_GENERIC ? 8 : 0) |
++                         (f->blend_kind << 4 & 0x30);
++
++      if (!seen[k]++)
++         fprintf(stderr, "sp_fast: not NEON: mixed %d cpack %d neon_ok %d blend %d (%d %d %d %d) "
++                 "col_chan %d %d %d %d u0 %d %d %d %d u1 %d %d %d %d\n", f->mixed, f->cpack, f->neon_ok,
++                 f->blend_kind, f->rgb_src, f->rgb_dst, f->a_src, f->a_dst,
++                 f->col_chan[0], f->col_chan[1], f->col_chan[2], f->col_chan[3],
++                 f->u[0].chan[0], f->u[0].chan[1], f->u[0].chan[2], f->u[0].chan[3],
++                 f->u[1].chan[0], f->u[1].chan[1], f->u[1].chan[2], f->u[1].chan[3]);
++   }
++}
++
++
++/* level and filter for a lambda (tex_setup()'s choice) */
++static void
++pick_level(const struct sp_fast_tex *t, float lambda, int *level, int *linear)
++{
++   /* not a number (a degenerate triangle: Q = 0): as no minification */
++   if (!t->need_lambda || !(lambda > 0.0f)) {
++      *level = t->first;
++      *linear = t->mag_linear;
++   } else {
++      *level = t->mip == PIPE_TEX_MIPFILTER_NEAREST ?
++               t->first + (int)(MIN2(lambda, 15.0f) + 0.5f) : t->first;
++      if (*level > t->last)
++         *level = t->last;
++      *linear = t->min_linear;
++   }
++}
++
++/* float to int32, saturating (a native conversion on the A9, unlike to int64) */
++static inline int32_t
++fix32(float v)
++{
++   return v >= 2147483520.0f ? INT32_MAX : v <= -2147483520.0f ? INT32_MIN : (int32_t)v;
++}
++
++void
++sp_fast_tri_planes(struct sp_fast *f, const struct tgsi_interp_coef *coef,
++                   const struct tgsi_interp_coef *pos, int ox, int oy,
++                   const struct tgsi_interp_coef *aff, const struct tgsi_interp_coef *col)
++{
++   const float fx = (float)ox, fy = (float)oy;
++   int k, c;
++
++   /* perspective, but 1/w varies by half at most: the mip level per
++      triangle (at its first corner) and longer segments */
++   f->tri_level = FALSE;
++   f->seg = f->tri_ratio <= 1.15f ? 32 : 16;
++   if (!aff && f->tri_ratio <= 1.5f) {
++      for (k = 0; k < SP_FAST_UNITS; k++) {
++         struct sp_fast_unit *un = &f->u[k];
++         int32_t a, b, d, e;
++
++         if (un->in >= 0)
++            tex_setup(un, &coef[un->in], pos, fx, fy, &un->aff_level, &un->aff_linear,
++                      &a, &b, &d, &e, TRUE, NULL);
++      }
++      f->tri_level = TRUE;
++   }
++
++   f->share_q = FALSE;
++   if (!aff && f->u[0].in >= 0 && f->u[1].in >= 0) {
++      f->share_q = same_q(f, coef, pos);
++      if (f->share_q) {
++         const struct sp_fast_unit *un = &f->u[0];
++         const struct tgsi_interp_coef *qc = un->txp ? &coef[un->in] : pos;
++         const int qch = un->txp ? un->coord_chan[2] : 3;
++
++         for (k = 0; k < 4; k++) {
++            const struct sp_fast_unit *uk = &f->u[k >> 1];
++            const int ch = uk->coord_chan[k & 1];
++
++            f->vq_a0[k] = coef[uk->in].a0[ch];
++            f->vq_dx[k] = coef[uk->in].dadx[ch];
++            f->vq_dy[k] = coef[uk->in].dady[ch];
++            f->vq_clamp[k] = (k & 1 ? uk->tex.clamp_t : uk->tex.clamp_s) ? 0xffffffffu : 0;
++         }
++         if (un->txp || un->interp == SP_INTERP_PERSPECTIVE) {
++            f->vq_q[0] = qc->a0[qch];
++            f->vq_q[1] = qc->dadx[qch];
++            f->vq_q[2] = qc->dady[qch];
++         } else {
++            f->vq_q[0] = 1.0f;
++            f->vq_q[1] = f->vq_q[2] = 0.0f;
++         }
++      }
++   }
++
++   f->ox = ox;
++   f->oy = oy;
++   f->zplane = FALSE;
++   if (f->zformat && zfrac_bits(f->zformat) >= 0) {
++      const float scale = (f->zformat == PIPE_FORMAT_Z16_UNORM ? 65535.0f : 16777215.0f) *
++                          (float)(1 << zfrac_bits(f->zformat));
++      const float z = pos->a0[2] + pos->dadx[2] * fx + pos->dady[2] * fy;
++      const float dx = pos->dadx[2] * scale, dy = pos->dady[2] * scale;
++
++      if (z >= 0.0f && z <= 1.0f && fabsf(dx) < 2.0e9f && fabsf(dy) < 2.0e9f) {
++         f->ZO = (uint32_t)(z * scale);
++         f->ZDX = (int32_t)dx;
++         f->ZDY = (int32_t)dy;
++         f->zplane = TRUE;
++      }
++   }
++   f->tri_affine = aff != NULL;
++   if (!aff)
++      return;
++   for (k = 0; k < SP_FAST_UNITS; k++) {
++      struct sp_fast_unit *un = &f->u[k];
++      const struct sp_fast_tex *t = &un->tex;
++      float w, h, off, so, to;
++
++      if (un->in < 0)
++         continue;
++      if (t->need_lambda) {
++         const float rs = MAX2(fabsf(aff[k].dadx[0]), fabsf(aff[k].dady[0])) * (float)t->w[t->first];
++         const float rt = MAX2(fabsf(aff[k].dadx[1]), fabsf(aff[k].dady[1])) * (float)t->h[t->first];
++         float lambda = util_fast_log2(MAX2(rs, rt)) + t->lod_bias;
++
++         pick_level(t, CLAMP(lambda, t->min_lod, t->max_lod), &un->aff_level, &un->aff_linear);
++      } else {
++         pick_level(t, 0.0f, &un->aff_level, &un->aff_linear);
++      }
++      w = (float)t->w[un->aff_level] * 65536.0f;
++      h = (float)t->h[un->aff_level] * 65536.0f;
++      off = un->aff_linear ? 32768.0f : 0.0f;
++      /* at the origin; repeat: reduced to [0, 1) (the stepping wraps modulo
++         2^32, which the power-of-two mask does not mind); clamp: kept near */
++      so = aff[k].a0[0] + aff[k].dadx[0] * fx + aff[k].dady[0] * fy;
++      to = aff[k].a0[1] + aff[k].dadx[1] * fx + aff[k].dady[1] * fy;
++      so = t->clamp_s ? CLAMP(so, -4.0f, 4.0f) : so - (float)util_ifloor(so);
++      to = t->clamp_t ? CLAMP(to, -4.0f, 4.0f) : to - (float)util_ifloor(to);
++      un->UO = fix32(so * w - off);
++      un->VO = fix32(to * h - off);
++      un->UDX = fix32(CLAMP(aff[k].dadx[0], -1.0f, 1.0f) * w);
++      un->UDY = fix32(CLAMP(aff[k].dady[0], -1.0f, 1.0f) * w);
++      un->VDX = fix32(CLAMP(aff[k].dadx[1], -1.0f, 1.0f) * h);
++      un->VDY = fix32(CLAMP(aff[k].dady[1], -1.0f, 1.0f) * h);
++   }
++   if (col)
++      for (c = 0; c < 4; c++) {
++         const float v = col->a0[c] + col->dadx[c] * fx + col->dady[c] * fy;
++
++         f->CO[c] = fix32(v * (255.0f * 65536.0f)) + 32768;
++         f->CDX[c] = fix32(col->dadx[c] * (255.0f * 65536.0f));
++         f->CDY[c] = fix32(col->dady[c] * (255.0f * 65536.0f));
++      }
++}
+diff --git a/src/gallium/drivers/softpipe/sp_fast.h b/src/gallium/drivers/softpipe/sp_fast.h
+new file mode 100644
+index 0000000..1a200ea
+--- /dev/null
++++ b/src/gallium/drivers/softpipe/sp_fast.h
+@@ -0,0 +1,192 @@
++/*
++ * sp_fast.h -- a fixed-function fast path for softpipe's triangles.
++ *
++ * The fragment shaders the GL fixed-function pipeline produces for
++ * colour, texture and texture * colour, with depth test, alpha test and
++ * blending, are drawn span by span straight into the colour and depth
++ * buffers (8-bit channels), without the TGSI interpreter and the quad
++ * pipeline.  Everything else falls back to softpipe.
++ *
++ * SOFTPIPE_NO_FAST=1 turns it off (for comparisons).
++ */
++#ifndef SP_FAST_H
++#define SP_FAST_H
++
++#include "pipe/p_compiler.h"
++#include "tgsi/tgsi_exec.h"
++
++struct softpipe_context;
++struct sp_fragment_shader_variant;
++
++#define SP_FAST_LEVELS 16
++
++/* cycle counts on Z3660 core 1 (glbench and the GPU program read them):
++   0 fast triangles (setup and spans), 1 spans, 2 prepare, 3 draw_vbo,
++   4 spans, 5 pixels, 6 softpipe's own triangles, 7 their cycles */
++#ifdef __z3660core__
++#include <stdint.h>
++extern uint64_t sp_fast_prof[16];
++extern int sp_fast_evt_on;       /* event counters 0 and 1 into sp_fast_prof[8], [14] */
++static inline uint32_t
++sp_fast_ccnt(void)
++{
++   uint32_t v;
++
++   __asm__ volatile("mrc p15, 0, %0, c9, c13, 0" : "=r"(v));
++   return v;
++}
++/* PMU event counters 0 and 1 (set by the core program; the GPU program:
++   0 = L1 data refills): profile 8 and 14 */
++static inline uint32_t
++sp_fast_evt(uint32_t n)
++{
++   uint32_t v;
++
++   __asm__ volatile("mcr p15, 0, %1, c9, c12, 5\n"
++                    "mrc p15, 0, %0, c9, c13, 2" : "=r"(v) : "r"(n));
++   return v;
++}
++#define sp_fast_evt0() sp_fast_evt(0)
++#define SPF_PROF_BEGIN(v) uint32_t v = sp_fast_ccnt()
++#define SPF_PROF_END(i, v) (sp_fast_prof[i] += sp_fast_ccnt() - (v))
++#define SPF_PROF_ADD(i, n) (sp_fast_prof[i] += (n))
++#else
++#define SPF_PROF_BEGIN(v) (void)0
++#define SPF_PROF_END(i, v) (void)0
++#define SPF_PROF_ADD(i, n) (void)0
++#endif
++
++struct sp_fast_tex {
++   const ubyte *data[SP_FAST_LEVELS];
++   unsigned stride[SP_FAST_LEVELS];
++   int w[SP_FAST_LEVELS], h[SP_FAST_LEVELS];
++   float fsize[SP_FAST_LEVELS][2];   /* w, h as floats (tex_setup2()) */
++   int first, last;              /* levels in use */
++   int bpp;                      /* bytes per texel */
++   signed char map[4];           /* r, g, b, a: byte in the texel, -1 = 0, -2 = 255 */
++   int clamp_s, clamp_t;         /* clamp to edge, else repeat */
++   int min_linear, mag_linear;
++   int mip;                      /* PIPE_TEX_MIPFILTER_x */
++   int need_lambda;
++   float lod_bias, min_lod, max_lod;
++   boolean ident;                /* texels are r, g, b, a bytes: load as one word */
++   boolean fast4;                /* r, g, b, a/x bytes: fetch_fast() and fetch_neon() */
++   uint32_t amask;               /* ORed in: 0xff000000 for x (alpha 1.0) */
++};
++
++#define SP_FAST_UNITS 2
++
++/* a texture unit the shader reads */
++struct sp_fast_unit {
++   int in;                       /* coordinate input, -1 = unit not used */
++   int coord_chan[3];            /* s, t, q (TXP) channels of the input */
++   boolean txp;
++   int interp;                   /* SP_INTERP_x of the input */
++   int chan[4];                  /* output channel <- texel channel, -1 = 1.0 */
++   uint32_t ormask;              /* the bytes of channels taken as 1.0 */
++   struct sp_fast_tex tex;
++   /* per triangle, when it is drawn affine (tri_affine): the level, the
++      filter and the 16.16 texel coordinate planes, relative to the
++      triangle's origin (ox, oy): u = UO + UDX (x - ox) + UDY (y - oy) */
++   int aff_level, aff_linear;
++   int32_t UO, VO, UDX, UDY, VDX, VDY;
++};
++
++struct sp_fast {
++   boolean enabled;              /* SOFTPIPE_NO_FAST not set */
++   boolean neon_ok;              /* SOFTPIPE_FAST_NONEON not set */
++   boolean pairs;                /* two pixels a turn (SOFTPIPE_FAST_NOPAIR not set) */
++   boolean on;                   /* this draw goes the fast way */
++   boolean fixed;                /* fixed-point spans (span_tmpl()) */
++   /* the span_tmpl() instance for this draw's depth test, units and blend */
++   void (*span)(const struct sp_fast *f, const struct tgsi_interp_coef *coef,
++                const struct tgsi_interp_coef *pos, int y, int x0, int x1);
++   boolean neon_span;            /* f->span is a NEON one (profile) */
++
++   /* the fragment shader, analysed once per variant */
++   const struct sp_fragment_shader_variant *fs;
++   boolean fs_ok;
++   int col_in;                   /* colour input, -1 = unused */
++   int col_chan[4];              /* output channel <- input channel, -1 = 1.0 */
++   struct sp_fast_unit u[SP_FAST_UNITS];   /* texture units 0 and 1 */
++   boolean mixed;                /* not plain texel (* colour) per channel */
++   int fog_kind;                 /* FOG_x: the shader ends in fixed-function fog */
++   int fog_in;                   /* the fog coordinate's input */
++   int fog_ka, fog_kb;           /* constants: scale, offset (word in the buffer) */
++   int fog_kc;                   /* constant with the fog colour */
++
++   /* per draw */
++   int col_interp;               /* SP_INTERP_x */
++   boolean col_const;            /* the colour is a constant of the shader (glColor) */
++   uint32_t const_col;           /* then this, for the draw */
++   int fog_slot;                 /* vertex slot of fog_in */
++   float fog_scale, fog_off;
++   uint32_t fog_rgba;            /* the fog colour, alpha 0 */
++
++   ubyte *cbuf;
++   unsigned cstride;
++   int cbpp;
++   signed char cmap[4];          /* byte of r, g, b, a in the pixel, -1 = none */
++   unsigned colormask;
++   int cpack;                    /* CPACK_x: how a pixel is loaded and stored */
++
++   ubyte *zbuf;
++   unsigned zstride;
++   int zformat;                  /* PIPE_FORMAT_x, 0 = no depth test */
++   int zfunc;
++   boolean zwrite;
++   boolean zclamp;
++   float zmin, zmax;
++
++   int afunc;                    /* PIPE_FUNC_ALWAYS = no alpha test */
++   int aref;                     /* 0..255 */
++   float areff;
++
++   boolean blend;
++   int rgb_func, rgb_src, rgb_dst, a_func, a_src, a_dst;
++   int blend_kind;               /* BLEND_x: the common cases */
++
++   /* per triangle */
++   int col_slot;                 /* vertex slot of col_in */
++   boolean tri_const;            /* the colour is the same over the triangle */
++   uint32_t tri_col;             /* then this: r | g << 8 | b << 16 | a << 24 */
++   boolean tri_affine;           /* texture and colour planes, no perspective */
++   float tri_ratio;              /* the largest 1/w over the smallest at the corners */
++   boolean tri_level;            /* perspective with the level chosen per triangle
++                                    (u[].aff_level, aff_linear) */
++   int seg;                      /* perspective: re-anchored every seg pixels */
++   boolean share_q;              /* both units divide by the same Q (same_q()) */
++   /* perspective with share_q, for tex_setup2(): the S, T planes of both
++      units in lanes s0 t0 s1 t1, Q's plane,
++      the lanes that clamp (else repeat) */
++   float vq_a0[4], vq_dx[4], vq_dy[4], vq_q[3];
++   uint32_t vq_clamp[4];
++   int ox, oy;                   /* the planes' origin: a pixel of the triangle */
++   int32_t CO[4], CDX[4], CDY[4];   /* colour planes, 8.16 (0..255) */
++   uint32_t ZO;                  /* Z plane in span_tmpl()'s fixed point */
++   int32_t ZDX, ZDY;
++   int32_t FO, FDX, FDY;         /* fog factor plane, 8.16 (0..255), from (ox, oy) */
++   boolean zplane;               /* the Z plane fits (else Z per pixel in float) */
++};
++
++void sp_fast_init(struct sp_fast *f);
++
++/* validate the state for the next draw: sets and returns f->on */
++boolean sp_fast_prepare(struct sp_fast *f, struct softpipe_context *sp);
++
++/* per triangle, before the planes: is the colour constant (tri_const)? */
++void sp_fast_tri(struct sp_fast *f, const float (*provoke)[4],
++                 const float (*v0)[4], const float (*v1)[4], const float (*v2)[4]);
++
++/* per triangle, after the planes: Z in fixed point; aff (the s, t planes of
++   each unit in channels 0 and 1) and col (the colour's planes) when the
++   triangle is drawn affine, else NULL */
++void sp_fast_tri_planes(struct sp_fast *f, const struct tgsi_interp_coef *coef,
++                        const struct tgsi_interp_coef *pos, int ox, int oy,
++                        const struct tgsi_interp_coef *aff, const struct tgsi_interp_coef *col);
++
++/* draw pixels [x0, x1) of row y */
++void sp_fast_span(const struct sp_fast *f, const struct tgsi_interp_coef *coef,
++                  const struct tgsi_interp_coef *pos, int y, int x0, int x1);
++
++#endif
+diff --git a/src/gallium/drivers/softpipe/sp_flush.c b/src/gallium/drivers/softpipe/sp_flush.c
+index 3bf8c49..581c96d 100644
+--- a/src/gallium/drivers/softpipe/sp_flush.c
++++ b/src/gallium/drivers/softpipe/sp_flush.c
+@@ -58,6 +58,8 @@ softpipe_flush( struct pipe_context *pipe,
+ 
+       for (sh = 0; sh < ARRAY_SIZE(softpipe->tex_cache); sh++) {
+          for (i = 0; i < softpipe->num_sampler_views[sh]; i++) {
++            if (softpipe->tex_cache[sh][i])
++               if (softpipe->tex_cache[sh][i])
+             sp_flush_tex_tile_cache(softpipe->tex_cache[sh][i]);
+          }
+       }
+@@ -176,7 +178,8 @@ void softpipe_texture_barrier(struct pipe_context *pipe, unsigned flags)
+ 
+    for (sh = 0; sh < ARRAY_SIZE(softpipe->tex_cache); sh++) {
+       for (i = 0; i < softpipe->num_sampler_views[sh]; i++) {
+-         sp_flush_tex_tile_cache(softpipe->tex_cache[sh][i]);
++         if (softpipe->tex_cache[sh][i])
++            sp_flush_tex_tile_cache(softpipe->tex_cache[sh][i]);
+       }
+    }
+ 
+diff --git a/src/gallium/drivers/softpipe/sp_fs.h b/src/gallium/drivers/softpipe/sp_fs.h
+index 4fac9b4..2fe791e 100644
+--- a/src/gallium/drivers/softpipe/sp_fs.h
++++ b/src/gallium/drivers/softpipe/sp_fs.h
+@@ -35,6 +35,10 @@
+ struct sp_fragment_shader_variant *
+ softpipe_create_fs_variant_exec(struct softpipe_context *softpipe);
+ 
++/* run the variant through sp_fs_fast.c when it can */
++void
++softpipe_fs_variant_try_fast(struct sp_fragment_shader_variant *var);
++
+ 
+ struct tgsi_interp_coef;
+ struct tgsi_exec_vector;
+diff --git a/src/gallium/drivers/softpipe/sp_fs_exec.c b/src/gallium/drivers/softpipe/sp_fs_exec.c
+index cb22850..3acc876 100644
+--- a/src/gallium/drivers/softpipe/sp_fs_exec.c
++++ b/src/gallium/drivers/softpipe/sp_fs_exec.c
+@@ -39,6 +39,7 @@
+ #include "util/u_memory.h"
+ #include "tgsi/tgsi_exec.h"
+ #include "tgsi/tgsi_parse.h"
++#include "sp_fs_fast.h"
+ 
+ 
+ /**
+@@ -47,7 +48,7 @@
+ struct sp_exec_fragment_shader
+ {
+    struct sp_fragment_shader_variant base;
+-   /* No other members for now */
++   struct sp_fs_fast *fast;      /* sp_fs_fast.c, or NULL */
+ };
+ 
+ 
+@@ -174,10 +175,34 @@ exec_run( const struct sp_fragment_shader_variant *var,
+ }
+ 
+ 
++/* the same, by sp_fs_fast.c */
++static unsigned
++fast_run(const struct sp_fragment_shader_variant *var,
++         struct tgsi_exec_machine *machine,
++         struct quad_header *quad,
++         bool early_depth_test)
++{
++   return sp_fs_fast_run(((const struct sp_exec_fragment_shader *)var)->fast, machine, quad,
++                         early_depth_test, &var->info);
++}
++
++
++void
++softpipe_fs_variant_try_fast(struct sp_fragment_shader_variant *var)
++{
++   struct sp_exec_fragment_shader *shader = (struct sp_exec_fragment_shader *)var;
++
++   shader->fast = sp_fs_fast_compile(var->tokens, &var->info);
++   if (shader->fast)
++      var->run = fast_run;
++}
++
++
+ static void 
+ exec_delete(struct sp_fragment_shader_variant *var,
+             struct tgsi_exec_machine *machine)
+ {
++   sp_fs_fast_destroy(((struct sp_exec_fragment_shader *)var)->fast);
+    if (machine->Tokens == var->tokens) {
+       tgsi_exec_machine_bind_shader(machine, NULL, NULL, NULL, NULL);
+    }
+diff --git a/src/gallium/drivers/softpipe/sp_fs_fast.c b/src/gallium/drivers/softpipe/sp_fs_fast.c
+new file mode 100644
+index 0000000..23146e4
+--- /dev/null
++++ b/src/gallium/drivers/softpipe/sp_fs_fast.c
+@@ -0,0 +1,694 @@
++/*
++ * sp_fs_fast.c -- see sp_fs_fast.h.
++ *
++ * Registers are vec[4]: one vector per channel, lane i = pixel i of the
++ * quad (tgsi_exec's order).  The register file is part of the program
++ * (one shader runs at a time): inputs, temporaries, outputs, immediates
++ * (broadcast once) and the constants of buffer 0 (broadcast per quad).
++ */
++#include "sp_context.h"
++#include "sp_quad.h"
++#include "sp_fs_fast.h"
++#include "pipe/p_shader_tokens.h"
++#include "tgsi/tgsi_exec.h"
++#include "tgsi/tgsi_info.h"
++#include "tgsi/tgsi_parse.h"
++#include "tgsi/tgsi_scan.h"
++#include "tgsi/tgsi_util.h"
++#include "util/u_debug.h"
++#include "util/u_math.h"
++#include "util/u_memory.h"
++
++#ifdef __ARM_NEON
++#include <arm_neon.h>
++#endif
++
++typedef float vec __attribute__((vector_size(16), aligned(16)));
++typedef int32_t ivec __attribute__((vector_size(16), aligned(16)));
++typedef uint32_t uvec __attribute__((vector_size(16), aligned(16)));
++
++#define FSF_MAX_REGS 512
++
++/* the pixels of a quad (tgsi_exec.c's TILE_x) */
++#define TILE_TOP_LEFT     0
++#define TILE_BOTTOM_LEFT  2
++#define TILE_BOTTOM_RIGHT 3
++
++struct fsf_src {
++   unsigned short reg;
++   unsigned char swz[4];
++   unsigned char neg, abs;
++};
++
++struct fsf_op {
++   unsigned short opcode;
++   unsigned char wmask, sat;
++   unsigned short dst;
++   unsigned char nsrc;
++   unsigned char unit;           /* TEX: sampler unit */
++   unsigned char dim;            /* TEX: coordinates used */
++   unsigned char modifier;       /* TEX: 0, projected, bias, explicit lod */
++   struct fsf_src src[3];
++};
++
++struct fsf_input {
++   unsigned short reg;
++   unsigned char interp;         /* TGSI_INTERPOLATE_x */
++   unsigned char face;
++   unsigned char mask;           /* channels used */
++};
++
++struct sp_fs_fast {
++   struct fsf_op *ops;
++   unsigned nops;
++   struct fsf_input in[PIPE_MAX_SHADER_INPUTS];
++   unsigned nin;
++   unsigned out_base;
++   unsigned const_base, nconsts;
++   vec (*r)[4];                  /* the register file */
++};
++
++enum { MOD_NONE, MOD_PROJ, MOD_BIAS, MOD_LOD };
++
++static boolean
++float_op(unsigned op)
++{
++   switch (op) {
++   case TGSI_OPCODE_MOV: case TGSI_OPCODE_ADD: case TGSI_OPCODE_MUL: case TGSI_OPCODE_MAD:
++   case TGSI_OPCODE_DP2: case TGSI_OPCODE_DP3: case TGSI_OPCODE_DP4: case TGSI_OPCODE_MIN:
++   case TGSI_OPCODE_MAX: case TGSI_OPCODE_RCP: case TGSI_OPCODE_RSQ: case TGSI_OPCODE_SQRT:
++   case TGSI_OPCODE_EX2: case TGSI_OPCODE_LG2: case TGSI_OPCODE_POW: case TGSI_OPCODE_SIN:
++   case TGSI_OPCODE_COS: case TGSI_OPCODE_FLR: case TGSI_OPCODE_FRC: case TGSI_OPCODE_CEIL:
++   case TGSI_OPCODE_TRUNC: case TGSI_OPCODE_LRP: case TGSI_OPCODE_CMP: case TGSI_OPCODE_SLT:
++   case TGSI_OPCODE_SGE: case TGSI_OPCODE_SEQ: case TGSI_OPCODE_SNE: case TGSI_OPCODE_DDX:
++   case TGSI_OPCODE_DDY: case TGSI_OPCODE_KILL_IF: case TGSI_OPCODE_KILL:
++   case TGSI_OPCODE_TEX: case TGSI_OPCODE_TXP: case TGSI_OPCODE_TXB: case TGSI_OPCODE_TXL:
++   case TGSI_OPCODE_FSLT: case TGSI_OPCODE_FSGE: case TGSI_OPCODE_FSEQ: case TGSI_OPCODE_FSNE:
++   case TGSI_OPCODE_I2F: case TGSI_OPCODE_U2F: case TGSI_OPCODE_F2I: case TGSI_OPCODE_F2U:
++   case TGSI_OPCODE_NOP:
++      return TRUE;
++   default:
++      return FALSE;
++   }
++}
++
++/* integer and bit ops: sources without modifiers only */
++static boolean
++int_op(unsigned op)
++{
++   switch (op) {
++   case TGSI_OPCODE_AND: case TGSI_OPCODE_OR: case TGSI_OPCODE_XOR: case TGSI_OPCODE_NOT:
++   case TGSI_OPCODE_UCMP: case TGSI_OPCODE_UADD: case TGSI_OPCODE_UMUL: case TGSI_OPCODE_ISLT:
++   case TGSI_OPCODE_ISGE: case TGSI_OPCODE_USEQ: case TGSI_OPCODE_USNE: case TGSI_OPCODE_IMAX:
++   case TGSI_OPCODE_IMIN: case TGSI_OPCODE_INEG:
++      return TRUE;
++   default:
++      return FALSE;
++   }
++}
++
++struct sp_fs_fast *
++sp_fs_fast_compile(const struct tgsi_token *tokens, const struct tgsi_shader_info *info)
++{
++   struct sp_fs_fast *p;
++   struct tgsi_parse_context parse;
++   unsigned nimm = 0, nregs, temp_base, imm_base, i;
++   boolean ok = TRUE;
++
++   if (debug_get_bool_option("SOFTPIPE_NO_FAST_FS", FALSE))
++      return NULL;
++   if (info->num_system_values || info->indirect_files || info->const_buffers_declared > 1 ||
++       info->file_max[TGSI_FILE_ADDRESS] >= 0 || info->file_max[TGSI_FILE_IMAGE] >= 0 ||
++       info->file_max[TGSI_FILE_BUFFER] >= 0 || info->file_max[TGSI_FILE_MEMORY] >= 0 ||
++       info->num_outputs > PIPE_MAX_SHADER_OUTPUTS || info->uses_doubles)
++      return NULL;
++
++   p = CALLOC_STRUCT(sp_fs_fast);
++   if (!p)
++      return NULL;
++   temp_base = info->file_max[TGSI_FILE_INPUT] + 1;
++   p->out_base = temp_base + info->file_max[TGSI_FILE_TEMPORARY] + 1;
++   imm_base = p->out_base + info->file_max[TGSI_FILE_OUTPUT] + 1;
++   p->const_base = imm_base + info->immediate_count;
++   p->nconsts = info->file_max[TGSI_FILE_CONSTANT] + 1;
++   nregs = p->const_base + p->nconsts;
++   p->ops = CALLOC(info->num_instructions ? info->num_instructions : 1, sizeof(*p->ops));
++   p->r = align_malloc(nregs * sizeof(*p->r) + 16, 16);
++   if (!p->ops || !p->r || nregs > FSF_MAX_REGS) {
++      sp_fs_fast_destroy(p);
++      return NULL;
++   }
++   memset(p->r, 0, nregs * sizeof(*p->r));
++
++   tgsi_parse_init(&parse, tokens);
++   while (ok && !tgsi_parse_end_of_tokens(&parse)) {
++      tgsi_parse_token(&parse);
++      switch (parse.FullToken.Token.Type) {
++      case TGSI_TOKEN_TYPE_DECLARATION: {
++         const struct tgsi_full_declaration *d = &parse.FullToken.FullDeclaration;
++
++         if (d->Declaration.File == TGSI_FILE_INPUT) {
++            for (i = d->Range.First; i <= d->Range.Last && ok; i++) {
++               struct fsf_input *in = &p->in[p->nin++];
++
++               if (p->nin > PIPE_MAX_SHADER_INPUTS) {
++                  ok = FALSE;
++                  break;
++               }
++               in->reg = (unsigned short)i;
++               in->interp = d->Interp.Interpolate;
++               in->face = d->Semantic.Name == TGSI_SEMANTIC_FACE;
++               in->mask = d->Declaration.UsageMask;
++            }
++         }
++         break;
++      }
++      case TGSI_TOKEN_TYPE_IMMEDIATE: {
++         const struct tgsi_full_immediate *imm = &parse.FullToken.FullImmediate;
++         unsigned c;
++
++         if (nimm >= info->immediate_count) {
++            ok = FALSE;
++            break;
++         }
++         /* the bits as they are: float or integer */
++         for (c = 0; c < imm->Immediate.NrTokens - 1 && c < 4; c++) {
++            const uint32_t u = imm->u[c].Uint;
++
++            p->r[imm_base + nimm][c] = (vec)(uvec){ u, u, u, u };
++         }
++         nimm++;
++         break;
++      }
++      case TGSI_TOKEN_TYPE_INSTRUCTION: {
++         const struct tgsi_full_instruction *inst = &parse.FullToken.FullInstruction;
++         const unsigned opc = inst->Instruction.Opcode;
++         struct fsf_op *op;
++         unsigned s, c, nsrc = inst->Instruction.NumSrcRegs;
++         boolean isint = int_op(opc), tex;
++
++         if (opc == TGSI_OPCODE_END)
++            break;
++         if ((!float_op(opc) && !isint) || inst->Instruction.NumDstRegs > 1 ||
++             p->nops >= info->num_instructions || inst->Instruction.Saturate > 1) {
++            ok = FALSE;
++            break;
++         }
++         op = &p->ops[p->nops++];
++         op->opcode = opc;
++         op->sat = inst->Instruction.Saturate;
++         tex = opc == TGSI_OPCODE_TEX || opc == TGSI_OPCODE_TXP || opc == TGSI_OPCODE_TXB ||
++               opc == TGSI_OPCODE_TXL;
++         if (inst->Instruction.NumDstRegs) {
++            if (inst->Dst[0].Register.Indirect || inst->Dst[0].Register.Dimension) {
++               ok = FALSE;
++               break;
++            }
++            op->wmask = inst->Dst[0].Register.WriteMask;
++            switch (inst->Dst[0].Register.File) {
++            case TGSI_FILE_TEMPORARY: op->dst = temp_base + inst->Dst[0].Register.Index; break;
++            case TGSI_FILE_OUTPUT: op->dst = p->out_base + inst->Dst[0].Register.Index; break;
++            default: ok = FALSE;
++            }
++         }
++         if (tex) {
++            const unsigned target = inst->Texture.Texture;
++
++            if (nsrc != 2 || inst->Src[1].Register.File != TGSI_FILE_SAMPLER ||
++                inst->Src[1].Register.Indirect || inst->Texture.NumOffsets ||
++                tgsi_util_get_shadow_ref_src_index(target) >= 0 ||
++                (target != TGSI_TEXTURE_1D && target != TGSI_TEXTURE_2D &&
++                 target != TGSI_TEXTURE_RECT && target != TGSI_TEXTURE_3D &&
++                 target != TGSI_TEXTURE_CUBE)) {
++               ok = FALSE;
++               break;
++            }
++            op->unit = (unsigned char)inst->Src[1].Register.Index;
++            op->dim = (unsigned char)tgsi_util_get_texture_coord_dim(target);
++            op->modifier = opc == TGSI_OPCODE_TXP ? MOD_PROJ : opc == TGSI_OPCODE_TXB ? MOD_BIAS :
++                           opc == TGSI_OPCODE_TXL ? MOD_LOD : MOD_NONE;
++            nsrc = 1;
++         }
++         op->nsrc = (unsigned char)nsrc;
++         for (s = 0; ok && s < nsrc; s++) {
++            const struct tgsi_full_src_register *src = &inst->Src[s];
++            struct fsf_src *d = &op->src[s];
++            const int idx = src->Register.Index;
++
++            if (src->Register.Indirect ||
++                (src->Register.Dimension && (src->Dimension.Indirect || src->Dimension.Index != 0)) ||
++                (isint && (src->Register.Negate || src->Register.Absolute))) {
++               ok = FALSE;
++               break;
++            }
++            switch (src->Register.File) {
++            case TGSI_FILE_INPUT: d->reg = (unsigned short)idx; break;
++            case TGSI_FILE_TEMPORARY: d->reg = temp_base + idx; break;
++            case TGSI_FILE_OUTPUT: d->reg = p->out_base + idx; break;
++            case TGSI_FILE_IMMEDIATE: d->reg = imm_base + idx; break;
++            case TGSI_FILE_CONSTANT: d->reg = p->const_base + idx; break;
++            default: ok = FALSE;
++            }
++            for (c = 0; c < 4; c++)
++               d->swz[c] = (unsigned char)tgsi_util_get_full_src_register_swizzle(src, c);
++            d->neg = src->Register.Negate;
++            d->abs = src->Register.Absolute;
++         }
++         break;
++      }
++      default:
++         break;
++      }
++   }
++   tgsi_parse_free(&parse);
++   if (!ok) {
++      sp_fs_fast_destroy(p);
++      return NULL;
++   }
++   return p;
++}
++
++void
++sp_fs_fast_destroy(struct sp_fs_fast *p)
++{
++   if (!p)
++      return;
++   FREE(p->ops);
++   if (p->r)
++      align_free(p->r);
++   FREE(p);
++}
++
++
++static inline vec
++splat(float f)
++{
++   return (vec){ f, f, f, f };
++}
++
++static inline vec
++vabs(vec v)
++{
++   return (vec)((uvec)v & 0x7fffffffu);
++}
++
++static inline vec
++vsel(ivec m, vec a, vec b)
++{
++   return (vec)(((uvec)m & (uvec)a) | (~(uvec)m & (uvec)b));
++}
++
++static inline ivec
++isel(ivec m, ivec a, ivec b)
++{
++   return (a & m) | (b & ~m);
++}
++
++/* 1.0 where m, else 0.0 */
++static inline vec
++bool_f(ivec m)
++{
++   return (vec)((uvec)m & 0x3f800000u);
++}
++
++static inline vec
++vfloor(vec x)
++{
++   const vec t = __builtin_convertvector(__builtin_convertvector(x, ivec), vec);
++
++   return t - bool_f(t > x);
++}
++
++static inline vec
++vceil(vec x)
++{
++   const vec t = __builtin_convertvector(__builtin_convertvector(x, ivec), vec);
++
++   return t + bool_f(t < x);
++}
++
++/* sin(2 pi y), as tgsi_exec's sin_turns() */
++static inline vec
++vsin_turns(vec y)
++{
++   vec z;
++
++   y -= vfloor(y + 0.5f);
++   y = vsel(y > 0.25f, 0.5f - y, vsel(y < -0.25f, -0.5f - y, y));
++   z = y * y;
++   return y * (6.28318531f + z * (-41.3417022f + z * (81.6052492f + z * (-76.7058597f + z * 42.0586940f))));
++}
++
++static inline vec
++vrcp(vec x)
++{
++   return splat(1.0f) / x;
++}
++
++static inline vec
++vsqrt(vec x)
++{
++   return (vec){ sqrtf(x[0]), sqrtf(x[1]), sqrtf(x[2]), sqrtf(x[3]) };
++}
++
++static inline vec
++fetch(const struct sp_fs_fast *p, const struct fsf_src *s, unsigned c)
++{
++   vec v = p->r[s->reg][s->swz[c]];
++
++   if (s->abs)
++      v = vabs(v);
++   if (s->neg)
++      v = -v;
++   return v;
++}
++
++#define A(c) fetch(p, &op->src[0], c)
++#define B(c) fetch(p, &op->src[1], c)
++#define C(c) fetch(p, &op->src[2], c)
++#define AI(c) ((ivec)p->r[op->src[0].reg][op->src[0].swz[c]])
++#define BI(c) ((ivec)p->r[op->src[1].reg][op->src[1].swz[c]])
++#define CI(c) ((ivec)p->r[op->src[2].reg][op->src[2].swz[c]])
++
++static void
++texture(struct sp_fs_fast *p, const struct fsf_op *op, struct tgsi_exec_machine *mach, vec res[4])
++{
++   vec coord[3], extra = splat(0.0f);
++   const vec zero = splat(0.0f);
++   float rgba[4][TGSI_QUAD_SIZE];
++   const int8_t offsets[3] = { 0, 0, 0 };
++   enum tgsi_sampler_control control = TGSI_SAMPLER_LOD_NONE;
++   unsigned i;
++
++   for (i = 0; i < 3; i++)
++      coord[i] = i < op->dim ? A(i) : zero;
++   if (op->modifier != MOD_NONE)
++      extra = A(3);
++   if (op->modifier == MOD_PROJ) {
++      for (i = 0; i < op->dim; i++)
++         coord[i] = coord[i] / extra;
++      extra = zero;
++   } else if (op->modifier == MOD_BIAS) {
++      control = TGSI_SAMPLER_LOD_BIAS;
++   } else if (op->modifier == MOD_LOD) {
++      control = TGSI_SAMPLER_LOD_EXPLICIT;
++   }
++   mach->Sampler->get_samples(mach->Sampler, op->unit, op->unit, (const float *)&coord[0],
++                              (const float *)&coord[1], (const float *)&coord[2],
++                              (const float *)&zero, (const float *)&extra, NULL, offsets, control,
++                              rgba);
++   for (i = 0; i < 4; i++)
++      res[i] = (vec){ rgba[i][0], rgba[i][1], rgba[i][2], rgba[i][3] };
++}
++
++unsigned
++sp_fs_fast_run(struct sp_fs_fast *p, struct tgsi_exec_machine *mach, struct quad_header *quad,
++               boolean early_depth_test, const struct tgsi_shader_info *info)
++{
++   const float x = (float)quad->input.x0, y = (float)quad->input.y0;
++   const struct tgsi_interp_coef *coef = quad->coef;
++   const struct tgsi_interp_coef *pc = quad->posCoef;
++   const vec lx = { 0.0f, 1.0f, 0.0f, 1.0f }, ly = { 0.0f, 0.0f, 1.0f, 1.0f };
++   const struct fsf_op *op, *end = p->ops + p->nops;
++   unsigned kill = 0, i, c;
++   vec w;
++
++   /* the quad's 1/w (tgsi_exec's QuadPos.w), then the inputs */
++   {
++      const float a = pc->a0[3] + pc->dadx[3] * x + pc->dady[3] * y;
++
++      w = splat(a) + lx * pc->dadx[3] + ly * pc->dady[3];
++   }
++   for (i = 0; i < p->nin; i++) {
++      const struct fsf_input *in = &p->in[i];
++      const struct tgsi_interp_coef *k = &coef[in->reg];
++      unsigned interp = in->interp;
++
++      if (in->face) {
++         p->r[in->reg][0] = splat((float)(quad->input.facing * -2 + 1));
++         continue;
++      }
++      if (interp == TGSI_INTERPOLATE_COLOR)
++         interp = mach->flatshade_color ? TGSI_INTERPOLATE_CONSTANT : TGSI_INTERPOLATE_PERSPECTIVE;
++      for (c = 0; c < 4; c++) {
++         float a;
++         vec v;
++
++         if (!(in->mask & (1 << c)))
++            continue;
++         if (interp == TGSI_INTERPOLATE_CONSTANT) {
++            p->r[in->reg][c] = splat(k->a0[c]);
++            continue;
++         }
++         a = k->a0[c] + k->dadx[c] * x + k->dady[c] * y;
++         v = splat(a) + lx * k->dadx[c] + ly * k->dady[c];
++         p->r[in->reg][c] = interp == TGSI_INTERPOLATE_PERSPECTIVE ? v / w : v;
++      }
++   }
++   /* the constants of buffer 0 (0 beyond its end, as tgsi_exec) */
++   if (p->nconsts) {
++      const float *cb = (const float *)mach->Consts[0];
++      const unsigned have = cb ? mach->ConstsSize[0] / (4 * sizeof(float)) : 0;
++
++      for (i = 0; i < p->nconsts; i++)
++         for (c = 0; c < 4; c++)
++            p->r[p->const_base + i][c] = splat(i < have ? cb[i * 4 + c] : 0.0f);
++   }
++
++   for (op = p->ops; op < end; op++) {
++      vec res[4];
++      const unsigned m = op->wmask;
++
++      switch (op->opcode) {
++      case TGSI_OPCODE_NOP:
++         continue;
++      case TGSI_OPCODE_MOV:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = A(c);
++         break;
++      case TGSI_OPCODE_ADD:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = A(c) + B(c);
++         break;
++      case TGSI_OPCODE_MUL:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = A(c) * B(c);
++         break;
++      case TGSI_OPCODE_MAD:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = A(c) * B(c) + C(c);
++         break;
++      case TGSI_OPCODE_LRP:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = A(c) * (B(c) - C(c)) + C(c);
++         break;
++      case TGSI_OPCODE_MIN:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) { const vec a = A(c), b = B(c); res[c] = vsel(a < b, a, b); }
++         break;
++      case TGSI_OPCODE_MAX:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) { const vec a = A(c), b = B(c); res[c] = vsel(a > b, a, b); }
++         break;
++      case TGSI_OPCODE_CMP:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = vsel(A(c) < 0.0f, B(c), C(c));
++         break;
++      case TGSI_OPCODE_SLT:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = bool_f(A(c) < B(c));
++         break;
++      case TGSI_OPCODE_SGE:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = bool_f(A(c) >= B(c));
++         break;
++      case TGSI_OPCODE_SEQ:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = bool_f(A(c) == B(c));
++         break;
++      case TGSI_OPCODE_SNE:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = bool_f(A(c) != B(c));
++         break;
++      case TGSI_OPCODE_FSLT:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = (vec)(A(c) < B(c));
++         break;
++      case TGSI_OPCODE_FSGE:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = (vec)(A(c) >= B(c));
++         break;
++      case TGSI_OPCODE_FSEQ:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = (vec)(A(c) == B(c));
++         break;
++      case TGSI_OPCODE_FSNE:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = (vec)(A(c) != B(c));
++         break;
++      case TGSI_OPCODE_FLR:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = vfloor(A(c));
++         break;
++      case TGSI_OPCODE_CEIL:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = vceil(A(c));
++         break;
++      case TGSI_OPCODE_TRUNC:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = __builtin_convertvector(__builtin_convertvector(A(c), ivec), vec);
++         break;
++      case TGSI_OPCODE_FRC:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) { const vec a = A(c); res[c] = a - vfloor(a); }
++         break;
++      case TGSI_OPCODE_I2F:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = __builtin_convertvector((ivec)A(c), vec);
++         break;
++      case TGSI_OPCODE_U2F:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = __builtin_convertvector((uvec)A(c), vec);
++         break;
++      case TGSI_OPCODE_F2I:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = (vec)__builtin_convertvector(A(c), ivec);
++         break;
++      case TGSI_OPCODE_F2U:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = (vec)__builtin_convertvector(A(c), uvec);
++         break;
++      case TGSI_OPCODE_DDX:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) { const vec a = A(c); res[c] = splat(a[TILE_BOTTOM_RIGHT] - a[TILE_BOTTOM_LEFT]); }
++         break;
++      case TGSI_OPCODE_DDY:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) { const vec a = A(c); res[c] = splat(a[TILE_BOTTOM_LEFT] - a[TILE_TOP_LEFT]); }
++         break;
++      /* replicated scalars: src.x (after swizzle) */
++      case TGSI_OPCODE_DP2:
++         res[0] = A(0) * B(0) + A(1) * B(1);
++         goto replicate;
++      case TGSI_OPCODE_DP3:
++         res[0] = A(0) * B(0) + A(1) * B(1) + A(2) * B(2);
++         goto replicate;
++      case TGSI_OPCODE_DP4:
++         res[0] = A(0) * B(0) + A(1) * B(1) + A(2) * B(2) + A(3) * B(3);
++         goto replicate;
++      case TGSI_OPCODE_RCP:
++         res[0] = vrcp(A(0));
++         goto replicate;
++      case TGSI_OPCODE_SQRT:
++         res[0] = vsqrt(A(0));
++         goto replicate;
++      case TGSI_OPCODE_RSQ:
++         res[0] = vrcp(vsqrt(A(0)));
++         goto replicate;
++      case TGSI_OPCODE_SIN:
++         res[0] = vsin_turns(A(0) * 0.159154943f);
++         goto replicate;
++      case TGSI_OPCODE_COS:
++         res[0] = vsin_turns(A(0) * 0.159154943f + 0.25f);
++         goto replicate;
++      case TGSI_OPCODE_EX2: {
++         const vec a = A(0);
++
++         res[0] = (vec){ powf(2.0f, a[0]), powf(2.0f, a[1]), powf(2.0f, a[2]), powf(2.0f, a[3]) };
++         goto replicate;
++      }
++      case TGSI_OPCODE_LG2: {
++         const vec a = A(0);
++
++         res[0] = (vec){ logf(a[0]), logf(a[1]), logf(a[2]), logf(a[3]) } * 1.442695f;
++         goto replicate;
++      }
++      case TGSI_OPCODE_POW: {
++         const vec a = A(0), b = B(0);
++
++         res[0] = (vec){ powf(a[0], b[0]), powf(a[1], b[1]), powf(a[2], b[2]), powf(a[3], b[3]) };
++         goto replicate;
++      }
++      case TGSI_OPCODE_TEX: case TGSI_OPCODE_TXP: case TGSI_OPCODE_TXB: case TGSI_OPCODE_TXL:
++         texture(p, op, mach, res);
++         break;
++      case TGSI_OPCODE_KILL_IF: {
++         ivec any = { 0, 0, 0, 0 };
++
++         for (c = 0; c < 4; c++)
++            any |= A(c) < 0.0f;
++         for (i = 0; i < 4; i++)
++            if (any[i])
++               kill |= 1 << i;
++         continue;
++      }
++      case TGSI_OPCODE_KILL:
++         kill = 0xf;
++         continue;
++      /* integers and bits */
++      case TGSI_OPCODE_AND:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = (vec)(AI(c) & BI(c));
++         break;
++      case TGSI_OPCODE_OR:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = (vec)(AI(c) | BI(c));
++         break;
++      case TGSI_OPCODE_XOR:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = (vec)(AI(c) ^ BI(c));
++         break;
++      case TGSI_OPCODE_NOT:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = (vec)(~AI(c));
++         break;
++      case TGSI_OPCODE_INEG:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = (vec)(-AI(c));
++         break;
++      case TGSI_OPCODE_UADD:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = (vec)(AI(c) + BI(c));
++         break;
++      case TGSI_OPCODE_UMUL:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = (vec)((uvec)AI(c) * (uvec)BI(c));
++         break;
++      case TGSI_OPCODE_ISLT:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = (vec)(AI(c) < BI(c));
++         break;
++      case TGSI_OPCODE_ISGE:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = (vec)(AI(c) >= BI(c));
++         break;
++      case TGSI_OPCODE_USEQ:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = (vec)(AI(c) == BI(c));
++         break;
++      case TGSI_OPCODE_USNE:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = (vec)(AI(c) != BI(c));
++         break;
++      case TGSI_OPCODE_IMAX:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) { const ivec a = AI(c), b = BI(c); res[c] = (vec)isel(a > b, a, b); }
++         break;
++      case TGSI_OPCODE_IMIN:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) { const ivec a = AI(c), b = BI(c); res[c] = (vec)isel(a < b, a, b); }
++         break;
++      case TGSI_OPCODE_UCMP:
++         for (c = 0; c < 4; c++) if (m & (1 << c)) res[c] = vsel(AI(c) != 0, (vec)BI(c), (vec)CI(c));
++         break;
++      default:
++         continue;
++      replicate:
++         res[1] = res[2] = res[3] = res[0];
++         break;
++      }
++      for (c = 0; c < 4; c++) {
++         if (!(m & (1 << c)))
++            continue;
++         if (op->sat) {
++            const vec v = res[c];
++
++            res[c] = vsel(v > 1.0f, splat(1.0f), vsel(v > 0.0f, v, splat(0.0f)));
++         }
++         p->r[op->dst][c] = res[c];
++      }
++   }
++
++   quad->inout.mask &= ~kill;
++   if (!quad->inout.mask)
++      return FALSE;
++
++   /* the outputs, as sp_fs_exec.c's exec_run() */
++   for (i = 0; i < info->num_outputs; i++) {
++      const vec *o = p->r[p->out_base + i];
++      unsigned j;
++
++      switch (info->output_semantic_name[i]) {
++      case TGSI_SEMANTIC_COLOR: {
++         float (*col)[4] = quad->output.color[info->output_semantic_index[i]];
++
++         for (c = 0; c < 4; c++)
++            for (j = 0; j < 4; j++)
++               col[c][j] = o[c][j];
++         break;
++      }
++      case TGSI_SEMANTIC_POSITION:
++         if (!early_depth_test)
++            for (j = 0; j < 4; j++)
++               quad->output.depth[j] = o[2][j];
++         break;
++      case TGSI_SEMANTIC_STENCIL:
++         if (!early_depth_test)
++            for (j = 0; j < 4; j++)
++               quad->output.stencil[j] = ((const uvec *)o)[1][j];
++         break;
++      }
++   }
++   return TRUE;
++}
+diff --git a/src/gallium/drivers/softpipe/sp_fs_fast.h b/src/gallium/drivers/softpipe/sp_fs_fast.h
+new file mode 100644
+index 0000000..baf3779
+--- /dev/null
++++ b/src/gallium/drivers/softpipe/sp_fs_fast.h
+@@ -0,0 +1,36 @@
++/*
++ * sp_fs_fast.h -- fragment shaders run as vector code, a quad at a time.
++ *
++ * A fragment shader without flow control is decoded once into a list of
++ * operations on registers held as one 4-wide vector per channel (the four
++ * pixels of a quad: NEON on the Z3660's core 1, SSE on a PC), instead of
++ * going through the tgsi_exec machine for every quad.  The inputs, the
++ * texture sampling (softpipe's sampler) and the outputs are tgsi_exec's,
++ * so the results are the same.  Anything it does not know stays with
++ * tgsi_exec.
++ *
++ * SOFTPIPE_NO_FAST_FS=1 turns it off.
++ */
++#ifndef SP_FS_FAST_H
++#define SP_FS_FAST_H
++
++#include "pipe/p_compiler.h"
++
++struct tgsi_token;
++struct tgsi_shader_info;
++struct tgsi_exec_machine;
++struct quad_header;
++struct sp_fs_fast;
++
++struct sp_fs_fast *
++sp_fs_fast_compile(const struct tgsi_token *tokens, const struct tgsi_shader_info *info);
++
++/* run the shader for one quad: the mask of the pixels still alive */
++unsigned
++sp_fs_fast_run(struct sp_fs_fast *p, struct tgsi_exec_machine *mach, struct quad_header *quad,
++               boolean early_depth_test, const struct tgsi_shader_info *info);
++
++void
++sp_fs_fast_destroy(struct sp_fs_fast *p);
++
++#endif
+diff --git a/src/gallium/drivers/softpipe/sp_setup.c b/src/gallium/drivers/softpipe/sp_setup.c
+index ffe4926..c4e4fe2 100644
+--- a/src/gallium/drivers/softpipe/sp_setup.c
++++ b/src/gallium/drivers/softpipe/sp_setup.c
+@@ -36,6 +36,7 @@
+ #include "sp_quad.h"
+ #include "sp_quad_pipe.h"
+ #include "sp_setup.h"
++#include "sp_fast.h"
+ #include "sp_state.h"
+ #include "draw/draw_context.h"
+ #include "pipe/p_shader_tokens.h"
+@@ -113,6 +114,8 @@ struct setup_context {
+ 
+    unsigned cull_face;		/* which faces cull */
+    unsigned nr_vertex_attrs;
++
++   struct sp_fast fast;          /* sp_fast.c: fixed-function spans */
+ };
+ 
+ 
+@@ -675,6 +678,15 @@ setup_tri_coefficients(struct setup_context *setup)
+ }
+ 
+ 
++/* ceilf() for screen coordinates: a library call on the Cortex-A9 */
++static inline float
++ceil_coord(float x)
++{
++   const int i = (int)x;
++
++   return (float)(i + (x > (float)i));
++}
++
+ static void
+ setup_tri_edges(struct setup_context *setup)
+ {
+@@ -685,18 +697,18 @@ setup_tri_edges(struct setup_context *setup)
+    float vmid_y = setup->vmid[0][1] - setup->pixel_offset;
+    float vmax_y = setup->vmax[0][1] - setup->pixel_offset;
+ 
+-   setup->emaj.sy = ceilf(vmin_y);
+-   setup->emaj.lines = (int) ceilf(vmax_y - setup->emaj.sy);
++   setup->emaj.sy = ceil_coord(vmin_y);
++   setup->emaj.lines = (int) ceil_coord(vmax_y - setup->emaj.sy);
+    setup->emaj.dxdy = setup->emaj.dy ? setup->emaj.dx / setup->emaj.dy : .0f;
+    setup->emaj.sx = vmin_x + (setup->emaj.sy - vmin_y) * setup->emaj.dxdy;
+ 
+-   setup->etop.sy = ceilf(vmid_y);
+-   setup->etop.lines = (int) ceilf(vmax_y - setup->etop.sy);
++   setup->etop.sy = ceil_coord(vmid_y);
++   setup->etop.lines = (int) ceil_coord(vmax_y - setup->etop.sy);
+    setup->etop.dxdy = setup->etop.dy ? setup->etop.dx / setup->etop.dy : .0f;
+    setup->etop.sx = vmid_x + (setup->etop.sy - vmid_y) * setup->etop.dxdy;
+ 
+-   setup->ebot.sy = ceilf(vmin_y);
+-   setup->ebot.lines = (int) ceilf(vmid_y - setup->ebot.sy);
++   setup->ebot.sy = ceil_coord(vmin_y);
++   setup->ebot.lines = (int) ceil_coord(vmid_y - setup->ebot.sy);
+    setup->ebot.dxdy = setup->ebot.dy ? setup->ebot.dx / setup->ebot.dy : .0f;
+    setup->ebot.sx = vmin_x + (setup->ebot.sy - vmin_y) * setup->ebot.dxdy;
+ }
+@@ -779,6 +791,168 @@ subtriangle(struct setup_context *setup,
+ }
+ 
+ 
++/**
++ * setup_tri_coefficients() for the fast path: only Z, W and the channels
++ * it reads (no colour planes when the colour is constant).
++ */
++static void
++fast_coeff(struct setup_context *setup, int fragSlot, uint chan)
++{
++   const struct sp_setup_info *sinfo = &setup->softpipe->setup_info;
++   const uint vertSlot = sinfo->attrib[fragSlot].src_index;
++   float v[3];
++
++   switch (sinfo->attrib[fragSlot].interp) {
++   case SP_INTERP_CONSTANT:
++      const_coeff(setup, &setup->coef[fragSlot], vertSlot, chan);
++      break;
++   case SP_INTERP_LINEAR:
++      v[0] = setup->vmin[vertSlot][chan];
++      v[1] = setup->vmid[vertSlot][chan];
++      v[2] = setup->vmax[vertSlot][chan];
++      tri_linear_coeff(setup, &setup->coef[fragSlot], chan, v);
++      break;
++   default:
++      v[0] = setup->vmin[vertSlot][chan];
++      v[1] = setup->vmid[vertSlot][chan];
++      v[2] = setup->vmax[vertSlot][chan];
++      tri_persp_coeff(setup, &setup->coef[fragSlot], chan, v);
++   }
++}
++
++static void
++fast_tri_coefficients(struct setup_context *setup, boolean persp)
++{
++   const struct sp_fast *f = &setup->fast;
++   float v[3];
++   int c, u;
++
++   v[0] = setup->vmin[0][2];
++   v[1] = setup->vmid[0][2];
++   v[2] = setup->vmax[0][2];
++   tri_linear_coeff(setup, &setup->posCoef, 2, v);
++   v[0] = setup->vmin[0][3];
++   v[1] = setup->vmid[0][3];
++   v[2] = setup->vmax[0][3];
++   tri_linear_coeff(setup, &setup->posCoef, 3, v);
++
++   /* the texture planes: not when the triangle is drawn affine */
++   for (u = 0; u < SP_FAST_UNITS && persp; u++)
++      if (f->u[u].in >= 0)
++         for (c = 0; c < (f->u[u].txp ? 3 : 2); c++)
++            fast_coeff(setup, f->u[u].in, f->u[u].coord_chan[c]);
++   if (f->col_in >= 0 && !f->tri_const && persp)
++      for (c = 0; c < 4; c++)
++         if (f->col_chan[c] >= 0)
++            fast_coeff(setup, f->col_in, f->col_chan[c]);
++}
++
++
++/**
++ * Affine planes for a small, nearly flat triangle (1/w within 3 % over its
++ * corners, or the attributes not perspective): s and t of each texture unit
++ * (s/q, t/q for TXP) and the colour, linear in x and y from the corners.
++ * The fast path then needs no division per span.
++ */
++static boolean
++fast_affine_planes(struct setup_context *setup, struct tgsi_interp_coef aff[SP_FAST_UNITS],
++                   struct tgsi_interp_coef *col, float *ratio)
++{
++   const struct sp_fast *f = &setup->fast;
++   const struct sp_setup_info *sinfo = &setup->softpipe->setup_info;
++   const float (*vx[3])[4] = { setup->vmin, setup->vmid, setup->vmax };
++   const float o0 = setup->vmin[0][3], o1 = setup->vmid[0][3], o2 = setup->vmax[0][3];
++   const float lo = MIN2(o0, MIN2(o1, o2)), hi = MAX2(o0, MAX2(o1, o2));
++   int u, c, i;
++
++   *ratio = lo > 0.0f ? hi / lo : 1e9f;
++   if (!f->fixed || !(lo > 0.0f) || hi > lo * 1.03f)
++      return FALSE;
++   for (u = 0; u < SP_FAST_UNITS; u++) {
++      const struct sp_fast_unit *un = &f->u[u];
++      int slot;
++      float sv[3], tv[3];
++
++      if (un->in < 0)
++         continue;
++      slot = sinfo->attrib[un->in].src_index;
++      for (i = 0; i < 3; i++) {
++         float s = vx[i][slot][un->coord_chan[0]], t = vx[i][slot][un->coord_chan[1]];
++
++         if (un->txp) {
++            const float q = vx[i][slot][un->coord_chan[2]];
++
++            if (q == 0.0f)
++               return FALSE;
++            s /= q;
++            t /= q;
++         }
++         sv[i] = s;
++         tv[i] = t;
++      }
++      tri_linear_coeff(setup, &aff[u], 0, sv);
++      tri_linear_coeff(setup, &aff[u], 1, tv);
++   }
++   if (f->col_in >= 0 && !f->tri_const) {
++      const int slot = sinfo->attrib[f->col_in].src_index;
++
++      for (c = 0; c < 4; c++) {
++         const int ch = f->col_chan[c];
++         float v[3];
++
++         if (ch < 0) {
++            col->a0[c] = 1.0f;
++            col->dadx[c] = col->dady[c] = 0.0f;
++            continue;
++         }
++         for (i = 0; i < 3; i++)
++            v[i] = CLAMP(vx[i][slot][ch], 0.0f, 1.0f);
++         tri_linear_coeff(setup, col, c, v);
++      }
++   }
++   return TRUE;
++}
++
++
++/**
++ * subtriangle() for the fast path: the same spans, drawn at once.
++ */
++static void
++fast_subtriangle(struct setup_context *setup,
++                 struct edge *eleft,
++                 struct edge *eright,
++                 int lines)
++{
++   const struct pipe_scissor_state *cliprect = &setup->softpipe->cliprect[0];
++   const int minx = (int) cliprect->minx;
++   const int maxx = (int) cliprect->maxx;
++   const int miny = (int) cliprect->miny;
++   const int maxy = (int) cliprect->maxy;
++   int y, start_y, finish_y;
++   int sy = (int)eleft->sy;
++
++   start_y = sy < miny ? miny : sy;
++   finish_y = sy + lines > maxy ? maxy : sy + lines;
++
++   for (y = start_y - sy; y < finish_y - sy; y++) {
++      int left = (int)(eleft->sx + y * eleft->dxdy);
++      int right = (int)(eright->sx + y * eright->dxdy);
++
++      if (left < minx)
++         left = minx;
++      if (right > maxx)
++         right = maxx;
++      if (left < right)
++         sp_fast_span(&setup->fast, setup->coef, &setup->posCoef, sy + y, left, right);
++   }
++
++   eleft->sx += lines * eleft->dxdy;
++   eright->sx += lines * eright->dxdy;
++   eleft->sy += lines;
++   eright->sy += lines;
++}
++
++
+ /**
+  * Recalculate prim's determinant.  This is needed as we don't have
+  * get this information through the vbuf_render interface & we must
+@@ -835,6 +1009,37 @@ sp_setup_tri(struct setup_context *setup,
+    if (!setup_sort_vertices( setup, det, v0, v1, v2 ))
+       return;
+ 
++   if (setup->fast.on) {
++      SPF_PROF_BEGIN(t0);
++      sp_fast_tri(&setup->fast, setup->vprovoke, setup->vmin, setup->vmid, setup->vmax);
++      {
++         struct tgsi_interp_coef aff[SP_FAST_UNITS], col;
++         float ratio = 1e9f;
++         const boolean affine = fast_affine_planes(setup, aff, &col, &ratio);
++
++         fast_tri_coefficients(setup, !affine);
++         setup->fast.tri_ratio = ratio;
++
++         sp_fast_tri_planes(&setup->fast, setup->coef, &setup->posCoef, (int)setup->vmin[0][0],
++                            (int)setup->vmin[0][1], affine ? aff : NULL,
++                            affine && !setup->fast.tri_const ? &col : NULL);
++      }
++      setup_tri_edges(setup);
++      if (setup->oneoverarea < 0.0) {
++         fast_subtriangle(setup, &setup->emaj, &setup->ebot, setup->ebot.lines);
++         fast_subtriangle(setup, &setup->emaj, &setup->etop, setup->etop.lines);
++      } else {
++         fast_subtriangle(setup, &setup->ebot, &setup->emaj, setup->ebot.lines);
++         fast_subtriangle(setup, &setup->etop, &setup->emaj, setup->etop.lines);
++      }
++      if (setup->softpipe->active_statistics_queries)
++         setup->softpipe->pipeline_statistics.c_primitives++;
++      SPF_PROF_END(0, t0);
++      return;
++   }
++
++   SPF_PROF_ADD(6, 1);          /* a triangle softpipe draws itself */
++   SPF_PROF_BEGIN(ts);
+    setup_tri_coefficients( setup );
+    setup_tri_edges( setup );
+ 
+@@ -872,6 +1077,7 @@ sp_setup_tri(struct setup_context *setup,
+    }
+ 
+    flush_spans( setup );
++   SPF_PROF_END(7, ts);
+ 
+    if (setup->softpipe->active_statistics_queries) {
+       setup->softpipe->pipeline_statistics.c_primitives++;
+@@ -1480,6 +1686,8 @@ sp_setup_prepare(struct setup_context *setup)
+ 
+    sp->quad.first->begin( sp->quad.first );
+ 
++   sp_fast_prepare(&setup->fast, sp);
++
+    if (sp->reduced_api_prim == PIPE_PRIM_TRIANGLES &&
+        sp->rasterizer->fill_front == PIPE_POLYGON_MODE_FILL &&
+        sp->rasterizer->fill_back == PIPE_POLYGON_MODE_FILL) {
+@@ -1510,6 +1718,7 @@ sp_setup_create_context(struct softpipe_context *softpipe)
+    unsigned i;
+ 
+    setup->softpipe = softpipe;
++   sp_fast_init(&setup->fast);
+ 
+    for (i = 0; i < MAX_QUADS; i++) {
+       setup->quad[i].coef = setup->coef;
+diff --git a/src/gallium/drivers/softpipe/sp_state_sampler.c b/src/gallium/drivers/softpipe/sp_state_sampler.c
+index 751eb76..e043fc8 100644
+--- a/src/gallium/drivers/softpipe/sp_state_sampler.c
++++ b/src/gallium/drivers/softpipe/sp_state_sampler.c
+@@ -117,8 +117,11 @@ softpipe_set_sampler_views(struct pipe_context *pipe,
+          &softpipe->tgsi.sampler[shader]->sp_sview[start + i];
+       struct pipe_sampler_view **pview = &softpipe->sampler_views[shader][start + i];
+       pipe_sampler_view_reference(pview, views[i]);
+-      sp_tex_tile_cache_set_sampler_view(softpipe->tex_cache[shader][start + i],
+-                                         views[i]);
++      if (views[i] && !softpipe->tex_cache[shader][start + i])
++         softpipe->tex_cache[shader][start + i] = sp_create_tex_tile_cache(pipe);
++      if (softpipe->tex_cache[shader][start + i])
++         sp_tex_tile_cache_set_sampler_view(softpipe->tex_cache[shader][start + i],
++                                            views[i]);
+       /*
+        * We don't really have variants, however some bits are different per shader,
+        * so just copy?
+diff --git a/src/gallium/drivers/softpipe/sp_state_shader.c b/src/gallium/drivers/softpipe/sp_state_shader.c
+index da47927..51a8d3a 100644
+--- a/src/gallium/drivers/softpipe/sp_state_shader.c
++++ b/src/gallium/drivers/softpipe/sp_state_shader.c
+@@ -75,6 +75,7 @@ create_fs_variant(struct softpipe_context *softpipe,
+       }
+ 
+       tgsi_scan_shader(var->tokens, &var->info);
++      softpipe_fs_variant_try_fast(var);
+ 
+       /* See comments elsewhere about draw fragment shaders */
+ #if 0
+diff --git a/src/gallium/drivers/softpipe/sp_tile_cache.c b/src/gallium/drivers/softpipe/sp_tile_cache.c
+index 998939b..12a42da 100644
+--- a/src/gallium/drivers/softpipe/sp_tile_cache.c
++++ b/src/gallium/drivers/softpipe/sp_tile_cache.c
+@@ -171,6 +171,7 @@ void
+ sp_tile_cache_set_surface(struct softpipe_tile_cache *tc,
+                           struct pipe_surface *ps)
+ {
++   tc->fast_clean = FALSE;
+    struct pipe_context *pipe = tc->pipe;
+    int i;
+ 
+@@ -517,6 +518,7 @@ struct softpipe_cached_tile *
+ sp_find_cached_tile(struct softpipe_tile_cache *tc, 
+                     union tile_address addr )
+ {
++   tc->fast_clean = FALSE;
+    struct pipe_transfer *pt;
+    /* cache pos/entry: */
+    const int pos = CACHE_POS(addr.bits.x,
+@@ -640,6 +642,7 @@ sp_tile_cache_clear(struct softpipe_tile_cache *tc,
+    uint pos;
+ 
+    tc->clear_color = *color;
++   tc->fast_clean = FALSE;
+ 
+    tc->clear_val = clearValue;
+ 
+diff --git a/src/gallium/drivers/softpipe/sp_tile_cache.h b/src/gallium/drivers/softpipe/sp_tile_cache.h
+index 2c0bafa..ac99de1 100644
+--- a/src/gallium/drivers/softpipe/sp_tile_cache.h
++++ b/src/gallium/drivers/softpipe/sp_tile_cache.h
+@@ -99,6 +99,8 @@ struct softpipe_tile_cache
+ 
+    union tile_address last_tile_addr;
+    struct softpipe_cached_tile *last_tile;  /**< most recently retrieved tile */
++
++   boolean fast_clean;  /**< sp_fast.c: nothing cached or pending since it drew */
+ };
+ 
+ 
+diff --git a/src/gallium/include/pipe/p_config.h b/src/gallium/include/pipe/p_config.h
+index 3fa43ed..f7fc395 100644
+--- a/src/gallium/include/pipe/p_config.h
++++ b/src/gallium/include/pipe/p_config.h
+@@ -194,6 +194,12 @@
+ #define PIPE_OS_UNIX
+ #endif
+ 
++/* Amiga UNIX (SVR4 on m68k) and the Z3660's core 1 (bare metal, newlib) */
++#if defined(__amix__) || defined(__z3660core__)
++#define PIPE_OS_AMIX
++#define PIPE_OS_UNIX
++#endif
++
+ #if defined(__APPLE__)
+ #define PIPE_OS_APPLE
+ #define PIPE_OS_UNIX
+diff --git a/src/gallium/state_trackers/osmesa/osmesa.c b/src/gallium/state_trackers/osmesa/osmesa.c
+index e7e0ab1..4648f98 100644
+--- a/src/gallium/state_trackers/osmesa/osmesa.c
++++ b/src/gallium/state_trackers/osmesa/osmesa.c
+@@ -191,10 +191,9 @@ osmesa_choose_format(GLenum format, GLenum type)
+    switch (format) {
+    case OSMESA_RGBA:
+       if (type == GL_UNSIGNED_BYTE) {
+-         if (little_endian())
+-            return PIPE_FORMAT_R8G8B8A8_UNORM;
+-         else
+-            return PIPE_FORMAT_A8B8G8R8_UNORM;
++         /* 8-bit channels are byte arrays in Gallium: the same on
++          * big-endian machines (AMIX) */
++         return PIPE_FORMAT_R8G8B8A8_UNORM;
+       }
+       else if (type == GL_UNSIGNED_SHORT) {
+          return PIPE_FORMAT_R16G16B16A16_UNORM;
+@@ -208,10 +207,9 @@ osmesa_choose_format(GLenum format, GLenum type)
+       break;
+    case OSMESA_BGRA:
+       if (type == GL_UNSIGNED_BYTE) {
+-         if (little_endian())
+-            return PIPE_FORMAT_B8G8R8A8_UNORM;
+-         else
+-            return PIPE_FORMAT_A8R8G8B8_UNORM;
++         /* 8-bit channels are byte arrays in Gallium: the same on
++          * big-endian machines (AMIX) */
++         return PIPE_FORMAT_B8G8R8A8_UNORM;
+       }
+       else if (type == GL_UNSIGNED_SHORT) {
+          return PIPE_FORMAT_R16G16B16A16_UNORM;
+@@ -225,10 +223,9 @@ osmesa_choose_format(GLenum format, GLenum type)
+       break;
+    case OSMESA_ARGB:
+       if (type == GL_UNSIGNED_BYTE) {
+-         if (little_endian())
+-            return PIPE_FORMAT_A8R8G8B8_UNORM;
+-         else
+-            return PIPE_FORMAT_B8G8R8A8_UNORM;
++         /* 8-bit channels are byte arrays in Gallium: the same on
++          * big-endian machines (AMIX) */
++         return PIPE_FORMAT_A8R8G8B8_UNORM;
+       }
+       else if (type == GL_UNSIGNED_SHORT) {
+          return PIPE_FORMAT_R16G16B16A16_UNORM;
+@@ -699,6 +696,9 @@ OSMesaCreateContextAttribs(const int *attribList, OSMesaContext sharelist)
+    osmesa->stctx = stapi->create_context(stapi, get_st_manager(),
+                                          &attribs, &st_error, st_shared);
+    if (!osmesa->stctx) {
++      if (getenv("OSMESA_DEBUG"))
++         fprintf(stderr, "OSMesa: create_context failed, st_error %d (version %d.%d)\n",
++                 (int)st_error, version_major, version_minor);
+       FREE(osmesa);
+       return NULL;
+    }
+diff --git a/src/mapi/glapi/gen/glX_XML.py b/src/mapi/glapi/gen/glX_XML.py
+index ff0011b..f3ee7b2 100644
+--- a/src/mapi/glapi/gen/glX_XML.py
++++ b/src/mapi/glapi/gen/glX_XML.py
+@@ -48,7 +48,7 @@ class glx_enum(gl_XML.gl_enum):
+ 
+         self.functions = {}
+ 
+-        for child in element.getchildren():
++        for child in list(element):
+             if child.tag == "size":
+                 n = child.get( "name" )
+                 c = child.get( "count" )
+@@ -130,7 +130,7 @@ class glx_function(gl_XML.gl_function):
+                     self.counter_list.append(param.counter)
+ 
+ 
+-        for child in element.getchildren():
++        for child in list(element):
+             if child.tag == "glx":
+                 rop = child.get( 'rop' )
+                 sop = child.get( 'sop' )
+diff --git a/src/mapi/glapi/gen/gl_XML.py b/src/mapi/glapi/gen/gl_XML.py
+index b4aa6be..9923c9c 100644
+--- a/src/mapi/glapi/gen/gl_XML.py
++++ b/src/mapi/glapi/gen/gl_XML.py
+@@ -714,7 +714,7 @@ class gl_function( gl_item ):
+ 
+         parameters = []
+         return_type = "void"
+-        for child in element.getchildren():
++        for child in list(element):
+             if child.tag == "return":
+                 return_type = child.get( "type", "void" )
+             elif child.tag == "param":
+@@ -744,7 +744,7 @@ class gl_function( gl_item ):
+                 if param.is_image():
+                     self.images.append( param )
+ 
+-        if element.getchildren():
++        if list(element):
+             self.initialized = 1
+             self.entry_point_parameters[name] = parameters
+         else:
+@@ -916,7 +916,7 @@ class gl_api(object):
+ 
+ 
+     def process_OpenGLAPI(self, file_name, element):
+-        for child in element.getchildren():
++        for child in list(element):
+             if child.tag == "category":
+                 self.process_category( child )
+             elif child.tag == "OpenGLAPI":
+@@ -936,7 +936,7 @@ class gl_api(object):
+         [cat_type, key] = classify_category(cat_name, cat_number)
+         self.categories[cat_type][key] = [cat_name, cat_number]
+ 
+-        for child in cat.getchildren():
++        for child in list(cat):
+             if child.tag == "function":
+                 func_name = real_function_name( child )
+ 
+diff --git a/src/mesa/main/get_hash_generator.py b/src/mesa/main/get_hash_generator.py
+index 37dae45..f742ebf 100644
+--- a/src/mesa/main/get_hash_generator.py
++++ b/src/mesa/main/get_hash_generator.py
+@@ -30,7 +30,7 @@
+ 
+ from __future__ import print_function
+ 
+-import os, sys, imp, getopt
++import os, sys, getopt
+ from collections import defaultdict
+ import get_hash_params
+ 
+diff --git a/src/mesa/state_tracker/st_context.c b/src/mesa/state_tracker/st_context.c
+index 3548767..7787039 100644
+--- a/src/mesa/state_tracker/st_context.c
++++ b/src/mesa/state_tracker/st_context.c
+@@ -579,6 +579,8 @@ st_create_context(gl_api api, struct pipe_context *pipe,
+       return NULL;
+ 
+    if (!_mesa_initialize_context(ctx, api, visual, shareCtx, &funcs)) {
++      if (getenv("OSMESA_DEBUG"))
++         fprintf(stderr, "st: _mesa_initialize_context failed\n");
+       free(ctx);
+       return NULL;
+    }
+diff --git a/src/mesa/state_tracker/st_manager.c b/src/mesa/state_tracker/st_manager.c
+index 7b74a37..935511a 100644
+--- a/src/mesa/state_tracker/st_manager.c
++++ b/src/mesa/state_tracker/st_manager.c
+@@ -841,8 +841,11 @@ st_api_create_context(struct st_api *stapi, struct st_manager *smapi,
+    bool no_error = false;
+    unsigned ctx_flags = PIPE_CONTEXT_PREFER_THREADED;
+ 
+-   if (!(stapi->profile_mask & (1 << attribs->profile)))
++   if (!(stapi->profile_mask & (1 << attribs->profile))) {
++      if (getenv("OSMESA_DEBUG"))
++         fprintf(stderr, "st: profile %d not in mask %x\n", attribs->profile, stapi->profile_mask);
+       return NULL;
++   }
+ 
+    switch (attribs->profile) {
+    case ST_PROFILE_DEFAULT:
+@@ -890,6 +893,8 @@ st_api_create_context(struct st_api *stapi, struct st_manager *smapi,
+ 
+    pipe = smapi->screen->context_create(smapi->screen, NULL, ctx_flags);
+    if (!pipe) {
++      if (getenv("OSMESA_DEBUG"))
++         fprintf(stderr, "st: screen->context_create failed\n");
+       *error = ST_CONTEXT_ERROR_NO_MEMORY;
+       return NULL;
+    }
+@@ -904,6 +909,8 @@ st_api_create_context(struct st_api *stapi, struct st_manager *smapi,
+    st = st_create_context(api, pipe, mode_ptr, shared_ctx,
+                           &attribs->options, no_error);
+    if (!st) {
++      if (getenv("OSMESA_DEBUG"))
++         fprintf(stderr, "st: st_create_context failed\n");
+       *error = ST_CONTEXT_ERROR_NO_MEMORY;
+       pipe->destroy(pipe);
+       return NULL;
+@@ -941,6 +948,8 @@ st_api_create_context(struct st_api *stapi, struct st_manager *smapi,
+       /* Is the actual version less than the requested version?
+        */
+       if (st->ctx->Version < attribs->major * 10U + attribs->minor) {
++         if (getenv("OSMESA_DEBUG"))
++            fprintf(stderr, "st: version %u < %d.%d\n", st->ctx->Version, attribs->major, attribs->minor);
+          *error = ST_CONTEXT_ERROR_BAD_VERSION;
+          st_destroy_context(st);
+          return NULL;
+diff --git a/src/util/os_misc.c b/src/util/os_misc.c
+index 09d4400..31d795a 100644
+--- a/src/util/os_misc.c
++++ b/src/util/os_misc.c
+@@ -51,6 +51,8 @@
+ #  include <unistd.h>
+ #elif defined(PIPE_OS_APPLE) || defined(PIPE_OS_BSD)
+ #  include <sys/sysctl.h>
++#elif defined(PIPE_OS_AMIX)
++   /* nothing: total memory is fixed */
+ #elif defined(PIPE_OS_HAIKU)
+ #  include <kernel/OS.h>
+ #elif defined(PIPE_OS_WINDOWS)
+@@ -151,6 +153,10 @@ os_get_total_physical_memory(uint64_t *size)
+ #endif
+ 
+    return (sysctl(mib, 2, size, &len, NULL, 0) == 0);
++#elif defined(PIPE_OS_AMIX)
++   /* the A3000's 128 MB, or core 1's 256 MB region */
++   *size = 128ULL * 1024 * 1024;
++   return true;
+ #elif defined(PIPE_OS_HAIKU)
+    system_info info;
+    status_t ret;
