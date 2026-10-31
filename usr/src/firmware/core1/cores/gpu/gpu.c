@@ -250,8 +250,7 @@ static void idle(void)
 #define ICDICER0        PRIV(0x1180)
 #define ICDIPR_29       (*(volatile uint8_t *)0xF8F0141DUL)
 #define PT_IRQ          29
-#define PT_PRESCALE     255             /* 433 MHz / 256 */
-#define PT_TICKS        1693000u        /* a second */
+#define PT_PRESCALE     255             /* the private timer: half the CPU clock / 256 */
 
 extern char __rodata_start[], _stack[];
 extern void _vector_table(void);
@@ -312,7 +311,7 @@ static void samp_start(void)
     __asm__ volatile("mcr p15, 0, %0, c12, c0, 0\n isb" : : "r"((uint32_t)samp_vectors));
     PT_CTRL = 0;
     PT_ISR = 1;
-    PT_LOAD = PT_TICKS;
+    PT_LOAD = (uint32_t)(pl_tick_hz / (PT_PRESCALE + 1));        /* a second, at whatever the clock is */
     ICDIPR_29 = 0xA0;
     ICDISER0 = 1u << PT_IRQ;
     ICCPMR = 0xF0;
