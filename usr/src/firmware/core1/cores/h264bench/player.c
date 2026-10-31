@@ -161,6 +161,7 @@ static struct seg { uint64_t abs; uint32_t len; double t0; int media; } seg[NSEG
 static int seg_n, seg_first;
 static uint64_t wr_abs, dma_abs;
 static uint32_t dma_last;
+static uint64_t t_pass, idle_ticks;      /* see the main loop */
 static double clock_hold;               /* the clock while only silence plays */
 static int audio_on, volume = 256, media_started;
 
@@ -736,11 +737,17 @@ int player_run(void)
     put(ZZAV_W_STATE, ZZAV_PLAYING);
     put(ZZAV_W_CMD, ZZAV_CMD_NONE);
 
+    t_pass = now_ticks();
+    idle_ticks = 0;
     for (;;) {
         uint64_t t = now_ticks();
         double clk;
         int paused;
 
+        /* the loop only polls: a short pass found nothing to do */
+        if (t - t_pass < pl_tick_hz / 10000)
+            idle_ticks += t - t_pass;
+        t_pass = t;
         if (get(ZZAV_W_CMD) == ZZAV_CMD_CLOSE)
             break;
         paused = get(ZZAV_W_PAUSE) != 0;
@@ -867,6 +874,8 @@ int player_run(void)
         }
         if (t - t_report > pl_tick_hz / 10) {
             t_report = t;
+            pl_load(idle_ticks, get(ZZAV_W_SHOWN));
+            idle_ticks = 0;
             put(ZZAV_W_ASAMPLES, asamples);
             put(ZZAV_W_CLOCKSRC, audio_on ? 1 : 2);
             put(ZZAV_W_CLOCK_MS, clk >= 0 ? (uint32_t)(clk * 1000) : 0);

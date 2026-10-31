@@ -150,6 +150,14 @@ static void load_window(uint64_t now)
     win_idle = 0;
 }
 
+/* from the player, which is never in the waiting loop */
+void pl_load(uint64_t idle, uint32_t frames)
+{
+    win_idle += idle;
+    put(W_PROGRESS, frames);
+    load_window(ticks());
+}
+
 static void progress(uint32_t frames)
 {
     put(W_PROGRESS, frames);
@@ -319,12 +327,13 @@ int main(void)
         int ret;
 
         if (__builtin_bswap32(((volatile uint32_t *)(RTG_BASE + ZZAV_OFF))[ZZAV_W_CMD]) == ZZAV_CMD_OPEN) {
-            uint64_t t0 = ticks();
-
             put(W_STATE, HB_RUNNING);
+            put(W_PROGRESS, 0);
+            win_start = ticks();
+            win_idle = 0;
             player_run();
             put(W_STATE, HB_IDLE);
-            win_start = t0;     /* the player's time counts as busy */
+            win_start = ticks();
             win_idle = 0;
             continue;
         }
