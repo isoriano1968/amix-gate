@@ -63,6 +63,8 @@ static void overlay(uint32_t pitch, uint32_t row0, uint32_t maxw, uint32_t maxh,
  * the buffer not shown, upright (GL's rows are bottom first), 0x00RRGGBB,
  * 0 made 0x010101 (0 is transparent there), then core 0 flips at vblank.
  */
+static uint64_t load_start, load_wait, idle_last;       /* see load_report() */
+
 extern uint64_t sp_fast_prof[16];
 
 /* the last frame's profile into the block (zzglstat shows it) */
@@ -114,8 +116,13 @@ static void present(const void *rgba, int w, int h)
     if (w <= 0 || h <= 0 || w > 2048 || (uint32_t)w * 4 > ovl.pitch)
         return;
     /* the last flip not taken yet: wait for it (at most 50 ms) */
-    while (ovl.dbuf && c1ld[C1LD_W_FLIP] != 0 && armgl_now_us() - t0 < 50000)
-        ;
+    {
+        const uint64_t w0 = pl_ticks();
+
+        while (ovl.dbuf && c1ld[C1LD_W_FLIP] != 0 && armgl_now_us() - t0 < 50000)
+            ;
+        load_wait += pl_ticks() - w0;
+    }
     back = !ovl.dbuf || __builtin_bswap32(c1ld[C1LD_W_FRONT]) == 2 ? ZZAV_OVL_OFF : ZZAV_OVL_OFF1;
     dst = pl_board + back + ovl.row0 * ovl.pitch;
     for (y = 0; y < h; y++) {
@@ -217,16 +224,41 @@ static void snd_service(void)
     }
 }
 
+/*
+ * Core 1's load for ztop: the share of time not spent waiting for the 060 or
+ * for the overlay's flip.  In ticks of the global timer, whatever the clock.
+ */
+
+static void load_report(uint64_t t)
+{
+    volatile uint32_t *c = (volatile uint32_t *)(pl_board + HB_CTL_OFF);
+    const uint64_t all = t - load_start;
+
+    if (all < pl_tick_hz / 2)
+        return;
+    c[W_LOAD] = __builtin_bswap32((uint32_t)(1000 - (load_wait > all ? all : load_wait) * 1000 / all));
+    c[W_PROGRESS] = blk[ZB_FRAMES];
+    load_start = t;
+    load_wait = 0;
+}
+
 static void tick(void)
 {
     publish_audio();
     snd_service();
+    load_report(pl_ticks());
 }
 
 static void idle(void)
 {
     static unsigned n;
+    const uint64_t t = pl_ticks();
 
+    /* a call right after the last one: all the time between was waiting */
+    if (t - idle_last < pl_tick_hz / 1000)
+        load_wait += t - idle_last;
+    idle_last = t;
+    load_report(t);
     snd_service();
     if (++n % 64 == 0)
         publish_audio();
