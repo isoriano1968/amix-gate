@@ -1,0 +1,40 @@
+#!/bin/sh
+#
+# S99zz9000 - late SysV init hook for the AMIX ZZ9000 RTG console.
+#
+# Install as /etc/rc2.d/S99zz9000, or into the equivalent AMIX run-level
+# directory used after filesystems and the normal console are initialized.
+
+PATH=/sbin:/usr/sbin:/usr/bin:/usr/amiga/bin
+export PATH
+
+DEV=/dev/zz9000
+TEST=/usr/amiga/bin/zz9k_test
+
+case "$1" in
+''|start)
+	if [ ! -r "$DEV" ]; then
+		echo "ZZ9000 device node $DEV not found"
+		exit 1
+	fi
+
+	if [ -x "$TEST" ]; then
+		echo "Starting ZZ9000 RTG console redirect"
+		"$TEST" "$DEV" redirect >/dev/console 2>&1
+	fi
+	;;
+
+stop)
+	if [ -x "$TEST" ]; then
+		echo "Stopping ZZ9000 RTG console redirect"
+		"$TEST" "$DEV" noconsole >/dev/console 2>&1
+	fi
+	;;
+
+*)
+	echo "usage: $0 {start|stop}"
+	exit 2
+	;;
+esac
+
+exit 0

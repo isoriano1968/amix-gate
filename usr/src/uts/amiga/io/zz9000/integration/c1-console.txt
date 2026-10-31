@@ -1,0 +1,16 @@
+Optional AMIX file: /usr/sys/amiga/console/c1.c
+
+This hook is needed only for the late framebuffer-console redirect. It is not
+needed by X11.
+
+In c1write(), after obtaining the screen pointer and before native rendering,
+add:
+
+    extern struct screen *displayedscreen;
+    extern int zz9000consolewrite();
+
+    if (sp == displayedscreen && zz9000consolewrite(p, n))
+	return;
+
+The displayedscreen test is required. Without it, output from every AMIX
+virtual terminal is sent to the same framebuffer console.

@@ -1,0 +1,18 @@
+AMIX file: /usr/sys/amiga/driver/Makefile
+
+Add zz9000/exp to OBJ:
+
+OBJ = ... \
+	  hydra/exp \
+	  zz9000/exp
+
+Add the build rule:
+
+zz9000/exp :
+	cd zz9000; $(MAKE)
+
+Add to the clean target:
+
+	cd zz9000; $(MAKE) clean
+
+Keep literal tab characters at the start of make recipe lines.

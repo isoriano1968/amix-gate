@@ -1,0 +1,6 @@
+* text=auto
+*.c text eol=lf
+*.h text eol=lf
+Makefile text eol=lf
+*.sh text eol=lf
+S99zz9000 text eol=lf
