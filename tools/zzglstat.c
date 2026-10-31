@@ -87,6 +87,38 @@ int main(int argc, char **argv)
         printf("zzglstat: %lux%lu into %s\n", w, h, argv[2]);
         return 0;
     }
+    if (argc > 1 && !strcmp(argv[1], "-ring")) {
+        /* the commands not yet taken: what core 1 is at, for a hang */
+        const unsigned char *r = (const unsigned char *)mmap(0, ZZGL_RING_SIZE, PROT_READ, MAP_SHARED, fd,
+                                                             (off_t)(ZZGL_RING_OFF - FB_PHYS));
+        unsigned long rd = b[ZB_RD], wr = b[ZB_WR], k;
+
+        if (r == (void *)-1) {
+            perror("zzglstat -ring");
+            return 1;
+        }
+        printf("rd %lu wr %lu; command %lu\n", rd, wr, b[ZB_MARK]);
+        printf("sample %lu: pc %08lx lr %08lx sp %08lx stack", b[ZB_SAMPLE], b[ZB_SAMPLE + 1], b[ZB_SAMPLE + 2],
+               b[ZB_SAMPLE + 3]);
+        for (k = ZB_SAMPLE + 4; k < ZB_REPLY && b[k]; k++)
+            printf(" %08lx", b[k]);
+        printf("\n");
+        for (i = 0; i < 40 && rd != wr; i++) {
+            const unsigned long *w = (const unsigned long *)(r + rd);
+
+            if (w[0] == ZZ_WRAP) {
+                printf("%8lu wrap\n", rd);
+                rd = 0;
+                continue;
+            }
+            printf("%8lu op %lu n %lu:", rd, w[0], w[1]);
+            for (k = 0; k < (i ? 8 : 512) && k * 4 < w[1]; k++)
+                printf(" %08lx", w[2 + k]);
+            printf("\n");
+            rd = (rd + ((8 + w[1] + 7) & ~7UL)) % ZZGL_RING_SIZE;
+        }
+        return 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "-snd")) {
         /* the sound: positions, and how much of the stream and of the HDMI
            ring is not silence */
@@ -131,6 +163,7 @@ int main(int argc, char **argv)
                b[ZB_PROF + 6], b[ZB_PROF + 7], b[ZB_PROF + 4], b[ZB_PROF + 5], b[ZB_PROF_EVT]);
         printf("  pixels: affine NEON %lu, perspective NEON %lu, scalar %lu; perspective setups %lu: %lu k cycles\n",
                b[ZB_PROF_PATH], b[ZB_PROF_PATH + 1], b[ZB_PROF_PATH2], b[ZB_PROF_SEG + 1], b[ZB_PROF_SEG]);
+        printf("  routes: %lu pixels two a turn, %lu of them direct\n", b[ZB_PROF_ROUTE], b[ZB_PROF_ROUTE + 1]);
         f0 = b[ZB_FRAMES];
     }
     return 0;

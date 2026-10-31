@@ -53,6 +53,9 @@ enum {
    ZB_PROF_PATH2 = 31,  /*   ... and on the scalar path */
    ZB_OVL = 24,         /* core 1: the overlay's pitch, row0, width, height (zzglstat -grab) */
    ZB_PROF_SEG = 40,    /* core 1: perspective segment setups: k cycles, count */
+   ZB_MARK = 48,        /* core 1: the command being done */
+   ZB_PROF_ROUTE = 42,  /* core 1: pixels two a turn, of those in TK_DIRECT */
+   ZB_SAMPLE = 49,      /* core 1, per tick: count, pc, lr, sp, then code addresses on the stack (to 63) */
    ZB_SND_ON = 32,      /* 060: 1 or 2 = the stream's rate divides 48 kHz by this; 0 off */
    ZB_SND_WR,           /* 060: stream bytes written up to (its time) */
    ZB_SND_POS,          /* core 1: HDMI bytes played since ZB_SND_ON (48 kHz frames * 4) */

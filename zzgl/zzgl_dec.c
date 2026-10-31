@@ -453,6 +453,7 @@ zzgl_dec_run(const struct zzgl_dec_env *env, int once)
       if (n)
          E->copy_in(buf, E->ring + rd + 8, n);
       rd = (rd + ((8 + n + 7) & ~7u)) % ZZGL_RING_SIZE;
+      blk_put(ZB_MARK, op);
       if (command(op, n)) {
          blk_put(ZB_RD, rd);
          return 1;

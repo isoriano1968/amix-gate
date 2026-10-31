@@ -31,10 +31,45 @@ static const struct zzgl_dec_env env = {
 };
 static struct zzgl_dec_env denv;
 
+/* ZZGL_REC=file: what the decoder is about to take, as ring position, length
+   and bytes, for tests/zzgl_replay.c on the ARM */
+static void
+rec_segment(FILE *f, uint32_t pos, uint32_t len)
+{
+   fwrite(&pos, 4, 1, f);
+   fwrite(&len, 4, 1, f);
+   fwrite(ring + pos, 1, len, f);
+}
+
+static void
+dec_run(void)
+{
+   static FILE *rec;
+   static int tried;
+
+   if (!tried) {
+      tried = 1;
+      if (getenv("ZZGL_REC"))
+         rec = fopen(getenv("ZZGL_REC"), "wb");
+   }
+   if (rec) {
+      const uint32_t rd = __builtin_bswap32(blk[ZB_RD]), wr = __builtin_bswap32(blk[ZB_WR]);
+
+      if (wr >= rd) {
+         rec_segment(rec, rd, wr - rd);
+      } else {
+         rec_segment(rec, rd, ZZGL_RING_SIZE - rd);
+         rec_segment(rec, 0, wr);
+      }
+      fflush(rec);
+   }
+   zzgl_dec_run(&denv, 1);
+}
+
 static void
 wait_dec(void)
 {
-   zzgl_dec_run(&denv, 1);
+   dec_run();
 }
 
 static struct zzgl_transport tr;
@@ -76,6 +111,8 @@ present(const void *rgba, int w, int h)
                fwrite(s + ((size_t)y * w + x) * 4, 1, 3, f);
          fclose(f);
       }
+      if (getenv("ZZGL_STOP") && frames >= atoi(getenv("ZZGL_STOP")))
+         exit(0);
       if (getenv("ZZGL_FRAMES") && frames % 50 == 0)
          fprintf(stderr, "zzgl_host: %d frames\n", frames);
    }
@@ -117,7 +154,7 @@ zzgl_platform_frame(void)
 {
    static int reported;
 
-   zzgl_dec_run(&denv, 1);
+   dec_run();
    if (blk[ZB_ERROR] && !reported) {
       reported = 1;
       fprintf(stderr, "zzgl_host: a command core 1 did not know: %08x\n", __builtin_bswap32(blk[ZB_ERROR]));

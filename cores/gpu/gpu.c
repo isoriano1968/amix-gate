@@ -82,6 +82,9 @@ static void publish_prof(void)
     blk[ZB_PROF_PATH] = __builtin_bswap32((uint32_t)sp_fast_prof[9]);
     blk[ZB_PROF_PATH + 1] = __builtin_bswap32((uint32_t)sp_fast_prof[10]);
     blk[ZB_PROF_PATH2] = __builtin_bswap32((uint32_t)sp_fast_prof[11]);
+    blk[ZB_PROF_ROUTE] = __builtin_bswap32((uint32_t)sp_fast_prof[8]);
+    blk[ZB_PROF_ROUTE + 1] = __builtin_bswap32((uint32_t)sp_fast_prof[15]);
+    sp_fast_prof[15] = 0;
     blk[ZB_PROF_SEG] = __builtin_bswap32((uint32_t)(sp_fast_prof[12] / 1000));    /* k cycles */
     blk[ZB_PROF_SEG + 1] = __builtin_bswap32((uint32_t)sp_fast_prof[13]);
     sp_fast_prof[8] = sp_fast_prof[9] = sp_fast_prof[10] = sp_fast_prof[11] = 0;
@@ -227,6 +230,104 @@ static void idle(void)
         publish_audio();
 }
 
+/*
+ * Where core 1 is: a private timer interrupt once a second writes the
+ * interrupted pc, lr, sp and the code addresses on the stack into the block.
+ * Nothing else can see a core that spins without faulting.  Own vectors:
+ * only the IRQ differs, and it saves no FP state, so samp_tick() uses none.
+ */
+#define PRIV(off)       (*(volatile uint32_t *)(0xF8F00000UL + (off)))
+#define ICCICR          PRIV(0x100)
+#define ICCPMR          PRIV(0x104)
+#define ICCIAR          PRIV(0x10C)
+#define ICCEOIR         PRIV(0x110)
+#define PT_LOAD         PRIV(0x600)
+#define PT_CTRL         PRIV(0x608)
+#define PT_ISR          PRIV(0x60C)
+#define ICDISER0        PRIV(0x1100)
+#define ICDICER0        PRIV(0x1180)
+#define ICDIPR_29       (*(volatile uint8_t *)0xF8F0141DUL)
+#define PT_IRQ          29
+#define PT_PRESCALE     255             /* 433 MHz / 256 */
+#define PT_TICKS        1693000u        /* a second */
+
+extern char __rodata_start[], _stack[];
+extern void _vector_table(void);
+extern void samp_vectors(void);
+
+__asm__(".text\n"
+        ".arm\n"
+        ".balign 32\n"
+        ".global samp_vectors\n"
+        "samp_vectors:\n"
+        "  b _vector_table+0\n"
+        "  b _vector_table+4\n"
+        "  b _vector_table+8\n"
+        "  b _vector_table+12\n"
+        "  b _vector_table+16\n"
+        "  b _vector_table+20\n"
+        "  b samp_irq\n"
+        "  b _vector_table+28\n"
+        "samp_irq:\n"
+        "  sub lr, lr, #4\n"
+        "  push {r0-r3, r12, lr}\n"
+        "  mov r0, lr\n"
+        "  mrs r3, cpsr\n"
+        "  cps #0x1f\n"                /* the program's lr and sp */
+        "  mov r1, lr\n"
+        "  mov r2, sp\n"
+        "  msr cpsr_c, r3\n"
+        "  bl samp_tick\n"
+        "  pop {r0-r3, r12, lr}\n"
+        "  movs pc, lr\n");
+
+__attribute__((used, target("general-regs-only"))) void samp_tick(uint32_t pc, uint32_t lr, uint32_t sp)
+{
+    const uint32_t id = ICCIAR;
+
+    if ((id & 0x3ff) == PT_IRQ) {
+        const uint32_t *w = (const uint32_t *)(sp & ~3u);
+        const uint32_t *top = (const uint32_t *)_stack;
+        int k = ZB_SAMPLE + 4, i;
+
+        PT_ISR = 1;
+        blk[ZB_SAMPLE + 1] = __builtin_bswap32(pc);
+        blk[ZB_SAMPLE + 2] = __builtin_bswap32(lr);
+        blk[ZB_SAMPLE + 3] = __builtin_bswap32(sp);
+        for (i = 0; i < 4096 && w < top && k < ZB_REPLY; i++, w++)
+            if (*w >= (uint32_t)_vector_table && *w < (uint32_t)__rodata_start)
+                blk[k++] = __builtin_bswap32(*w);
+        while (k < ZB_REPLY)
+            blk[k++] = 0;
+        blk[ZB_SAMPLE] = __builtin_bswap32(__builtin_bswap32(blk[ZB_SAMPLE]) + 1);
+    }
+    if ((id & 0x3ff) < 1020)
+        ICCEOIR = id;
+}
+
+static void samp_start(void)
+{
+    __asm__ volatile("mcr p15, 0, %0, c12, c0, 0\n isb" : : "r"((uint32_t)samp_vectors));
+    PT_CTRL = 0;
+    PT_ISR = 1;
+    PT_LOAD = PT_TICKS;
+    ICDIPR_29 = 0xA0;
+    ICDISER0 = 1u << PT_IRQ;
+    ICCPMR = 0xF0;
+    ICCICR = 1;
+    PT_CTRL = PT_PRESCALE << 8 | 1 << 2 | 1 << 1 | 1;   /* interrupt, reload, on */
+    __asm__ volatile("cpsie i");
+}
+
+static void samp_stop(void)
+{
+    __asm__ volatile("cpsid i");
+    PT_CTRL = 0;
+    PT_ISR = 1;
+    ICDICER0 = 1u << PT_IRQ;
+    __asm__ volatile("mcr p15, 0, %0, c12, c0, 0\n isb" : : "r"((uint32_t)_vector_table));
+}
+
 int hb_decode(const uint8_t *data, size_t size, int flags, hb_clock clock,
               void (*progress)(uint32_t frames), struct hb_result *r)
 {
@@ -260,7 +361,9 @@ int hb_decode(const uint8_t *data, size_t size, int flags, hb_clock clock,
     __asm__ volatile("mcr p15, 0, %0, c9, c13, 1" : : "r"(0x03u));         /* PMXEVTYPER */
     __asm__ volatile("mcr p15, 0, %0, c9, c12, 1" : : "r"((1u << 31) | 1u));
     zzgl_dec_init(&env);
+    samp_start();
     ret = zzgl_dec_run(&env, 0);
+    samp_stop();
     r->frames = __builtin_bswap32(blk[ZB_FRAMES]);
     r->errcode = ret < 0 ? -31 : 0;
     zzgl_dec_shutdown();

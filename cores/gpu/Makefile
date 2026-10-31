@@ -15,7 +15,7 @@ CFLAGS  := $(CPU) -O2 -Wall -ffunction-sections -fdata-sections -fno-short-enums
            -I$(BSP)/include -I$(HB) -I$(V)/ffmpeg-4.4.8 -I$(V)/build-arm \
            -I$(G)/zzgl -I$(G)/src/mesa-18.3.6/include
 LDFLAGS := $(CPU) -T $(HB)/lscript.ld -specs=$(HB)/Xilinx.spec \
-           -Wl,--gc-sections,-build-id=none,-Map=build/gpu.map,--no-enum-size-warning -L$(BSP)/lib
+           -Wl,--gc-sections,-build-id=none,-Map=build/gpu.map,--no-enum-size-warning,--defsym=_HEAP_SIZE=0x06800000 -L$(BSP)/lib
 LIBS    := $(G)/build/arm/libOSMesa.a \
            -Wl,--start-group,-lxil,-lstdc++,-lgcc,-lm,-lc,--end-group
 

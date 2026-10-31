@@ -638,10 +638,10 @@ index 6363701..3ae99a6 100644
     for (i = 0; i < sp->num_vertex_buffers; i++) {
 diff --git a/src/gallium/drivers/softpipe/sp_fast.c b/src/gallium/drivers/softpipe/sp_fast.c
 new file mode 100644
-index 0000000..2698ef1
+index 0000000..61373d5
 --- /dev/null
 +++ b/src/gallium/drivers/softpipe/sp_fast.c
-@@ -0,0 +1,2253 @@
+@@ -0,0 +1,2443 @@
 +/*
 + * sp_fast.c -- see sp_fast.h.
 + *
@@ -680,6 +680,7 @@ index 0000000..2698ef1
 +static inline unsigned to8(float v);
 +static inline uint32_t pack(unsigned r, unsigned g, unsigned b, unsigned a);
 +enum { BLEND_NONE, BLEND_MODULATE, BLEND_ALPHA, BLEND_ADD, BLEND_GENERIC };
++enum { FOG_NONE, FOG_EXP, FOG_LINEAR };
 +
 +
 +#include <stdio.h>
@@ -779,14 +780,77 @@ index 0000000..2698ef1
 +   return s->in >= 0 && s->in < FAST_CONST;
 +}
 +
++/* word of a constant the instruction reads, or -1 */
++static int
++const_word(const struct tgsi_full_src_register *src)
++{
++   if (src->Register.File != TGSI_FILE_CONSTANT || src->Register.Indirect || src->Register.Index >= 32 ||
++       (src->Register.Dimension && (src->Dimension.Indirect || src->Dimension.Index != 0)))
++      return -1;
++   return src->Register.Index * 4 + tgsi_util_get_full_src_register_swizzle(src, 0);
++}
++
++/*
++ * The end of a fixed-function shader with fog, as Mesa writes it:
++ *    MOV  out.w, alpha
++ *    MUL  t.x, fogcoord, scale; EX2 t.x, -t.x         (GL_EXP)
++ *    or MAD t.x, fogcoord, scale, offset              (GL_LINEAR)
++ *    MOV_SAT t.x, t.x; ADD u.x, 1, -t.x; MUL u.xyz, fogcolor, u.x
++ *    MAD  out.xyz, colour, t.x, u.xyz; MOV OUT[0], out; END
++ * Sets fog_kind and the rest; returns the index of the first MOV (the
++ * program before it is the colour), and the final MAD in *mad.
++ */
++static int
++find_fog(struct sp_fast *f, const struct sp_fragment_shader_variant *v,
++         const struct tgsi_full_instruction *in, int n, int *mad)
++{
++   static const unsigned exp_ops[] = { TGSI_OPCODE_MUL, TGSI_OPCODE_EX2, TGSI_OPCODE_MOV, TGSI_OPCODE_ADD,
++                                       TGSI_OPCODE_MUL, TGSI_OPCODE_MAD, TGSI_OPCODE_MOV, TGSI_OPCODE_END };
++   static const unsigned lin_ops[] = { TGSI_OPCODE_MAD, TGSI_OPCODE_MOV, TGSI_OPCODE_ADD,
++                                       TGSI_OPCODE_MUL, TGSI_OPCODE_MAD, TGSI_OPCODE_MOV, TGSI_OPCODE_END };
++   int i, k;
++
++   for (i = 1; i < n; i++) {
++      const struct tgsi_full_src_register *s = &in[i].Src[0];
++      const boolean lin = in[i].Instruction.Opcode == TGSI_OPCODE_MAD;
++      const unsigned *ops = lin ? lin_ops : exp_ops;
++      const int nops = lin ? 7 : 8;
++
++      if ((!lin && in[i].Instruction.Opcode != TGSI_OPCODE_MUL) || s->Register.File != TGSI_FILE_INPUT ||
++          s->Register.Index >= (int)v->info.num_inputs ||
++          v->info.input_semantic_name[s->Register.Index] != TGSI_SEMANTIC_FOG)
++         continue;
++      if (i + nops != n || in[i - 1].Instruction.Opcode != TGSI_OPCODE_MOV ||
++          in[i - 1].Dst[0].Register.WriteMask != TGSI_WRITEMASK_W)
++         return -1;
++      for (k = 0; k < nops; k++)
++         if (in[i + k].Instruction.Opcode != ops[k])
++            return -1;
++      f->fog_in = s->Register.Index;
++      f->fog_ka = const_word(&in[i].Src[1]);
++      f->fog_kb = lin ? const_word(&in[i].Src[2]) : 0;
++      f->fog_kc = const_word(&in[i + nops - 4].Src[0]);
++      if (f->fog_ka < 0 || f->fog_kb < 0 || f->fog_kc < 0 || (f->fog_kc & 3) ||
++          in[i + nops - 3].Src[0].Register.File != TGSI_FILE_TEMPORARY)
++         return -1;
++      f->fog_kind = lin ? FOG_LINEAR : FOG_EXP;
++      *mad = i + nops - 3;
++      return i - 1;
++   }
++   return -1;
++}
++
++#define FAST_INSNS 32
++
 +static boolean
 +analyse_fs(struct sp_fast *f, const struct sp_fragment_shader_variant *v)
 +{
 +   struct sym temp[FAST_TEMPS][4], outv[4];
 +   struct tgsi_parse_context parse;
++   struct tgsi_full_instruction insns[FAST_INSNS];
 +   boolean ok = TRUE;
 +   unsigned c;
-+   int u;
++   int u, n = 0, k, fog_at = -1, fog_mad = 0;
 +
 +   if (v->info.num_outputs != 1 ||
 +       v->info.output_semantic_name[0] != TGSI_SEMANTIC_COLOR ||
@@ -797,22 +861,49 @@ index 0000000..2698ef1
 +   memset(temp, 0, sizeof(temp));
 +   memset(outv, 0, sizeof(outv));
 +   f->col_in = -1;
++   f->fog_kind = FOG_NONE;
 +   for (u = 0; u < SP_FAST_UNITS; u++) {
 +      f->u[u].in = -1;
 +      f->u[u].txp = FALSE;
 +   }
 +
 +   tgsi_parse_init(&parse, v->tokens);
-+   while (ok && !tgsi_parse_end_of_tokens(&parse)) {
-+      const struct tgsi_full_instruction *inst;
-+      struct sym res[4];
-+
++   while (!tgsi_parse_end_of_tokens(&parse)) {
 +      tgsi_parse_token(&parse);
 +      if (parse.FullToken.Token.Type != TGSI_TOKEN_TYPE_INSTRUCTION)
 +         continue;
-+      inst = &parse.FullToken.FullInstruction;
++      if (n == FAST_INSNS) {
++         tgsi_parse_free(&parse);
++         return FALSE;
++      }
++      insns[n++] = parse.FullToken.FullInstruction;
++   }
++   tgsi_parse_free(&parse);
++   fog_at = find_fog(f, v, insns, n, &fog_mad);
++
++   for (k = 0; ok && k < n; k++) {
++      const struct tgsi_full_instruction *inst = &insns[k];
++      struct sym res[4];
++
 +      if (inst->Instruction.Opcode == TGSI_OPCODE_END)
 +         break;
++      if (k == fog_at) {
++         /* the colour before the fog */
++         const int t = insns[fog_mad].Src[0].Register.Index;
++
++         if (t >= FAST_TEMPS || !src_value(&inst->Src[0], temp, 3, &outv[3])) {
++            ok = FALSE;
++            break;
++         }
++         for (c = 0; c < 3; c++) {
++            if (!temp[t][c].def) {
++               ok = FALSE;
++               break;
++            }
++            outv[c] = temp[t][c];
++         }
++         break;
++      }
 +      if (inst->Instruction.NumDstRegs != 1 || inst->Dst[0].Register.Indirect ||
 +          inst->Dst[0].Register.Dimension) {
 +         ok = FALSE;
@@ -902,7 +993,6 @@ index 0000000..2698ef1
 +            ok = FALSE;
 +      }
 +   }
-+   tgsi_parse_free(&parse);
 +   if (!ok)
 +      return FALSE;
 +
@@ -1174,6 +1264,17 @@ index 0000000..2698ef1
 +   }
 +   if (f->col_interp == SP_INTERP_POS)
 +      return why(4);
++   if (f->fog_kind) {
++      const float *cb = (const float *)sp->mapped_constants[PIPE_SHADER_FRAGMENT][0];
++      const int top = MAX3(f->fog_ka, f->fog_kb, f->fog_kc + 2);
++
++      if (!cb || (top + 1) * 4 > (int)sp->const_buffer_size[PIPE_SHADER_FRAGMENT][0])
++         return why(14);
++      f->fog_slot = sinfo->attrib[f->fog_in].src_index;
++      f->fog_scale = cb[f->fog_ka];
++      f->fog_off = f->fog_kind == FOG_LINEAR ? cb[f->fog_kb] : 0.0f;
++      f->fog_rgba = pack(to8(cb[f->fog_kc]), to8(cb[f->fog_kc + 1]), to8(cb[f->fog_kc + 2]), 0);
++   }
 +   for (unit = 0; unit < SP_FAST_UNITS; unit++) {
 +      struct sp_fast_unit *u = &f->u[unit];
 +
@@ -1285,8 +1386,8 @@ index 0000000..2698ef1
 +              (!f->zformat || (zfrac_bits(f->zformat) >= 0 && !f->zclamp)) &&
 +              !debug_get_bool_option("SOFTPIPE_FAST_FLOAT", FALSE);
 +
-+   if (f->u[1].in >= 0 && !f->fixed)
-+      return why(13);             /* fast_span() has one unit */
++   if ((f->u[1].in >= 0 || f->fog_kind) && !f->fixed)
++      return why(13);             /* fast_span() has one unit and no fog */
 +   if (f->fixed)
 +      choose_span(f);
 +
@@ -1597,6 +1698,47 @@ index 0000000..2698ef1
 +   return pack(o[0], o[1], o[2], o[3]);
 +}
 +
++/* the fog factor of a vertex, 0..1 */
++static inline float
++fog_factor(const struct sp_fast *f, const float (*v)[4])
++{
++   const float c = v[f->fog_slot][0] * f->fog_scale;
++   const float r = f->fog_kind == FOG_EXP ? util_fast_exp2(-c) : c + f->fog_off;
++
++   return CLAMP(r, 0.0f, 1.0f);
++}
++
++static inline int32_t
++fog_fix(float v)
++{
++   const float m = 65536.0f * 255.0f;
++   const float r = v * m;
++
++   return (int32_t)CLAMP(r, -m, m);
++}
++
++/* the factor is exact at the corners and linear between them, as fog per
++   vertex is: a shader's exponential per pixel costs a thousand cycles */
++static void
++fog_plane(struct sp_fast *f, const float (*v0)[4], const float (*v1)[4], const float (*v2)[4])
++{
++   const float f0 = fog_factor(f, v0), f1 = fog_factor(f, v1) - f0, f2 = fog_factor(f, v2) - f0;
++   const float ax = v1[0][0] - v0[0][0], ay = v1[0][1] - v0[0][1];
++   const float bx = v2[0][0] - v0[0][0], by = v2[0][1] - v0[0][1];
++   const float det = ax * by - bx * ay;
++   float dx = 0.0f, dy = 0.0f;
++
++   if (det != 0.0f) {
++      const float r = 1.0f / det;
++
++      dx = (f1 * by - f2 * ay) * r;
++      dy = (f2 * ax - f1 * bx) * r;
++   }
++   f->FDX = fog_fix(dx);
++   f->FDY = fog_fix(dy);
++   f->FO = fog_fix(f0 + dx * ((float)(int)v0[0][0] - v0[0][0]) + dy * ((float)(int)v0[0][1] - v0[0][1]));
++}
++
 +void
 +sp_fast_tri(struct sp_fast *f, const float (*provoke)[4],
 +            const float (*v0)[4], const float (*v1)[4], const float (*v2)[4])
@@ -1604,6 +1746,8 @@ index 0000000..2698ef1
 +   unsigned c8[4] = { 255, 255, 255, 255 };
 +   int c;
 +
++   if (f->fog_kind)
++      fog_plane(f, v0, v1, v2);
 +   f->tri_const = TRUE;
 +   if (f->col_in < 0) {
 +      f->tri_col = 0xffffffffu;
@@ -2056,12 +2200,33 @@ index 0000000..2698ef1
 +#endif
 +
 +#ifdef __ARM_NEON
++/* the fog factor of an 8.16 plane value */
++static inline unsigned
++fog8(int32_t v)
++{
++   const int i = v >> 16;
++
++   return i < 0 ? 0 : i > 255 ? 255 : (unsigned)i;
++}
++
++/* two pixels to the fog colour by factors a and b; alpha stays (fogc has
++   alpha 0, the weight is 255) */
++static inline __attribute__((always_inline)) uint8x8_t
++n_fog(uint8x8_t s, int32_t a, int32_t b, uint8x8_t fogc)
++{
++   const uint32_t wa = fog8(a) * 0x010101u | 0xff000000u, wb = fog8(b) * 0x010101u | 0xff000000u;
++   const uint8x8_t w = vreinterpret_u8_u32(vset_lane_u32(wb, vdup_n_u32(wa), 1));
++
++   return n_div255(vmlal_u8(vmull_u8(s, w), fogc, vmvn_u8(w)));
++}
++
 +/* the state pair_run() carries along a span segment */
 +struct pstate {
 +   ubyte *cp, *zp;
 +   uint32_t zacc;
 +   int32_t u0, v0, u1, v1;
 +   int x;
++   int32_t fogv;
 +};
 +
 +/*
@@ -2080,7 +2245,10 @@ index 0000000..2698ef1
 +   const uint32_t tri_col = f->tri_col;
 +   const int zwrite = f->zwrite, afunc = f->afunc, cpack = f->cpack, cbpp = f->cbpp;
 +   const float areff = f->areff;
-+   const uint8x8_t tcol = n_word(tri_col);
++   const uint8x8_t tcol = n_word(tri_col), fogc = n_word(f->fog_rgba);
++   const int fog = f->fog_kind;
++   const int32_t fogd = f->FDX;
++   int32_t fogv = ps->fogv;
 +   int32x4_t cva = vld1q_s32(c);
 +   const int32x4_t dcv = vld1q_s32(dc), dcv2 = vshlq_n_s32(dcv, 1);
 +   ubyte *cp = ps->cp, *zp = ps->zp;
@@ -2089,7 +2257,8 @@ index 0000000..2698ef1
 +   int x = ps->x;
 +
 +      for (; x + 1 < end; x += 2, cp += 2 * cbpp, zp += 2 * zb, zacc += 2 * (uint32_t)dz,
-+           u0 += 2 * du0, v0 += 2 * dv0, u1 += 2 * du1, v1 += 2 * dv1, cva = vaddq_s32(cva, dcv2)) {
++           u0 += 2 * du0, v0 += 2 * dv0, u1 += 2 * du1, v1 += 2 * dv1, cva = vaddq_s32(cva, dcv2),
++           fogv += 2 * fogd) {
 +         unsigned za = 0, zbv = 0;
 +         int la = 1, lb = 1;
 +         uint8x8_t sa, sb;
@@ -2147,6 +2316,8 @@ index 0000000..2698ef1
 +            /* both pixels in one register: a in the low half, b in the high */
 +            uint8x8_t s2 = vreinterpret_u8_u32(vzip_u32(vreinterpret_u32_u8(sa),
 +                                                        vreinterpret_u32_u8(sb)).val[0]);
++            if (fog)
++               s2 = n_fog(s2, fogv, fogv + fogd, fogc);
 +            if (BK != BLEND_NONE) {
 +               uint8x8_t d2 = vreinterpret_u8_u32(vld1_u32((const uint32_t *)cp));
 +
@@ -2183,6 +2354,7 @@ index 0000000..2698ef1
 +   ps->u1 = u1;
 +   ps->v1 = v1;
 +   ps->x = x;
++   ps->fogv = fogv;
 +}
 +#endif
 +
@@ -2273,6 +2445,8 @@ index 0000000..2698ef1
 +   /* both units divide by the same Q (texture q 1.0 on both, as GL1 games
 +      send them): one division for the two */
 +   const boolean share = NT >= 2 && f->share_q;
++   const int32_t fogd = f->fog_kind ? f->FDX : 0;
++   int32_t fogv = f->fog_kind ? f->FO + f->FDX * (x0 - f->ox) + f->FDY * (y - f->oy) : 0;
 +
 +   if (zp) {
 +      const int fb = zfrac_bits(f->zformat);
@@ -2359,7 +2533,9 @@ index 0000000..2698ef1
 +#ifdef __ARM_NEON
 +      /* two pixels a turn (pair_run()) */
 +      if (NEON && !zfloat && x + 1 < end && f->pairs) {
-+         struct pstate ps = { cp, zp, zacc, u0, v0, u1, v1, x };
++         struct pstate ps = { cp, zp, zacc, u0, v0, u1, v1, x, fogv };
++
++         SPF_PROF_ADD(8, (end - x) & ~1);       /* pixels two a turn */
 +         const int cm = cc ? CM_INTERP : tri_col == 0xffffffffu ? CM_WHITE : CM_CONST;
 +#define PAIRS(K0, K1, CM) pair_run(f, &ps, end, dz, zsh, du0, dv0, du1, dv1, c, dc, &L0, &L1, \
 +                                   z16, zlow, zb, ZK, NT, BK, K0, K1, CM)
@@ -2376,8 +2552,10 @@ index 0000000..2698ef1
 +            const int k0 = tex_kind(&L0, u0, v0, du0, dv0, n);
 +            const int k1 = NT >= 2 ? tex_kind(&L1, u1, v1, du1, dv1, n) : TK_DIRECT;
 +
-+            if (k0 == TK_DIRECT && k1 == TK_DIRECT)
++            if (k0 == TK_DIRECT && k1 == TK_DIRECT) {
++               SPF_PROF_ADD(15, n & ~1);
 +               PAIRS_CM(TK_DIRECT, TK_DIRECT);
++            }
 +            else if (NT >= 2 && k0 == TK_DIRECT)
 +               PAIRS_CM(TK_DIRECT, TK_ANY);
 +            else if (NT >= 2 && k1 == TK_DIRECT)
@@ -2397,10 +2575,12 @@ index 0000000..2698ef1
 +         u1 = ps.u1;
 +         v1 = ps.v1;
 +         x = ps.x;
++         fogv = ps.fogv;
 +      }
 +#endif
 +      for (; x < end; x++, cp += cbpp, zp += zb, zacc += (uint32_t)dz, u0 += du0, v0 += dv0,
-+           u1 += du1, v1 += dv1, c[0] += dc[0], c[1] += dc[1], c[2] += dc[2], c[3] += dc[3]) {
++           u1 += du1, v1 += dv1, c[0] += dc[0], c[1] += dc[1], c[2] += dc[2], c[3] += dc[3],
++           fogv += fogd) {
 +         unsigned z = 0;
 +         uint32_t src, tv0 = 0xffffffffu, tv1 = 0xffffffffu, cv = f->tri_col;
 +
@@ -2453,6 +2633,8 @@ index 0000000..2698ef1
 +               else
 +                  *(uint *)zp = (*(uint *)zp & 0xffu) | (z << 8);
 +            }
++            if (f->fog_kind)
++               s8 = n_fog(s8, fogv, fogv, n_word(f->fog_rgba));
 +            if (BK != BLEND_NONE) {
 +               d8 = vreinterpret_u8_u32(vld1_dup_u32((const uint32_t *)cp));
 +               if (cpack == CPACK_BGRA)
@@ -2499,6 +2681,14 @@ index 0000000..2698ef1
 +               *(uint *)zp = (*(uint *)zp & 0xff000000u) | z;
 +            else
 +               *(uint *)zp = (*(uint *)zp & 0xffu) | (z << 8);
++         }
++
++         if (f->fog_kind) {
++            const unsigned w = fog8(fogv), iw = 255 - w;
++
++            src = pack(mul255(R(src), w) + mul255(R(f->fog_rgba), iw),
++                       mul255(G(src), w) + mul255(G(f->fog_rgba), iw),
++                       mul255(B(src), w) + mul255(B(f->fog_rgba), iw), A(src));
 +         }
 +
 +         switch (BK) {
@@ -2897,10 +3087,10 @@ index 0000000..2698ef1
 +}
 diff --git a/src/gallium/drivers/softpipe/sp_fast.h b/src/gallium/drivers/softpipe/sp_fast.h
 new file mode 100644
-index 0000000..ba324f0
+index 0000000..1a200ea
 --- /dev/null
 +++ b/src/gallium/drivers/softpipe/sp_fast.h
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,192 @@
 +/*
 + * sp_fast.h -- a fixed-function fast path for softpipe's triangles.
 + *
@@ -3013,11 +3203,18 @@ index 0000000..ba324f0
 +   int col_chan[4];              /* output channel <- input channel, -1 = 1.0 */
 +   struct sp_fast_unit u[SP_FAST_UNITS];   /* texture units 0 and 1 */
 +   boolean mixed;                /* not plain texel (* colour) per channel */
++   int fog_kind;                 /* FOG_x: the shader ends in fixed-function fog */
++   int fog_in;                   /* the fog coordinate's input */
++   int fog_ka, fog_kb;           /* constants: scale, offset (word in the buffer) */
++   int fog_kc;                   /* constant with the fog colour */
 +
 +   /* per draw */
 +   int col_interp;               /* SP_INTERP_x */
 +   boolean col_const;            /* the colour is a constant of the shader (glColor) */
 +   uint32_t const_col;           /* then this, for the draw */
++   int fog_slot;                 /* vertex slot of fog_in */
++   float fog_scale, fog_off;
++   uint32_t fog_rgba;            /* the fog colour, alpha 0 */
 +
 +   ubyte *cbuf;
 +   unsigned cstride;
@@ -3061,6 +3258,7 @@ index 0000000..ba324f0
 +   int32_t CO[4], CDX[4], CDY[4];   /* colour planes, 8.16 (0..255) */
 +   uint32_t ZO;                  /* Z plane in span_tmpl()'s fixed point */
 +   int32_t ZDX, ZDY;
++   int32_t FO, FDX, FDY;         /* fog factor plane, 8.16 (0..255), from (ox, oy) */
 +   boolean zplane;               /* the Z plane fits (else Z per pixel in float) */
 +};
 +
