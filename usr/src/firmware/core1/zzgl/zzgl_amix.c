@@ -328,7 +328,15 @@ void zzgl_sound_write(unsigned long at, const short *frames, unsigned long n)
 
 void zzgl_sound_close(void)
 {
+   unsigned char *ring;
+
    if (zblk)
       zblk[ZB_SND_ON] = 0;
+   if (snd_div && (ring = (unsigned char *)map(ZZGL_HDMI_OFF, ZZGL_HDMI_SIZE)) != NULL) {
+      /* the DMA loops the ring for ever: silence, not the last notes */
+      usleep(20000);                    /* core 1 lets go of it */
+      memset(ring, 0, ZZGL_HDMI_SIZE);
+      munmap((caddr_t)ring, (size_t)ZZGL_HDMI_SIZE);
+   }
    snd_div = 0;
 }
