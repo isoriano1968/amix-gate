@@ -1,0 +1,170 @@
+RT-08 (MG10 part 3): the card blitter on by default, in bounded bands
+(build-tree patch, applied after rt07c-zeroline-bias.patch; built as s13rt04).
+
+MG10 on metal: a blitter operation stalls the 68060 for its whole length
+(~20 ms for a full screen) and lost 42-44 % of serial input at 9600 and
+38400.  The driver runs a ZZ9KIOC_BLITS batch record by record at base
+priority, so interrupts are taken between records; the server now splits
+every operation into bands of at most -blitmax pixels (whole rows, a
+downward copy's bands bottom-up) and needs no kernel change.
+
+  -blitmin  default 1024 (was 0 = never): MG10 kept the 100x100 gains at
+            1024 and 4096 and lost them at 16384
+  -blitmax  new, default 8192: ~0.16 ms at the measured ~50,000 px/ms, under
+            one character time at 38400 (0.26 ms); 0 = no split
+
+A refusal can now come in the middle of a banded operation (a full queue
+flushes); the flush draws everything queued on the CPU and the operation's
+remaining rows are drawn on the CPU there, never the whole operation again.
+Host test: x11/bench/band-test.sh (6930 cases incl. refusals at each flush).
+No startx-rtg flags are needed; -blitmin 0 turns the blitter off.
+
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000.h
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000.h
+@@ -47,6 +47,7 @@
+ };
+ 
+ extern int zz9000BlitMin;       /* -blitmin: pixels; 0 = never */
++extern int zz9000BlitMax;       /* -blitmax: pixels per blitter op; 0 = no split */
+ 
+ struct _ZZ9000ModeRec {
+     char *name;
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
+@@ -240,8 +240,18 @@
+ ** -blitmin N: window fills (SolidRect GXcopy, PaintWindow) and window-to-
+ ** window copies (CopyArea GXcopy, CopyWindow) of N pixels or more go to the
+ ** card's own blitter through the driver's ZZ9KIOC_BLITS; anything smaller,
+-** any other raster op and every pixmap stay on the CPU.  0, the default,
+-** never blits, so without the option the server draws exactly as before.
++** any other raster op and every pixmap stay on the CPU.  -blitmin 0 never
++** blits.  The default, 1024, is MG10's: it keeps the 100x100 gains (rect100
++** 585 -> 8140/s, scroll100 311 -> 2260) that 16384 gives up.
++**
++** -blitmax N: every record covers at most N pixels (whole rows; a downward
++** copy's bands run bottom-up).  The CPU sits in the stalled register write
++** for the whole of one card operation and takes no interrupt: MG10 measured
++** ~20 ms for a full-screen op and lost 42-44 % of serial input at 9600 and
++** 38400.  The driver runs a batch record by record at base priority, so
++** interrupts are taken between bands.  The default, 8192, is ~0.16 ms at
++** the measured ~50,000 px/ms -- under one character time at 38400 (0.26 ms;
++** Paula has a one-byte receive buffer).  0 does not split.
+ **
+ ** Records are queued and sent in batches.  The queue keeps drawing order:
+ ** it is flushed before any CPU drawing in these paths and before each entry
+@@ -252,7 +262,8 @@
+ ** before running any of it, and records made from clip boxes always lie on
+ ** the screen, so nothing is drawn twice.
+ */
+-int zz9000BlitMin = 0;
++int zz9000BlitMin = 1024;
++int zz9000BlitMax = 8192;
+ 
+ #define BLITQ   64
+ 
+@@ -305,17 +316,15 @@
+     }
+ }
+ 
+-/* Queue one blitter record when the area qualifies; FALSE = draw it yourself. */
++/* Append one record (already sized) to the queue; FALSE = refused. */
+ static int
+-blitQueue(pRTG, op, x, y, w, h, sx, sy, color)
++blitRecord(pRTG, op, x, y, w, h, sx, sy, color)
+ rtgScreenPtr   pRTG;
+ int            op, x, y, w, h, sx, sy;
+ unsigned short color;
+ {
+     struct zz9k_blit *b;
+ 
+-    if (zz9000BlitMin <= 0 || (long) w * h < zz9000BlitMin)
+-        return FALSE;
+     if (blitN == BLITQ)
+         blitFlush();
+     if (zz9000BlitMin <= 0)         /* that flush was refused */
+@@ -334,6 +343,58 @@
+     return TRUE;
+ }
+ 
++/*
++** Queue one blitter operation when the area qualifies, in bands of at most
++** -blitmax pixels; FALSE = draw it yourself.  A refusal comes from a flush
++** (the first one of the server, which a full queue can trigger in the middle
++** of a banded operation); that flush has already drawn every queued record,
++** earlier bands included, on the CPU, so the rows not yet queued are drawn
++** here on the CPU too -- redrawing the whole operation would move an
++** overlapping copy twice.
++*/
++static int
++blitQueue(pRTG, op, x, y, w, h, sx, sy, color)
++rtgScreenPtr   pRTG;
++int            op, x, y, w, h, sx, sy;
++unsigned short color;
++{
++    int band, top, n;
++
++    if (zz9000BlitMin <= 0 || (long) w * h < zz9000BlitMin)
++        return FALSE;
++    band = h;
++    if (zz9000BlitMax > 0 && (long) w * h > zz9000BlitMax) {
++        band = zz9000BlitMax / w;
++        if (band < 1)
++            band = 1;
++    }
++    if (op == ZZ9K_BLIT_COPY && y > sy) {       /* moving down: bottom band first */
++        for (top = h; top > 0; top -= n) {
++            n = top < band ? top : band;
++            if (!blitRecord(pRTG, op, x, y + top - n, w, n, sx, sy + top - n, color)) {
++                if (top == h)
++                    return FALSE;
++                cpuCopy(pRTG, sx, sy, w, top, x, y);   /* rows [0, top) */
++                return TRUE;
++            }
++        }
++        return TRUE;
++    }
++    for (top = 0; top < h; top += n) {
++        n = h - top < band ? h - top : band;
++        if (!blitRecord(pRTG, op, x, y + top, w, n, sx, sy + top, color)) {
++            if (top == 0)
++                return FALSE;
++            if (op == ZZ9K_BLIT_FILL)                   /* rows [top, h) */
++                cpuFill(pRTG, x, y + top, x + w - 1, y + h - 1, color);
++            else
++                cpuCopy(pRTG, sx, sy + top, w, h - top, x, y + top);
++            return TRUE;
++        }
++    }
++    return TRUE;
++}
++
+ /* Fill the inclusive screen box (x1,y1)-(x2,y2): the blitter or the CPU. */
+ static void
+ blitFill(pRTG, x1, y1, x2, y2, color)
+--- a/programs/Xserver/hw/amix/amixIo.c
++++ b/programs/Xserver/hw/amix/amixIo.c
+@@ -415,6 +415,14 @@
+ 	    zz9000BlitMin = 0;
+ 	return 2;
+     }
++    if (!strcmp(argv[i], "-blitmax")) {	/* largest area per blitter op */
++	extern int zz9000BlitMax;
++	if (++i >= argc) UseMsg ();
++	zz9000BlitMax = atoi(argv[i]);
++	if (zz9000BlitMax < 0)
++	    zz9000BlitMax = 0;
++	return 2;
++    }
+     if (!strcmp(argv[i], "-mode")) {	/* RTG mode: WxH (e.g. 1024x768) */
+ 	if (++i >= argc) UseMsg ();
+ 	if (!ZZ9000SetMode(argv[i])) {
+@@ -530,7 +538,8 @@
+     ErrorF("-height int            screen height in pixels.\n");
+     ErrorF("-depth int             screen depth in planes.\n");
+     ErrorF("-mode WxH              RTG video mode (e.g. 800x600, 1024x768)\n");
+-    ErrorF("-blitmin int           RTG: card blitter for fills/copies of this many pixels or more (0 = never, the default)\n");
++    ErrorF("-blitmin int           RTG: card blitter for fills/copies of this many pixels or more (default 1024, 0 = never)\n");
++    ErrorF("-blitmax int           RTG: split blitter ops into bands of at most this many pixels (default 8192, 0 = never)\n");
+     ErrorF("-group int		   screen group\n");
+ #ifdef TIGA
+     ErrorF("-res<#>                Use /dev/dmi<#> as display.\n");

@@ -1,0 +1,159 @@
+diff --git a/programs/Xserver/hw/amix/rtg/zz9000/zz9000.h b/programs/Xserver/hw/amix/rtg/zz9000/zz9000.h
+index b530bbc..83ff5e5 100644
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000.h
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000.h
+@@ -191,6 +191,7 @@ void    ZZ9000PolyText8();
+ void    ZZ9000ImageText8();
+ void    ZZ9000PutImage();
+ void    ZZ9000PushPixels();
++void    ZZ9000Soft3DInit();
+ 
+ Bool    ZZ9000CreateWindow();
+ Bool    ZZ9000DestroyWindow();
+diff --git a/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c b/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
+index 044f33d..1b6be12 100644
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
+@@ -1487,3 +1487,131 @@ int         dstx, dsty;
+         REGION_DESTROY(pScreen, prgnSrcClip);
+     return prgnExposed;
+ }
++
++/* ---------------------------------------------------------------------- */
++/* ZZ9K-SOFT3D: a 3D client's swap, through the window's clip list         */
++
++/*
++** A client that renders off-screen on the board (TinyGL on the Z3660's
++** soft3D, tinygl-amix/src/zsoft3d.c) has its frame in VRAM rows below the
++** visible screen.  Its swap asks the server to copy that rectangle into a
++** window: only the visible parts of the window are written, one blitter
++** copy per box of its clip list, with the software cursor taken down first
++** (miSprite's SourceValidate; its BlockHandler puts it back), so menus,
++** overlapping windows and the cursor survive.  The copies go through the
++** driver's ZZ9KIOC_BLITX, which accepts off-screen rows (ZZ9KIOC_BLITS
++** checks against the visible screen only); the extension is not offered
++** by a kernel without it.
++**
++** Request (no reply), the client's copy is in zsoft3d.c:
++**   CARD8 major, CARD8 minor (0 = Swap), CARD16 length (5),
++**   CARD32 window, INT16 srcX, srcY (VRAM, screen stride), INT16 x, y
++**   (window-relative), CARD16 width, height
++*/
++#include "dixstruct.h"
++#include "extnsionst.h"
++
++#define ZZ9KIOC_BLITX       (ZZ9K_IOC | 18)
++struct zz9k_blitx {
++    unsigned short op, sx, sy, dx, dy, width, height, pad;
++    unsigned long  color;
++};
++
++typedef struct {
++    CARD8  reqType;
++    CARD8  s3dReqType;
++    CARD16 length B16;
++    CARD32 window B32;
++    INT16  srcX B16, srcY B16;
++    INT16  x B16, y B16;
++    CARD16 width B16, height B16;
++} xZZ9KSwapReq;
++#define sz_xZZ9KSwapReq 20
++
++static int s3dFd = -1;
++
++static int
++s3dBlitx(sx, sy, dx, dy, w, h)
++int sx, sy, dx, dy, w, h;
++{
++    struct zz9k_blitx b;
++
++    b.op = 1;
++    b.sx = sx; b.sy = sy; b.dx = dx; b.dy = dy;
++    b.width = w; b.height = h; b.pad = 0; b.color = 0;
++    return ioctl(s3dFd, ZZ9KIOC_BLITX, &b);
++}
++
++static int
++ProcZZ9KSoft3D(client)
++ClientPtr client;
++{
++    REQUEST(xZZ9KSwapReq);
++    WindowPtr pWin;
++    ScreenPtr pScreen;
++    RegionRec rgn;
++    BoxRec    box;
++    BoxPtr    pb;
++    int       n, dx, dy;
++
++    if (stuff->s3dReqType != 0)
++        return BadRequest;
++    REQUEST_SIZE_MATCH(xZZ9KSwapReq);
++    pWin = LookupWindow(stuff->window, client);
++    if (!pWin) {
++        client->errorValue = stuff->window;
++        return BadWindow;
++    }
++    if (!pWin->viewable || stuff->width == 0 || stuff->height == 0 ||
++        stuff->srcX < 0 || stuff->srcY < 0)
++        return client->noClientException;
++    pScreen = pWin->drawable.pScreen;
++    box.x1 = pWin->drawable.x + stuff->x;
++    box.y1 = pWin->drawable.y + stuff->y;
++    box.x2 = box.x1 + stuff->width;
++    box.y2 = box.y1 + stuff->height;
++    REGION_INIT(pScreen, &rgn, &box, 1);
++    REGION_INTERSECT(pScreen, &rgn, &rgn, &pWin->clipList);
++    n = REGION_NUM_RECTS(&rgn);
++    if (n > 0) {
++        if (pScreen->SourceValidate)
++            (*pScreen->SourceValidate)((DrawablePtr) pWin, stuff->x, stuff->y,
++                                       stuff->width, stuff->height);
++        BLIT_FLUSH();
++        dx = stuff->srcX - box.x1;
++        dy = stuff->srcY - box.y1;
++        for (pb = REGION_RECTS(&rgn); n > 0; n--, pb++)
++            s3dBlitx(pb->x1 + dx, pb->y1 + dy, pb->x1, pb->y1,
++                     pb->x2 - pb->x1, pb->y2 - pb->y1);
++    }
++    REGION_UNINIT(pScreen, &rgn);
++    return client->noClientException;
++}
++
++static int
++SProcZZ9KSoft3D(client)
++ClientPtr client;
++{
++    return BadImplementation;       /* AMIX clients are all big-endian */
++}
++
++static void
++ZZ9KSoft3DReset(ext)
++ExtensionEntry *ext;
++{
++}
++
++/* From ZZ9000ScreenInit: offer the request if the driver can copy for it. */
++void
++ZZ9000Soft3DInit(pRTG)
++rtgScreenPtr pRTG;
++{
++    s3dFd = GetZZ9000Screen(pRTG)->fd;
++    if (s3dBlitx(0, 0, 0, 0, 1, 1) < 0) {       /* one pixel onto itself */
++        ErrorF("zz9000: no ZZ9KIOC_BLITX in this kernel; no ZZ9K-SOFT3D\n");
++        return;
++    }
++    if (!AddExtension("ZZ9K-SOFT3D", 0, 0, ProcZZ9KSoft3D, SProcZZ9KSoft3D,
++                      ZZ9KSoft3DReset, StandardMinorOpcode))
++        ErrorF("zz9000: AddExtension ZZ9K-SOFT3D failed\n");
++}
+diff --git a/programs/Xserver/hw/amix/rtg/zz9000/zz9000screen.c b/programs/Xserver/hw/amix/rtg/zz9000/zz9000screen.c
+index 38397d2..949f722 100644
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000screen.c
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000screen.c
+@@ -732,5 +732,6 @@ DepthRec    *pDepth;
+ 
+     /* Block/Wakeup and cursor are installed by rtgInit.c after this returns */
+ 
++    ZZ9000Soft3DInit(pRTG);         /* zz9000draw.c: 3D clients' swaps */
+     return TRUE;
+ }

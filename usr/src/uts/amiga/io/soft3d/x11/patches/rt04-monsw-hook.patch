@@ -1,0 +1,179 @@
+RT-04 (P-8): the RTG monitor switch from the X server's device-independent
+rtg/ layer (build-tree patch against isoriano1968/x11r6.3-amix cb61a21,
+applied after zz9000hw-modes.patch and p5-1 .. p5-6).
+
+At screen init, once the card's InitHW has set the mode, the layer asks the
+card's own device to switch the monitor to the RTG output, and when the
+server ends it asks for the Amiga video again: Klaus Burckert's Xsvga-class
+SVGAIOCSetMonitorSwitch (numbering as in Antti's va2000.h).  The card driver
+decides how (zz9000 -> the kernel's monsw).
+
+  rtg.h        int devFd in rtgScreenRec (the card's fd, -1 = none); the
+               SVGAIOC numbers; rtgAbort()
+  rtgInit.c    devFd = -1 at allocation; after the card's InitHW, dup() the
+               card's fd once per process and send SVGA; in rtgCloseScreen,
+               only when dispatchException has DE_TERMINATE (dix/main.c calls
+               CloseScreen before testing it), send Amiga and close the dup;
+               rtgAbort() sends Amiga
+  zz9000hw.c   pRTG->devFd = fd once the device is open
+  amixIo.c     AbortDDX (FatalError, GiveUp) calls rtgAbort()
+
+The dup() is what keeps a server reset from flipping the monitor: the card
+code closes its fd at every reset, and on zz9000 the driver's LAST close
+switches to native (monsw_lastclose); with the layer's copy open a reset's
+close is not the last one.  A crash or kill -9 closes everything, and the
+last close puts the monitor back on the Amiga video with nothing here
+having to run.  A kernel or card without the ioctl answers an error, which
+is ignored.
+
+--- a/programs/Xserver/hw/amix/rtg/rtg.h
++++ b/programs/Xserver/hw/amix/rtg/rtg.h
+@@ -32,8 +32,29 @@
+     int               (*CloseScreen)(); /* chained CloseScreen                */
+ 
+     unsigned char      *cardPrivate;    /* card-specific private data         */
++    int                 devFd;          /* the card's device fd, -1 = none;   */
++                                        /* set by the card's InitHW (RT-04)   */
+ };
+ 
++/*
++** The RTG monitor switch (P-8 / RT-04): the device-independent layer asks
++** the card's own device to put the monitor on the RTG output at screen init
++** and back on the Amiga video when the server ends, with the ioctl of the
++** Xsvga-class RTG contract (Klaus Burckert; the numbering of Antti's
++** va2000.h).  The card driver decides how: a line switch through the
++** kernel's monsw, a passthrough register, ...  A kernel or card without it
++** answers with an error, which is ignored.
++*/
++#ifndef SVGAIOCSetMonitorSwitch
++#define SVGAIOC                 (0xe300)
++#define SVGAIOCGetMonitorSwitch (SVGAIOC|0x06)
++#define SVGAIOCSetMonitorSwitch (SVGAIOC|0x08)  /* note: 0x08 not 0x07 */
++#define SVGAMONITORSWITCH_Amiga 1
++#define SVGAMONITORSWITCH_SVGA  2
++#endif
++
++extern void rtgAbort();
++
+ typedef struct _rtgScreenRec rtgScreenRec;
+ typedef struct _rtgScreenRec *rtgScreenPtr;
+ 
+--- a/programs/Xserver/hw/amix/rtg/rtgInit.c
++++ b/programs/Xserver/hw/amix/rtg/rtgInit.c
+@@ -30,6 +30,7 @@
+ #include "mipointer.h"
+ #include "mi.h"
+ #include "rtg.h"
++#include "opaque.h"		/* dispatchException, DE_TERMINATE */
+ #include "zz9000/zz9000.h"
+ 
+ extern int  XmonitorResolution;
+@@ -102,6 +103,49 @@
+     return FALSE;
+ }
+ 
++/*
++** RTG monitor switch (RT-04, P-8).
++**
++** rtgSwitchFd is a dup() of the card's device fd, taken at the first screen
++** init and kept for the whole process.  Two reasons: the card code closes its
++** own fd at every server reset (rtgCloseScreen -> *CloseHW), and on a card
++** whose driver switches back to native on its LAST close (zz9000 -> monsw)
++** that close would flip the monitor at every reset; with this copy open, a
++** reset's close is not the last one.  And when the process dies -- a crash,
++** kill -9 -- every descriptor closes and the driver's last close puts the
++** monitor back on the Amiga video, with nothing here having to run.
++**
++** Terminate is told apart from reset by DE_TERMINATE: dix/main.c calls each
++** screen's CloseScreen before it tests dispatchException for it.
++*/
++static int rtgSwitchFd = -1;
++
++static void
++rtgMonitorSwitch(sw)
++int sw;
++{
++    int v = sw;
++
++    if (rtgSwitchFd >= 0)
++        (void) ioctl(rtgSwitchFd, SVGAIOCSetMonitorSwitch, &v);
++}
++
++static void
++rtgMonitorOn(pRTG)
++rtgScreenPtr pRTG;
++{
++    if (rtgSwitchFd < 0 && pRTG->devFd >= 0)
++        rtgSwitchFd = dup(pRTG->devFd);
++    rtgMonitorSwitch(SVGAMONITORSWITCH_SVGA);
++}
++
++/* Fatal error or GiveUp (AbortDDX, amixIo.c): back to the Amiga video. */
++void
++rtgAbort()
++{
++    rtgMonitorSwitch(SVGAMONITORSWITCH_Amiga);
++}
++
+ static Bool
+ rtgCloseScreen(index, pScreen)
+ int       index;
+@@ -115,6 +159,14 @@
+     ret = (*pScreen->CloseScreen)(index, pScreen);
+     (*pScreen->SaveScreen)(pScreen, SCREEN_SAVER_OFF);
+ 
++    /* The server is ending, not resetting: monitor back to the Amiga video. */
++    if ((dispatchException & DE_TERMINATE) && rtgSwitchFd >= 0)
++    {
++        rtgMonitorSwitch(SVGAMONITORSWITCH_Amiga);
++        (void) close(rtgSwitchFd);
++        rtgSwitchFd = -1;
++    }
++
+     if (amixFbs[i].mapped && amixFbs[i].fd >= 0)
+     {
+         if (CloseScreen(amixFbs[i].fd))
+@@ -229,6 +281,7 @@
+         return FALSE;
+     }
+     memset((char *) pRTG, 0, sizeof(rtgScreenRec));
++    pRTG->devFd = -1;
+ 
+     pScreen->devPrivates[rtgScreenIndex].ptr = (pointer) pRTG;
+ 
+@@ -269,6 +322,9 @@
+         return FALSE;
+     }
+ 
++    /* The mode is set: the monitor to the RTG output (RT-04). */
++    rtgMonitorOn(pRTG);
++
+     ErrorF("rtgScreenInit: hw init done, calling ZZ9000ScreenInit\n");
+ 
+     /*
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000hw.c
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000hw.c
+@@ -131,6 +131,7 @@
+         ErrorF("ZZ9000InitHW: SETSWITCH RTG failed (%s)\n", strerror(errno));
+ 
+     pZZ->fd       = fd;
++    pRTG->devFd   = fd;             /* for the rtg/ layer's monitor switch */
+     pZZ->mapBase  = (pointer)base;
+     pZZ->mapSize  = info.board_size;
+     pZZ->fbOffset = fbi.fb_offset;
+--- a/programs/Xserver/hw/amix/amixIo.c
++++ b/programs/Xserver/hw/amix/amixIo.c
+@@ -322,6 +322,13 @@
+ 	(*pScreen->SaveScreen) (pScreen, SCREEN_SAVER_OFF);
+ 	amixDisableCursor (pScreen);
+     }
++#ifdef RTG
++    {
++	extern void rtgAbort();
++
++	rtgAbort ();	/* the monitor back to the Amiga video (RT-04) */
++    }
++#endif
+ }
+ 
+ /* Called by GiveUp(). */

@@ -1,0 +1,195 @@
+diff --git a/programs/Xserver/hw/amix/amixIo.c b/programs/Xserver/hw/amix/amixIo.c
+index ce00113..7b24ecc 100644
+--- a/programs/Xserver/hw/amix/amixIo.c
++++ b/programs/Xserver/hw/amix/amixIo.c
+@@ -415,6 +415,11 @@ ddxProcessArgument (argc, argv, i)
+ 	    zz9000BlitMin = 0;
+ 	return 2;
+     }
++    if (!strcmp(argv[i], "-nomove16")) {	/* no 68040/060 line bursts */
++	extern int zz9000Move16;
++	zz9000Move16 = 0;
++	return 1;
++    }
+     if (!strcmp(argv[i], "-blitmax")) {	/* largest area per blitter op */
+ 	extern int zz9000BlitMax;
+ 	if (++i >= argc) UseMsg ();
+@@ -540,6 +545,7 @@ ddxUseMsg()
+     ErrorF("-mode WxH              RTG video mode (e.g. 800x600, 1024x768)\n");
+     ErrorF("-blitmin int           RTG: card blitter for fills/copies of this many pixels or more (default 1024, 0 = never)\n");
+     ErrorF("-blitmax int           RTG: split blitter ops into bands of at most this many pixels (default 8192, 0 = never)\n");
++    ErrorF("-nomove16              RTG: no move16 line bursts in PutImage (68040/060 only)\n");
+     ErrorF("-group int		   screen group\n");
+ #ifdef TIGA
+     ErrorF("-res<#>                Use /dev/dmi<#> as display.\n");
+diff --git a/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c b/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
+index a6c002c..044f33d 100644
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
+@@ -791,6 +791,136 @@ int         fSorted;
+     }
+ }
+ 
++/* ---------------------------------------------------------------------- */
++/* ZZ9000PutImage                                                          */
++
++/*
++** -nomove16 turns the move16 line burst off.  Measured on the A3000 with
++** the Z3660's 68060 (bench/vrambw.c, 2026-10-25): single long writes reach
++** about 10.6 MB/s into VRAM and into RAM alike (the data cache writes
++** through), move16 26 MB/s into VRAM.  move16 wants source and destination
++** on 16-byte boundaries, so it only applies when both rows have the same
++** phase; staging a misaligned row first costs as much as the plain copy.
++*/
++int zz9000Move16 = 1;
++
++/*
++** burstRun - copyRun for a host-memory source: the 16-byte-aligned middle
++** moved by move16 when src and dst share their phase in a line, misaligned
++** long reads when they differ by two bytes.  move16 (a0)+,(a1)+ is spelled
++** as words: the AMIX assembler knows no 68040 mnemonics.
++*/
++static void
++burstRun(dst, src, w)
++unsigned short *dst;
++unsigned short *src;
++int             w;
++{
++    register unsigned short *s asm("a0");
++    register unsigned short *d asm("a1");
++    int head, k;
++
++    if (w >= RUN_SHORT && RUN_ODD(dst) != RUN_ODD(src))
++    {
++        /*
++        ** Ends two bytes apart (an odd window x): copyRun would move one
++        ** pixel per store, 59 ms for 512x320 where longs take 34.  The
++        ** source of a PutImage is host memory, never the card, so its longs
++        ** may be read misaligned (the 060 splits them, mostly from the
++        ** cache); every store to the drawable stays an aligned long.
++        */
++        unsigned long *ld;
++        int n;
++
++        if (RUN_ODD(dst))
++        {
++            *dst++ = *src++;
++            w--;
++        }
++        ld = (unsigned long *) dst;
++        for (n = w >> 1; n > 0; n--, src += 2)
++            *ld++ = *(unsigned long *) src;
++        if (w & 1)
++            *(unsigned short *) ld = *src;
++        return;
++    }
++    if (!zz9000Move16 || w < 16 ||
++        (((unsigned long) dst ^ (unsigned long) src) & 15) != 0)
++    {
++        copyRun(dst, src, w);
++        return;
++    }
++    head = ((16 - ((unsigned long) dst & 15)) & 15) >> 1;
++    if (head)
++        copyRun(dst, src, head);
++    s = src + head;
++    d = dst + head;
++    w -= head;
++    for (k = w >> 3; k > 0; k--)
++        __asm__ volatile (".word 0xf620,0x9000"     /* move16 (a0)+,(a1)+ */
++                          : "=a" (s), "=a" (d) : "0" (s), "1" (d) : "memory");
++    if (w & 7)
++        copyRun(d, s, w & 7);
++}
++
++/*
++** ZZ9000PutImage - a 16-bit ZPixmap under GXcopy (every XPutImage of a
++** picture, and MIT-SHM's: Mesa's back buffer), straight from the request
++** or the shared segment into the drawable, one clip-box intersection at a
++** time.  miPutImage built a span list and went through SetSpans, which
++** rescanned the clip list per row: about 12 ms of a 43 ms 512x320 swap.
++** Everything else (bitmaps, XYPixmap, other raster ops, a plane mask)
++** stays with miPutImage.
++*/
++void
++ZZ9000PutImage(pDraw, pGC, depth, x, y, w, h, leftPad, format, pImage)
++DrawablePtr pDraw;
++GCPtr       pGC;
++int         depth, x, y, w, h, leftPad, format;
++char       *pImage;
++{
++    rtgScreenPtr    pRTG;
++    unsigned short *base;
++    int             stride, srcPix, nbox, x1, x2, y1, y2, row;
++    RegionPtr       clip;
++    BoxPtr          pbox;
++    unsigned short *src;
++
++    if (format != ZPixmap || depth != ZZ9000_DEPTH || pGC->alu != GXcopy ||
++        (pGC->planemask & 0xffff) != 0xffff || w <= 0 || h <= 0)
++    {
++        miPutImage(pDraw, pGC, depth, x, y, w, h, leftPad, format, pImage);
++        return;
++    }
++    pRTG   = GetRTGScreen(pDraw->pScreen);
++    base   = drawBase(pDraw, pRTG);
++    stride = drawStride(pDraw);
++    clip   = rtgGCClip(pGC);
++    srcPix = PixmapBytePad(w, depth) / 2;
++    if (pGC->miTranslate)               /* as miPutImage: the clip's frame */
++    {
++        x += pDraw->x;
++        y += pDraw->y;
++    }
++    if (pDraw->type == DRAWABLE_WINDOW)
++        BLIT_FLUSH();                   /* no queued blit may land on top */
++
++    nbox = REGION_NUM_RECTS(clip);
++    pbox = REGION_RECTS(clip);
++    for (; nbox--; pbox++)
++    {
++        x1 = max(x, pbox->x1);
++        x2 = min(x + w, pbox->x2);
++        y1 = max(y, pbox->y1);
++        y2 = min(y + h, pbox->y2);
++        if (x1 >= x2 || y1 >= y2)
++            continue;
++        src = (unsigned short *) pImage + (long)(y1 - y) * srcPix + (x1 - x);
++        for (row = y1; row < y2; row++, src += srcPix)
++            burstRun(base + (long) row * stride + x1, src, x2 - x1);
++    }
++}
++
+ /* ---------------------------------------------------------------------- */
+ /* ZZ9000GetSpans                                                          */
+ 
+diff --git a/programs/Xserver/hw/amix/rtg/zz9000/zz9000screen.c b/programs/Xserver/hw/amix/rtg/zz9000/zz9000screen.c
+index d92473e..38397d2 100644
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000screen.c
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000screen.c
+@@ -62,6 +62,7 @@ static void ZZ9000pixValidateGC();
+ extern void      ZZ9000FillSpans();
+ extern void      ZZ9000PatternSpans();
+ extern void      ZZ9000SetSpans();
++extern void      ZZ9000PutImage();
+ extern RegionPtr ZZ9000CopyArea();
+ extern void      ZZ9000CopyWindow();
+ extern void      ZZ9000PaintWindow();
+@@ -116,7 +117,7 @@ static GCOps ZZ9000gcOps =
+ {
+     ZZ9000FillSpans,    /* FillSpans   */
+     ZZ9000SetSpans,     /* SetSpans    */
+-    miPutImage,         /* PutImage    - mi handles all wire formats    */
++    ZZ9000PutImage,     /* PutImage    - 16-bit ZPixmap direct, else mi */
+     ZZ9000CopyArea,     /* CopyArea    */
+     miCopyPlane,        /* CopyPlane   */
+     miPolyPoint,        /* PolyPoint   */
+@@ -295,7 +296,7 @@ DrawablePtr   pDraw;
+     pGC->ops->FillSpans     = (pGC->fillStyle == FillSolid) ? ZZ9000FillSpans
+                                                             : ZZ9000PatternSpans;
+     pGC->ops->SetSpans      = ZZ9000SetSpans;
+-    pGC->ops->PutImage      = miPutImage;
++    pGC->ops->PutImage      = ZZ9000PutImage;
+     pGC->ops->CopyArea      = ZZ9000CopyArea;
+     pGC->ops->CopyPlane     = miCopyPlane;
+     pGC->ops->PolyPoint     = miPolyPoint;

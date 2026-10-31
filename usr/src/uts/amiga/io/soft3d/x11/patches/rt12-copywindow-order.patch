@@ -1,0 +1,123 @@
+diff --git a/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c b/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
+index 6a20b64..46b2f1f 100644
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
+@@ -889,6 +889,53 @@ int       what;
+     BLIT_FLUSH();
+ }
+ 
++/*
++** copyBoxesOrdered - copy the boxes of a YX-banded region, each from (box + dx,dy),
++** in an order that never overwrites a source pixel before it is read: bands
++** bottom-up when the copy moves down (dy < 0: the source lies above), boxes
++** within a band right-to-left when it moves right (dx < 0) -- as cfb does and
++** as ZZ9000CopyArea walks its bands.  copyVRAMBox orders rows and columns
++** inside one box.  (CopyWindow used to choose the order from the sign of
++** old - new the wrong way round, which smeared a partly covered window's
++** contents into itself on every move.)
++*/
++static void
++copyBoxesOrdered(pRTG, pbox, nbox, dx, dy)
++rtgScreenPtr pRTG;
++BoxPtr       pbox;
++int          nbox, dx, dy;
++{
++    BoxPtr pboxEnd = pbox + nbox, pboxBand, pboxNext, first, last, b;
++    int    bandsUp = (dy < 0), boxesLeft = (dx < 0);
++
++    pboxBand = bandsUp ? pboxEnd : pbox;
++    while (bandsUp ? (pboxBand > pbox) : (pboxBand < pboxEnd))
++    {
++        if (bandsUp)
++        {
++            last  = pboxBand - 1;
++            first = last;
++            while (first > pbox && (first - 1)->y1 == last->y1)
++                first--;
++            pboxNext = first;
++        }
++        else
++        {
++            first = pboxBand;
++            last  = first;
++            while (last + 1 < pboxEnd && (last + 1)->y1 == first->y1)
++                last++;
++            pboxNext = last + 1;
++        }
++        for (b = boxesLeft ? last : first;
++             boxesLeft ? (b >= first) : (b <= last);
++             b += boxesLeft ? -1 : 1)
++            copyVRAMBox(pRTG, b->x1 + dx, b->y1 + dy,
++                        b->x2 - b->x1, b->y2 - b->y1, b->x1, b->y1);
++        pboxBand = pboxNext;
++    }
++}
++
+ /* ---------------------------------------------------------------------- */
+ /* ZZ9000CopyWindow                                                        */
+ 
+@@ -911,9 +958,7 @@ RegionPtr   prgnSrc;
+     rtgScreenPtr  pRTG = GetRTGScreen(pWin->drawable.pScreen);
+     ScreenPtr     pScreen = pWin->drawable.pScreen;
+     RegionPtr     prgnDst;
+-    DDXPointPtr   pptSrc, ppt;
+-    BoxPtr        pbox;
+-    int           nbox, i;
++    int           nbox;
+     int           dx, dy;
+ 
+     dx = ptOldOrg.x - pWin->drawable.x;
+@@ -931,52 +976,9 @@ RegionPtr   prgnSrc;
+         return;
+     }
+ 
+-    pptSrc = (DDXPointPtr) ALLOCATE_LOCAL(nbox * sizeof(DDXPointRec));
+-    if (!pptSrc)
+-    {
+-        (*pScreen->RegionDestroy)(prgnDst);
+-        return;
+-    }
+-
+-    pbox = REGION_RECTS(prgnDst);
+-    ppt  = pptSrc;
+-    for (i = 0; i < nbox; i++, ppt++, pbox++)
+-    {
+-        ppt->x = pbox->x1 + dx;
+-        ppt->y = pbox->y1 + dy;
+-    }
+-
+-    pbox = REGION_RECTS(prgnDst);
+-    ppt  = pptSrc;
+-
+-    if (dy > 0 || (dy == 0 && dx > 0))
+-    {
+-        /* Moving down or right: process boxes in reverse order */
+-        pbox += nbox - 1;
+-        ppt  += nbox - 1;
+-        for (i = 0; i < nbox; i++, pbox--, ppt--)
+-        {
+-            copyVRAMBox(pRTG,
+-                        ppt->x,  ppt->y,
+-                        pbox->x2 - pbox->x1,
+-                        pbox->y2 - pbox->y1,
+-                        pbox->x1, pbox->y1);
+-        }
+-    }
+-    else
+-    {
+-        for (i = 0; i < nbox; i++, pbox++, ppt++)
+-        {
+-            copyVRAMBox(pRTG,
+-                        ppt->x,  ppt->y,
+-                        pbox->x2 - pbox->x1,
+-                        pbox->y2 - pbox->y1,
+-                        pbox->x1, pbox->y1);
+-        }
+-    }
++    copyBoxesOrdered(pRTG, REGION_RECTS(prgnDst), nbox, dx, dy);
+ 
+     BLIT_FLUSH();
+-    DEALLOCATE_LOCAL(pptSrc);
+     (*pScreen->RegionDestroy)(prgnDst);
+ }
+ 

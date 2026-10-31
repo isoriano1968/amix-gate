@@ -1,0 +1,16 @@
+Add the Z3660's demonstration modes to the server's mode table (build-tree
+patch against isoriano1968/x11r6.3-amix cb61a21; proposed upstream as
+Q-isoriano-1 in docs/X-CROSS.md).  The default entry is unchanged; the
+startx-rtg wrapper always passes -mode.
+
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000hw.c
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000hw.c
+@@ -17,6 +17,8 @@ static ZZ9000ModeRec zz9000_modes[] = {
+     { "1280x720", 1280,  720 },
+     { "1280x1024",1280, 1024 },
+     { "1920x800", 1920,  800 },
++    { "1920x1080",1920, 1080 },
++    { "1280x800", 1280,  800 },
+     { (char *)0 }
+ };
+ 

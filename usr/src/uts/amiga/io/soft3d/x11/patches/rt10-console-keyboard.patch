@@ -1,0 +1,62 @@
+RT-10: give the keyboard back to the console when the server ends
+(build-tree patch, applied after rt08-banded-default.patch; built as s14rt04).
+
+rtgOpenInput makes the server's screen the screen manager's active one
+(SIOCACTIVATE, without displaying it).  When that screen closes, the kernel
+(console/screen.c CloseScreen) looks for a successor only in the screen's
+own group -- ours has none -- and then sets activescreen to 0, and a key
+arriving with no active screen is dropped.  After every RTG X session the
+console therefore took no typing (A4000T MG11; rig: s8rt04 and s13rt04
+both).  rtgCloseScreen and rtgAbort now issue SIOCBACK (HideScreen) on the
+screen before it goes away: it acts only while ours is still the active
+screen and selects the first usable other one, the console.  Rig, one
+boot: console typing works after s14rt04 three times and after a lost
+keyboard from s8/s13 (a later s14 session recovers it).  A kill -9 of the
+server still loses it: SIGKILL runs no server code.
+
+--- a/programs/Xserver/hw/amix/rtg/rtgInit.c
++++ b/programs/Xserver/hw/amix/rtg/rtgInit.c
+@@ -140,11 +140,35 @@
+     rtgMonitorSwitch(SVGAMONITORSWITCH_SVGA);
+ }
+ 
++/*
++** Give the keyboard back to the console (RT-10).  rtgOpenInput made our
++** screen the screen manager's active one (SIOCACTIVATE) without displaying
++** it; closing it leaves the kernel with no active screen at all -- its
++** CloseScreen looks for a successor only in our (empty) screen group and
++** then clears activescreen, and a key with no active screen is dropped
++** (console screen.c) -- so after X the console took no typing (A4000T,
++** MG11).  SIOCBACK (HideScreen) acts only while our screen is still the
++** active one and selects the first usable other screen, the console; a
++** user who switched screens meanwhile is left alone.
++*/
++static void
++rtgInputBack(fd)
++int fd;
++{
++    if (fd >= 0 && ioctl(fd, SIOCBACK, 0))
++        ErrorF("rtgInputBack: SIOCBACK failed (%s)\n", strerror(errno));
++}
++
+ /* Fatal error or GiveUp (AbortDDX, amixIo.c): back to the Amiga video. */
+ void
+ rtgAbort()
+ {
++    int i;
++
+     rtgMonitorSwitch(SVGAMONITORSWITCH_Amiga);
++    for (i = 0; i < MAXSCREENS; i++)    /* no CloseScreen on this path */
++        if (amixFbs[i].mapped)
++            rtgInputBack(amixFbs[i].fd);
+ }
+ 
+ static Bool
+@@ -170,6 +194,7 @@
+ 
+     if (amixFbs[i].mapped && amixFbs[i].fd >= 0)
+     {
++        rtgInputBack(amixFbs[i].fd);
+         if (CloseScreen(amixFbs[i].fd))
+             ErrorF("rtgCloseScreen: CloseScreen(%d) failed\n", amixFbs[i].fd);
+         amixFbs[i].fd     = -1;

@@ -1,0 +1,164 @@
+diff --git a/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c b/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
+index 46b2f1f..23b5e3e 100644
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
+@@ -805,13 +805,65 @@ xRectangle *prects;
+ /* ---------------------------------------------------------------------- */
+ /* ZZ9000PaintWindow                                                       */
+ 
++/*
++** tileBoxes - fill the boxes from a 16-bit tile, the tile's origin at
++** (xorg, yorg) as X requires (a window background's origin is the window's).
++** Row by row through the CPU mapping: one copyRun per tile-wide stretch.
++** Queued blits are flushed first so they cannot land on top of these writes.
++*/
++static void
++tileBoxes(pRTG, pbox, nbox, pTile, xorg, yorg)
++rtgScreenPtr pRTG;
++BoxPtr       pbox;
++int          nbox;
++PixmapPtr    pTile;
++int          xorg, yorg;
++{
++    unsigned short *fb = pRTG->fbBase;
++    int             stride = ZZ9000_STRIDE(pRTG);
++    unsigned short *tbase = (unsigned short *) pTile->devPrivate.ptr;
++    int             tstride = (int) pTile->devKind / 2;
++    int             tw = pTile->drawable.width, th = pTile->drawable.height;
++    int             x, y, tx, ty, w, n;
++    unsigned short *dst, *trow;
++
++    BLIT_FLUSH();
++    for (; nbox-- > 0; pbox++)
++    {
++        if (pbox->x1 >= pbox->x2 || pbox->y1 >= pbox->y2)
++            continue;
++        ty = (pbox->y1 - yorg) % th;
++        if (ty < 0)
++            ty += th;
++        for (y = pbox->y1; y < pbox->y2; y++)
++        {
++            trow = tbase + (long) ty * tstride;
++            dst = fb + (unsigned long) y * stride + pbox->x1;
++            tx = (pbox->x1 - xorg) % tw;
++            if (tx < 0)
++                tx += tw;
++            for (w = pbox->x2 - pbox->x1; w > 0; w -= n, dst += n, tx = 0)
++            {
++                n = tw - tx;
++                if (n > w)
++                    n = w;
++                copyRun(dst, trow + tx, n);
++            }
++            if (++ty == th)
++                ty = 0;
++        }
++    }
++}
++
+ /*
+ ** ZZ9000PaintWindow - paint window background (PW_BACKGROUND) or border
+ ** (PW_BORDER).
+ **
+-** Fast path: solid pixel -> direct VRAM fill.
+-** Pixmap backgrounds are not yet tiled; the window is left as-is
+-** (garbage on first expose).  TODO: implement tile/stipple painting.
++** A solid pixel is a VRAM fill; a pixmap background or border is tiled from
++** the window's origin (tileBoxes).  ParentRelative takes the nearest
++** ancestor's background, with that ancestor's origin.  This used to fill
++** pixmap backgrounds with the tile's first pixel, which made every CDE
++** backdrop (a full-screen window with a background tile) a plain colour.
+ */
+ void
+ ZZ9000PaintWindow(pWin, prgn, what)
+@@ -821,39 +873,35 @@ int       what;
+ {
+     rtgScreenPtr    pRTG   = GetRTGScreen(pWin->drawable.pScreen);
+     unsigned short  pixel;
++    PixmapPtr       pTile = NullPixmap;
++    WindowPtr       pOrg = pWin;        /* whose origin the tile starts at */
+     BoxPtr          pbox;
+     int             nbox;
+ 
+     if (what == PW_BACKGROUND)
+     {
+-        switch (pWin->backgroundState)
++        WindowPtr p = pWin;
++
++        while (p && p->backgroundState == ParentRelative)
++            p = p->parent;
++        if (!p)
++            p = pWin;
++        switch (p->backgroundState)
+         {
+         case None:
+-            return;
++            if (p == pWin)
++                return;
++            pixel = (unsigned short) pWin->drawable.pScreen->blackPixel;
++            break;
+         case BackgroundPixel:
+-            pixel = (unsigned short) pWin->background.pixel;
++            pixel = (unsigned short) p->background.pixel;
+             break;
+-        case ParentRelative:
+-            /* Walk up to find the nearest solid background */
+-            {
+-                WindowPtr p = pWin->parent;
+-                while (p && p->backgroundState == ParentRelative)
+-                    p = p->parent;
+-                if (p && p->backgroundState == BackgroundPixel)
+-                    pixel = (unsigned short) p->background.pixel;
+-                else
+-                    pixel = (unsigned short) pWin->drawable.pScreen->blackPixel;
+-            }
++        case BackgroundPixmap:
++            pTile = p->background.pixmap;
++            pOrg = p;
+             break;
+         default:
+-            /* BackgroundPixmap: read first pixel from tile for solid approx. */
+-            {
+-                PixmapPtr   pTile  = pWin->background.pixmap;
+-                unsigned short *tp = (unsigned short *) pTile->devPrivate.ptr;
+-                pixel = (pTile && pTile->drawable.depth == ZZ9000_DEPTH && tp)
+-                        ? *tp
+-                        : (unsigned short) pWin->drawable.pScreen->blackPixel;
+-            }
++            pixel = (unsigned short) pWin->drawable.pScreen->blackPixel;
+             break;
+         }
+     }
+@@ -862,19 +910,24 @@ int       what;
+         if (pWin->borderIsPixel)
+             pixel = (unsigned short) pWin->border.pixel;
+         else
+-        {
+-            /* Pixmap border: read first pixel for solid approx. */
+-            PixmapPtr   pTile  = pWin->border.pixmap;
+-            unsigned short *tp = (unsigned short *) pTile->devPrivate.ptr;
+-            pixel = (pTile && pTile->drawable.depth == ZZ9000_DEPTH && tp)
+-                    ? *tp
+-                    : (unsigned short) pWin->drawable.pScreen->blackPixel;
+-        }
++            pTile = pWin->border.pixmap;
+     }
+ 
+     nbox = REGION_NUM_RECTS(prgn);
+     pbox = REGION_RECTS(prgn);
+ 
++    if (pTile)
++    {
++        if (pTile->drawable.depth == ZZ9000_DEPTH && pTile->devPrivate.ptr &&
++            pTile->drawable.width > 0 && pTile->drawable.height > 0)
++        {
++            tileBoxes(pRTG, pbox, nbox, pTile,
++                      (int) pOrg->drawable.x, (int) pOrg->drawable.y);
++            return;
++        }
++        pixel = (unsigned short) pWin->drawable.pScreen->blackPixel;
++    }
++
+     while (nbox--)
+     {
+         if (pbox->x1 < pbox->x2 && pbox->y1 < pbox->y2)

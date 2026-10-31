@@ -1,0 +1,39 @@
+P-5 fix 1, S5: a window-to-window CopyArea with any raster op but GXcopy
+goes to miCopyArea (build-tree patch against isoriano1968/x11r6.3-amix
+cb61a21, applied after zz9000hw-modes.patch and p5-1 .. p5-3).
+
+The fast path's copyVRAMBox can only copy, so a GXxor (or any other alu)
+window-to-window copy was drawn as GXcopy.  Non-GXcopy now takes
+miCopyArea, whose GetSpans/SetSpans path applies the alu since S4
+(p5-3-setspans-alu.patch).  GXcopy keeps the fast path from S2.
+
+Proof: x11/bench/xorcopy, window-to-window case.
+
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
+@@ -689,8 +689,9 @@
+ ** copied and, with graphics exposures on, returns the region the client
+ ** must redraw (the GraphicsExpose events).
+ **
+-** All other cases (pixmap source or destination) fall back to miCopyArea,
+-** which uses GetSpans/SetSpans (correct but slower).
++** All other cases (pixmap source or destination, or any raster op but
++** GXcopy -- copyVRAMBox can only copy) fall back to miCopyArea, which uses
++** GetSpans/SetSpans (correct but slower; SetSpans applies the alu).
+ */
+ RegionPtr
+ ZZ9000CopyArea(pSrcDraw, pDstDraw, pGC, srcx, srcy, width, height, dstx, dsty)
+@@ -713,10 +714,11 @@
+     int             dx, dy;
+     int             bandsUp, boxesLeft;
+ 
+-    /* Only the window-to-window same-screen path gets the fast VRAM blit */
++    /* Only a GXcopy window-to-window same-screen copy gets the fast VRAM blit */
+     if (pSrcDraw->type != DRAWABLE_WINDOW ||
+         pDstDraw->type != DRAWABLE_WINDOW ||
+-        pSrcDraw->pScreen != pDstDraw->pScreen)
++        pSrcDraw->pScreen != pDstDraw->pScreen ||
++        pGC->alu != GXcopy)
+     {
+         return miCopyArea(pSrcDraw, pDstDraw, pGC,
+                           srcx, srcy, width, height, dstx, dsty);

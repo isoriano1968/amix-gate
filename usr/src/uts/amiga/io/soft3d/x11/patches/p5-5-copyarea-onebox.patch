@@ -1,0 +1,58 @@
+P-5 fix 2a: a one-box fast path in window-to-window CopyArea (build-tree
+patch against isoriano1968/x11r6.3-amix cb61a21, applied after
+zz9000hw-modes.patch and p5-1 .. p5-4).
+
+S2 (p5-2) made every window-to-window copy build a clip region and call
+miHandleExposures; small copies paid for it (x11perf scroll 10x10 -24 %,
+copywinwin 10x10 -29 % on the rig; -10/-12 % on the A4000T).  When the
+source is clipped by its clipList, that clipList and the destination's
+composite clip are one box each and the source rectangle lies inside the
+source box, nothing is obscured: one copyVRAMBox clipped to the destination
+box, and NULL returned (ProcCopyArea then sends the NoExpose).  Everything
+else keeps S2's region path, so copyexpose and xorcopy still pass.
+
+--- a/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
++++ b/programs/Xserver/hw/amix/rtg/zz9000/zz9000draw.c
+@@ -730,6 +730,42 @@
+     if (!((WindowPtr) pDstDraw)->realized)
+         return (RegionPtr) NULL;
+ 
++    /*
++    ** Fast path (P-5 fix 2a): the common scroll/copy of an unobscured window.
++    ** When the source is clipped by its clipList (not IncludeInferiors), that
++    ** clipList and the destination's composite clip are one box each, and
++    ** the source rectangle lies wholly inside the source box, no part of the
++    ** source is obscured: nothing to expose, one box to copy.  Returning
++    ** NULL is protocol-correct -- ProcCopyArea hands it to SendGraphicsExpose,
++    ** which sends the NoExpose a client with graphics exposures expects.
++    ** Anything else takes the full region path below.
++    */
++    if (pGC->subWindowMode != IncludeInferiors &&
++        REGION_NUM_RECTS(&((WindowPtr) pSrcDraw)->clipList) == 1 &&
++        REGION_NUM_RECTS(rtgGCClip(pGC)) == 1)
++    {
++        BoxPtr sb = REGION_RECTS(&((WindowPtr) pSrcDraw)->clipList);
++        BoxPtr db = REGION_RECTS(rtgGCClip(pGC));
++        int    sx = pSrcDraw->x + srcx, sy = pSrcDraw->y + srcy;
++        int    tx = pDstDraw->x + dstx, ty = pDstDraw->y + dsty;
++        int    x1, y1, x2, y2;
++
++        if (width > 0 && height > 0 &&
++            sx >= sb->x1 && sy >= sb->y1 &&
++            sx + width <= sb->x2 && sy + height <= sb->y2)
++        {
++            x1 = max(tx, db->x1);
++            y1 = max(ty, db->y1);
++            x2 = min(tx + width, db->x2);
++            y2 = min(ty + height, db->y2);
++            if (x1 < x2 && y1 < y2)
++                copyVRAMBox(pRTG->frameBase, pRTG->fbBase, ZZ9000_STRIDE(pRTG),
++                            x1 + (sx - tx), y1 + (sy - ty),
++                            x2 - x1, y2 - y1, x1, y1);
++            return (RegionPtr) NULL;
++        }
++    }
++
+     /* What of the source is visible */
+     if (pGC->subWindowMode == IncludeInferiors)
+     {

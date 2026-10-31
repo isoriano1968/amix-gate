@@ -1,0 +1,547 @@
+# Xzz9000 performance baseline
+# label:   p5 rig 709b8a97 base 1024x768 amiberry-LC060
+# date:    Sat Dec 31 20:29:15 EST 1977
+# system:  UNIX_System_V 4.0 2.1c 0800430 Amiga (Unlimited) 68060-260915-55
+# display: :0
+# timing:  3 s x 3 reps per test
+# x11perf: ./x11perf
+# rtgScreenInit: AllocateGCPrivate ok, calling ZZ9000InitHW
+# ZZ9000InitHW: starting
+# ZZ9000InitHW: done 1024x768 stride 2048
+# rtgScreenInit: hw init done, calling ZZ9000ScreenInit
+# rtgScreenInit: cursor done, calling ZZ9000CreateDefColormap
+# ZZ9000CreateGC: depth=1
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801adbf8
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801cb410
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801cb9a4
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801cba78
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801cbecc
+# rtgScreenInit: AllocateGCPrivate ok, calling ZZ9000InitHW
+# ZZ9000InitHW: starting
+# ZZ9000InitHW: done 1024x768 stride 2048
+# rtgScreenInit: hw init done, calling ZZ9000ScreenInit
+# rtgScreenInit: cursor done, calling ZZ9000CreateDefColormap
+# ZZ9000CreateGC: depth=1
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801aadb8
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801ba318
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801ba864
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801ba938
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801bada8
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801efc2c
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801f3d4c
+# ZZ9000CreateGC: depth=1
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801f4140
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801f4444
+# ZZ9000CreateGC: depth=1
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801f4b08
+# ZZ9000CreateGC: depth=1
+# ZZ9000CreateGC: depth=1
+# ZZ9000CreateGC: depth=1
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801f9810
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801f3b94
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801f3aac
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801f3da4
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801f3c68
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801c3720
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801c37f4
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801c38c8
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801c399c
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801c3d0c
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801c4148
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801c4234
+# ZZ9000CreateGC: depth=1
+# ZZ9000CreateGC: depth=1
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801fb07c
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801fb174
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801fb26c
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801fb5e8
+# ZZ9000CreateGC: depth=1
+# ZZ9000CreateGC: depth=1
+# ZZ9000CreateGC: depth=1
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80200fac
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80201080
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80201154
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=802012dc
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=8020136c
+# ZZ9000CreateGC: depth=1
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801c364c
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80201eb0
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80201fa8
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=802020a0
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80202198
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=802022c0
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=802023b8
+# ZZ9000CreateGC: depth=1
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80203b54
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80203c28
+# ZZ9000CreateGC: depth=1
+# ZZ9000CreateGC: depth=1
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80203dc0
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80203e94
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80203f68
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80204060
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80204158
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80204250
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80204348
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80204440
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80204538
+# ZZ9000CreateGC: depth=1
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80204b24
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80204c1c
+# ZZ9000CreateGC: depth=1
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80207650
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80207650
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80207a14
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801f2628
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=802077fc
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=802077fc
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801f2850
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801f2990
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80207cfc
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=80207a1c
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801f2794
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801f28ac
+# ZZ9000CreateGC: depth=16
+# ZZ9000CreateGC: pPriv=801f2720
+# dimensions:    1024x768 pixels (288x216 millimeters)
+# depth of root window:    16 planes
+#
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:29:16 1977
+
+Sync time adjustment is 1.2628 msecs.
+
+ 500000 reps @   0.0051 msec (196000.0/sec): Dot
+ 500000 reps @   0.0052 msec (194000.0/sec): Dot
+ 500000 reps @   0.0051 msec (196000.0/sec): Dot
+1500000 trep @   0.0051 msec (195000.0/sec): Dot
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:29:33 1977
+
+Sync time adjustment is 1.2665 msecs.
+
+ 400000 reps @   0.0077 msec (130000.0/sec): 1x1 rectangle
+ 400000 reps @   0.0077 msec (130000.0/sec): 1x1 rectangle
+ 400000 reps @   0.0077 msec (130000.0/sec): 1x1 rectangle
+1200000 trep @   0.0077 msec (130000.0/sec): 1x1 rectangle
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:29:52 1977
+
+Sync time adjustment is 1.2527 msecs.
+
+  70000 reps @   0.0566 msec ( 17700.0/sec): 10x10 rectangle
+  70000 reps @   0.0493 msec ( 20300.0/sec): 10x10 rectangle
+  70000 reps @   0.0490 msec ( 20400.0/sec): 10x10 rectangle
+ 210000 trep @   0.0516 msec ( 19400.0/sec): 10x10 rectangle
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:30:09 1977
+
+Sync time adjustment is 1.2615 msecs.
+
+   1080 reps @   3.1315 msec (   319.0/sec): 100x100 rectangle
+   1080 reps @   3.7025 msec (   270.0/sec): 100x100 rectangle
+   1080 reps @   3.1470 msec (   318.0/sec): 100x100 rectangle
+   3240 trep @   3.3270 msec (   301.0/sec): 100x100 rectangle
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:30:26 1977
+
+Sync time adjustment is 1.2971 msecs.
+
+     40 reps @  75.3842 msec (    13.3/sec): 500x500 rectangle
+     40 reps @  75.8009 msec (    13.2/sec): 500x500 rectangle
+     40 reps @  89.1342 msec (    11.2/sec): 500x500 rectangle
+    120 trep @  80.1065 msec (    12.5/sec): 500x500 rectangle
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:30:42 1977
+
+Sync time adjustment is 1.2994 msecs.
+
+  50000 reps @   0.0606 msec ( 16500.0/sec): 10-pixel line
+  50000 reps @   0.0713 msec ( 14000.0/sec): 10-pixel line
+  50000 reps @   0.0600 msec ( 16700.0/sec): 10-pixel line
+ 150000 trep @   0.0640 msec ( 15600.0/sec): 10-pixel line
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:31:01 1977
+
+Sync time adjustment is 1.2987 msecs.
+
+   8000 reps @   0.4040 msec (  2480.0/sec): 100-pixel line
+   8000 reps @   0.4728 msec (  2120.0/sec): 100-pixel line
+   8000 reps @   0.4019 msec (  2490.0/sec): 100-pixel line
+  24000 trep @   0.4262 msec (  2350.0/sec): 100-pixel line
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:31:21 1977
+
+Sync time adjustment is 1.2907 msecs.
+
+   1000 reps @  47.0987 msec (    21.2/sec): 10-pixel circle
+   1000 reps @  48.1987 msec (    20.7/sec): 10-pixel circle
+   1000 reps @  47.0820 msec (    21.2/sec): 10-pixel circle
+   3000 trep @  47.4598 msec (    21.1/sec): 10-pixel circle
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:34:37 1977
+
+Sync time adjustment is 1.2887 msecs.
+
+    200 reps @  58.8269 msec (    17.0/sec): 100-pixel circle
+    200 reps @  56.1602 msec (    17.8/sec): 100-pixel circle
+    200 reps @  59.0769 msec (    16.9/sec): 100-pixel circle
+    600 trep @  58.0213 msec (    17.2/sec): 100-pixel circle
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:35:28 1977
+
+Sync time adjustment is 1.2887 msecs.
+
+  40000 reps @   0.0879 msec ( 11400.0/sec): Scroll 10x10 pixels
+  40000 reps @   0.0875 msec ( 11400.0/sec): Scroll 10x10 pixels
+  40000 reps @   0.0871 msec ( 11500.0/sec): Scroll 10x10 pixels
+ 120000 trep @   0.0875 msec ( 11400.0/sec): Scroll 10x10 pixels
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:35:49 1977
+
+Sync time adjustment is 1.5713 msecs.
+
+   2000 reps @   2.9909 msec (   334.0/sec): Scroll 100x100 pixels
+   2000 reps @   2.9992 msec (   333.0/sec): Scroll 100x100 pixels
+   2000 reps @   2.9992 msec (   333.0/sec): Scroll 100x100 pixels
+   6000 trep @   2.9964 msec (   334.0/sec): Scroll 100x100 pixels
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:36:15 1977
+
+Sync time adjustment is 1.2882 msecs.
+
+     50 reps @  69.9742 msec (    14.3/sec): Scroll 500x500 pixels
+     50 reps @  70.3076 msec (    14.2/sec): Scroll 500x500 pixels
+     50 reps @  69.6409 msec (    14.4/sec): Scroll 500x500 pixels
+    150 trep @  69.9742 msec (    14.3/sec): Scroll 500x500 pixels
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:36:34 1977
+
+Sync time adjustment is 1.2973 msecs.
+
+  32000 reps @   0.0864 msec ( 11600.0/sec): Copy 10x10 from window to window
+  32000 reps @   0.0859 msec ( 11600.0/sec): Copy 10x10 from window to window
+  32000 reps @   0.0864 msec ( 11600.0/sec): Copy 10x10 from window to window
+  96000 trep @   0.0862 msec ( 11600.0/sec): Copy 10x10 from window to window
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:36:54 1977
+
+Sync time adjustment is 1.2887 msecs.
+
+   1200 reps @   3.4434 msec (   290.0/sec): Copy 100x100 from window to window
+   1200 reps @   3.0128 msec (   332.0/sec): Copy 100x100 from window to window
+   1200 reps @   2.9850 msec (   335.0/sec): Copy 100x100 from window to window
+   3600 trep @   3.1471 msec (   318.0/sec): Copy 100x100 from window to window
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:37:17 1977
+
+Sync time adjustment is 1.6017 msecs.
+
+     36 reps @  70.3259 msec (    14.2/sec): Copy 500x500 from window to window
+     36 reps @  70.3259 msec (    14.2/sec): Copy 500x500 from window to window
+     36 reps @  70.3259 msec (    14.2/sec): Copy 500x500 from window to window
+    108 trep @  70.3259 msec (    14.2/sec): Copy 500x500 from window to window
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:37:35 1977
+
+Sync time adjustment is 1.3022 msecs.
+
+    320 reps @  10.6209 msec (    94.2/sec): Copy 100x100 from pixmap to window
+    320 reps @  12.3397 msec (    81.0/sec): Copy 100x100 from pixmap to window
+    320 reps @  10.6209 msec (    94.2/sec): Copy 100x100 from pixmap to window
+    960 trep @  11.1938 msec (    89.3/sec): Copy 100x100 from pixmap to window
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:37:56 1977
+
+Sync time adjustment is 1.2907 msecs.
+
+    320 reps @  10.6731 msec (    93.7/sec): Copy 100x100 from window to pixmap
+    320 reps @  10.7772 msec (    92.8/sec): Copy 100x100 from window to pixmap
+    320 reps @  12.4439 msec (    80.4/sec): Copy 100x100 from window to pixmap
+    960 trep @  11.2980 msec (    88.5/sec): Copy 100x100 from window to pixmap
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:38:18 1977
+
+Sync time adjustment is 1.3223 msecs.
+
+    320 reps @  10.6209 msec (    94.2/sec): Copy 100x100 from pixmap to pixmap
+    320 reps @  10.6209 msec (    94.2/sec): Copy 100x100 from pixmap to pixmap
+    320 reps @  10.6209 msec (    94.2/sec): Copy 100x100 from pixmap to pixmap
+    960 trep @  10.6209 msec (    94.2/sec): Copy 100x100 from pixmap to pixmap
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:38:39 1977
+
+Sync time adjustment is 1.5991 msecs.
+
+  12000 reps @   0.2776 msec (  3600.0/sec): PutImage 10x10 square
+  12000 reps @   0.2749 msec (  3640.0/sec): PutImage 10x10 square
+  12000 reps @   0.2749 msec (  3640.0/sec): PutImage 10x10 square
+  36000 trep @   0.2758 msec (  3630.0/sec): PutImage 10x10 square
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:38:58 1977
+
+Sync time adjustment is 1.2907 msecs.
+
+    240 reps @  10.6891 msec (    93.6/sec): PutImage 100x100 square
+    240 reps @  10.7585 msec (    92.9/sec): PutImage 100x100 square
+    240 reps @  10.7585 msec (    92.9/sec): PutImage 100x100 square
+    720 trep @  10.7354 msec (    93.2/sec): PutImage 100x100 square
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:39:17 1977
+
+Sync time adjustment is 1.2793 msecs.
+
+   2000 reps @   1.5910 msec (   629.0/sec): GetImage 10x10 square
+   2000 reps @   1.8744 msec (   534.0/sec): GetImage 10x10 square
+   2000 reps @   1.5910 msec (   629.0/sec): GetImage 10x10 square
+   6000 trep @   1.6855 msec (   593.0/sec): GetImage 10x10 square
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:39:37 1977
+
+Sync time adjustment is 1.2971 msecs.
+
+    240 reps @  13.4668 msec (    74.3/sec): GetImage 100x100 square
+    240 reps @  13.4668 msec (    74.3/sec): GetImage 100x100 square
+    240 reps @  13.5363 msec (    73.9/sec): GetImage 100x100 square
+    720 trep @  13.4900 msec (    74.1/sec): GetImage 100x100 square
+
+	-> -ftext	Char in 80-char line (6x13)
+	-> -f8text	Char in 70-char line (8x13)
+	-> -f9text	Char in 60-char line (9x15)
+	-> -f14text16	Char16 in 40-char line (k14)
+	-> -f24text16	Char16 in 23-char line (k24)
+	-> -tr10text	Char in 80-char line (TR 10)
+	-> -tr24text	Char in 30-char line (TR 24)
+	-> -polytext	Char in 20/40/20 line (6x13, TR 10)
+	-> -polytext16	Char16 in 7/14/7 line (k14, k24)
+	-> -fitext	Char in 80-char image line (6x13)
+	-> -f8itext	Char in 70-char image line (8x13)
+	-> -f9itext	Char in 60-char image line (9x15)
+	-> -f14itext16	Char16 in 40-char image line (k14)
+	-> -f24itext16	Char16 in 23-char image line (k24)
+	-> -tr10itext	Char in 80-char image line (TR 10)
+	-> -tr24itext	Char in 30-char image line (TR 24)
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:39:54 1977
+
+Sync time adjustment is 1.6556 msecs.
+
+  16000 reps @   0.3447 msec (  2900.0/sec): Char in 80-char line (6x13)
+  16000 reps @   0.3447 msec (  2900.0/sec): Char in 80-char line (6x13)
+  16000 reps @   0.3447 msec (  2900.0/sec): Char in 80-char line (6x13)
+  48000 trep @   0.3447 msec (  2900.0/sec): Char in 80-char line (6x13)
+
+  14400 reps @   0.3598 msec (  2780.0/sec): Char in 70-char line (8x13)
+  14400 reps @   0.3598 msec (  2780.0/sec): Char in 70-char line (8x13)
+  14400 reps @   0.3610 msec (  2770.0/sec): Char in 70-char line (8x13)
+  43200 trep @   0.3602 msec (  2780.0/sec): Char in 70-char line (8x13)
+
+  12000 reps @   0.4596 msec (  2180.0/sec): Char in 60-char line (9x15)
+  12000 reps @   0.4124 msec (  2430.0/sec): Char in 60-char line (9x15)
+  12000 reps @   0.4124 msec (  2430.0/sec): Char in 60-char line (9x15)
+  36000 trep @   0.4281 msec (  2340.0/sec): Char in 60-char line (9x15)
+
+   8000 reps @   0.5665 msec (  1770.0/sec): Char16 in 40-char line (k14)
+   8000 reps @   0.5685 msec (  1760.0/sec): Char16 in 40-char line (k14)
+   8000 reps @   0.5644 msec (  1770.0/sec): Char16 in 40-char line (k14)
+  24000 trep @   0.5665 msec (  1770.0/sec): Char16 in 40-char line (k14)
+
+Could not load font '-jis-fixed-medium-r-normal--24-230-75-75-c-240-jisx0208.1983-*', benchmark omitted
+
+  16000 reps @   0.2520 msec (  3970.0/sec): Char in 80-char line (TR 10)
+  16000 reps @   0.2520 msec (  3970.0/sec): Char in 80-char line (TR 10)
+  16000 reps @   0.2186 msec (  4570.0/sec): Char in 80-char line (TR 10)
+  48000 trep @   0.2409 msec (  4150.0/sec): Char in 80-char line (TR 10)
+
+   6400 reps @   0.4997 msec (  2000.0/sec): Char in 30-char line (TR 24)
+   6400 reps @   0.4971 msec (  2010.0/sec): Char in 30-char line (TR 24)
+   6400 reps @   0.5831 msec (  1720.0/sec): Char in 30-char line (TR 24)
+  19200 trep @   0.5267 msec (  1900.0/sec): Char in 30-char line (TR 24)
+
+  16000 reps @   0.2884 msec (  3470.0/sec): Char in 20/40/20 line (6x13, TR 10)
+  16000 reps @   0.2895 msec (  3450.0/sec): Char in 20/40/20 line (6x13, TR 10)
+  16000 reps @   0.3218 msec (  3110.0/sec): Char in 20/40/20 line (6x13, TR 10)
+  48000 trep @   0.2999 msec (  3330.0/sec): Char in 20/40/20 line (6x13, TR 10)
+
+Could not load font '-jis-fixed-medium-r-normal--24-230-75-75-c-240-jisx0208.1983-*', benchmark omitted
+
+  16000 reps @   0.3676 msec (  2720.0/sec): Char in 80-char image line (6x13)
+  16000 reps @   0.3666 msec (  2730.0/sec): Char in 80-char image line (6x13)
+  16000 reps @   0.3999 msec (  2500.0/sec): Char in 80-char image line (6x13)
+  48000 trep @   0.3780 msec (  2650.0/sec): Char in 80-char image line (6x13)
+
+  14400 reps @   0.3876 msec (  2580.0/sec): Char in 70-char image line (8x13)
+  14400 reps @   0.4247 msec (  2350.0/sec): Char in 70-char image line (8x13)
+  14400 reps @   0.3876 msec (  2580.0/sec): Char in 70-char image line (8x13)
+  43200 trep @   0.4000 msec (  2500.0/sec): Char in 70-char image line (8x13)
+
+  12000 reps @   0.4499 msec (  2220.0/sec): Char in 60-char image line (9x15)
+  12000 reps @   0.4943 msec (  2020.0/sec): Char in 60-char image line (9x15)
+  12000 reps @   0.4457 msec (  2240.0/sec): Char in 60-char image line (9x15)
+  36000 trep @   0.4633 msec (  2160.0/sec): Char in 60-char image line (9x15)
+
+   8000 reps @   0.6998 msec (  1430.0/sec): Char16 in 40-char image line (k14)
+   8000 reps @   0.6248 msec (  1600.0/sec): Char16 in 40-char image line (k14)
+   8000 reps @   0.6227 msec (  1610.0/sec): Char16 in 40-char image line (k14)
+  24000 trep @   0.6491 msec (  1540.0/sec): Char16 in 40-char image line (k14)
+
+Could not load font '-jis-fixed-medium-r-normal--24-230-75-75-c-240-jisx0208.1983-*', benchmark omitted
+
+  16000 reps @   0.2343 msec (  4270.0/sec): Char in 80-char image line (TR 10)
+  16000 reps @   0.2353 msec (  4250.0/sec): Char in 80-char image line (TR 10)
+  16000 reps @   0.2343 msec (  4270.0/sec): Char in 80-char image line (TR 10)
+  48000 trep @   0.2346 msec (  4260.0/sec): Char in 80-char image line (TR 10)
+
+   6400 reps @   0.5831 msec (  1720.0/sec): Char in 30-char image line (TR 24)
+   6400 reps @   0.6690 msec (  1490.0/sec): Char in 30-char image line (TR 24)
+   6400 reps @   0.5831 msec (  1720.0/sec): Char in 30-char image line (TR 24)
+  19200 trep @   0.6117 msec (  1630.0/sec): Char in 30-char image line (TR 24)
+
+x11perf - X11 performance program, version 1.5
+X Consortium server version 6300 on :0.0
+from <host>
+Sat Dec 31 20:44:05 1977
+
+Sync time adjustment is 1.2994 msecs.
+
+  16000 reps @   0.3437 msec (  2910.0/sec): Char in 80-char line (6x13)
+  16000 reps @   0.3822 msec (  2620.0/sec): Char in 80-char line (6x13)
+  16000 reps @   0.3437 msec (  2910.0/sec): Char in 80-char line (6x13)
+  48000 trep @   0.3565 msec (  2800.0/sec): Char in 80-char line (6x13)
+
+
