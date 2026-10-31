@@ -1,0 +1,15 @@
+hdf/
+*.hdf
+repo/
+work/
+tmp/
+assets/
+build/
+core
+*~
+.DS_Store
+cold-cycle-test/
+
+# Local AI-agent / assistant files (never published)
+CLAUDE.md
+.claude/

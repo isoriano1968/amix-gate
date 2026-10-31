@@ -1,0 +1,19 @@
+NOTICE — src/kernel-patches/
+
+This directory ships unified diffs against stock Amiga UNIX (Amix) SVR4.0
+kernel sources -- NOT the Amix source files themselves.
+
+    dd.c.patch   Our fix to amiga/alien/dd.c: issue the next queued buf BEFORE
+                 iodone() in ihandle(), so iodone's b_iodone chunk-resubmit
+                 callback cannot re-enter ddstrategy and double-issue the same
+                 sdcom (see ../../NOTES.md).  Apply with `patch` from /usr/sys
+                 against a stock Amix 2.1 tree; the kerntools harness applies it
+                 (and skips it if already applied).
+
+The added/changed lines in the patch are our work, offered under this
+repository's MIT license (see ../../LICENSE).  The few unchanged context lines
+quoted from the stock file remain under their original Commodore SVR4 copyright.
+
+The SCSI controller-table rows (sd.c scsicard[] / externs / sdcardbase) and the
+kernel Makefile OBJ entry are NOT kept here -- kerntools generates them from
+../../driver.conf.

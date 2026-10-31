@@ -1,0 +1,285 @@
+# DI-1 block-wise diff: damaged D-DEV hdf0 vs the clean master (companion to DI-1-misplaced-write.md)
+#
+# reference  k1-desktop-rtg.hdf (card master)        sha256 403ca277902ae0ac020aa6fa...  209715200 B
+# damaged    k1-desktop-rtg.hdf pulled 2026-10-03     sha256 6ad5ba8fac65d51656337d0a...  209715200 B (crc32 59EA6326 = device CRC)
+#
+# 814 differing 512-byte sectors.  Every one lies inside UNIX_Root (image sectors 128..342143,
+# UFS base 0x10000); the RDB (sectors 0..127), UNIX_Swap and UNIX_Boot are byte-identical.
+# One line per run of consecutive sectors with the same class.  Columns:
+#   first-last sector (image LBA = piscsi LBA, the .hdf is the whole disk), count, image byte offset, class
+# Classes come from the UFS geometry (sblkno 16, cblkno 24, iblkno 32, fpg 1296, cgoffset 16):
+#   cg-header        a cylinder-group header block (free maps, summary): runtime allocation
+#   inode block (cg) an inode block; dinode-level breakdown is in DI-1-misplaced-write.md section 2.4
+#   data <path>      a fragment owned by the same file in both images (runtime content change)
+#   data new <path>  free in the master, owned in the damaged image (file grew / was created)
+#   data realloc     owned by different files in the two images (freed and reused)
+#   data freed       owned in the master, free in the damaged image
+#   data free space  free in both (stale bytes of a since-freed temp file; no meaning)
+# The single anomalous run is 34304-34311: the first 4 KiB of the inode block for inodes
+# 6656-6719; its second 2 KiB (34308-34311) is the DI-1 piece.
+#
+    144-145       2  img 0x00012000  data free space
+    176-177       2  img 0x00016000  cg-header
+    192-194       3  img 0x00018000  inode block (cg 0)
+    320-322       3  img 0x00028000  data free space
+    324-324       1  img 0x00028800  data free space
+    328-328       1  img 0x00029000  data /var/adm/sa
+    352-352       1  img 0x0002c000  data /
+    408-408       1  img 0x00033000  data new /.xinitrc
+   2736-2736      1  img 0x00156000  data /var
+   2816-2817      2  img 0x00160000  inode block (cg 1)
+   5320-5320      1  img 0x00299000  data /var/cron
+   5328-5328      1  img 0x0029a000  data /var/adm
+   5330-5333      4  img 0x0029a400  data free space
+   5344-5359     16  img 0x0029c000  data new /var/adm/wtmpx
+   5376-5377      2  img 0x002a0000  data free space
+   5378-5379      2  img 0x002a0400  data new /var/adm/lastlog
+   5380-5385      6  img 0x002a0800  data new /var/cron/log
+   5386-5386      1  img 0x002a1400  data new /var/adm/utmp
+   5424-5425      2  img 0x002a6000  cg-header
+   5440-5443      4  img 0x002a8000  inode block (cg 2)
+   5568-5583     16  img 0x002b8000  data new /var/adm/wtmpx
+   5584-5591      8  img 0x002ba000  data new /var/adm/utmpx
+   5592-5596      5  img 0x002bb000  data new /var/adm/wtmpx
+   5598-5599      2  img 0x002bbc00  data free space
+   5600-5611     12  img 0x002bc000  data new /var/adm/wtmp
+   5612-5614      3  img 0x002bd800  data free space
+   5632-5647     16  img 0x002c0000  data new /var/adm/wtmpx
+   5664-5695     32  img 0x002c4000  data new /var/adm/wtmpx
+   5696-5706     11  img 0x002c8000  data free space
+   5708-5708      1  img 0x002c9800  data free space
+   5710-5710      1  img 0x002c9c00  data free space
+   5712-5727     16  img 0x002ca000  data new /var/adm/wtmpx
+   5744-5759     16  img 0x002ce000  data new /var/adm/wtmpx
+   7920-7920      1  img 0x003de000  data freed (was /tmp)
+   8048-8049      2  img 0x003ee000  cg-header
+   8064-8064      1  img 0x003f0000  inode block (cg 3)
+  10520-10520     1  img 0x00523000  data /etc/TIMEZONE
+  10672-10673     2  img 0x00536000  cg-header
+  10688-10690     3  img 0x00538000  inode block (cg 4)
+  10693-10694     2  img 0x00538a00  inode block (cg 4)
+  10697-10705     9  img 0x00539200  inode block (cg 4)
+  10707-10708     2  img 0x0053a600  inode block (cg 4)
+  10711-10714     4  img 0x0053ae00  inode block (cg 4)
+  10716-10716     1  img 0x0053b800  inode block (cg 4)
+  10718-10722     5  img 0x0053bc00  inode block (cg 4)
+  10852-10852     1  img 0x0054c800  data /etc/nodename
+  10866-10867     2  img 0x0054e400  data /etc/profile
+  10906-10906     1  img 0x00553400  data realloc /etc/syslog.pid -> /etc/vfstab
+  10919-10919     1  img 0x00554e00  data /etc
+  10921-10921     1  img 0x00555200  data /etc
+  11008-11009     2  img 0x00560000  data realloc /etc/vfstab -> /etc/syslog.pid
+  11054-11054     1  img 0x00565c00  data new /etc/mnttab
+  11072-11073     2  img 0x00568000  data new /etc/tz.index
+  11074-11075     2  img 0x00568400  data new /etc/shadow
+  11076-11083     8  img 0x00568800  data new /etc/ps_data
+  11088-11103    16  img 0x0056a000  data new /etc/ps_data
+  13312-13313     2  img 0x00680000  inode block (cg 5)
+  15702-15702     1  img 0x007aac00  data /etc/net/ticlts/hosts
+  15706-15706     1  img 0x007ab400  data /var/mail
+  15708-15711     4  img 0x007ab800  data free space
+  15840-15845     6  img 0x007bc000  data new /var/mail/sys
+  15920-15921     2  img 0x007c6000  cg-header
+  15937-15938     2  img 0x007c8200  inode block (cg 6)
+  18294-18294     1  img 0x008eec00  data /var/mail/:saved
+  18544-18544     1  img 0x0090e000  cg-header
+  18560-18561     2  img 0x00910000  inode block (cg 7)
+  23810-23810     1  img 0x00ba0400  inode block (cg 9)
+  26064-26064     1  img 0x00cba000  data freed (was /tmp/apkgcache)
+  26416-26417     2  img 0x00ce6000  cg-header
+  26432-26432     1  img 0x00ce8000  inode block (cg 10)
+  28656-28656     1  img 0x00dfe000  data freed (was /tmp/apkgcache/cache)
+  29040-29042     3  img 0x00e2e000  cg-header
+  29056-29059     4  img 0x00e30000  inode block (cg 11)
+  31248-31258    11  img 0x00f42000  data freed (was ind:/tmp/apkgcache/cache/core-2.1.pkg)
+  31664-31666     3  img 0x00f76000  cg-header
+  31680-31680     1  img 0x00f78000  inode block (cg 12)
+  34288-34290     3  img 0x010be000  cg-header
+  34304-34311     8  img 0x010c0000  inode block (cg 13)
+  36912-36914     3  img 0x01206000  cg-header
+  36929-36929     1  img 0x01208200  inode block (cg 14)
+  39024-39026     3  img 0x0130e000  data freed (was ind:/tmp/apkgcache/cache/APKGENG-1.12.0.pkg)
+  39536-39538     3  img 0x0134e000  cg-header
+  41648-41650     3  img 0x01456000  cg-header
+  41664-41665     2  img 0x01458000  inode block (cg 16)
+  44208-44209     2  img 0x01596000  data realloc /tmp/apkgcache/cache/core-2.1.pkg -> /etc/saf/inetd/_pid
+  44272-44274     3  img 0x0159e000  cg-header
+  44288-44288     1  img 0x015a0000  inode block (cg 17)
+  46896-46898     3  img 0x016e6000  cg-header
+  46912-46913     2  img 0x016e8000  inode block (cg 18)
+  48216-48216     1  img 0x0178b000  data /etc/saf/screens
+  48432-48432     1  img 0x017a6000  data new /etc/saf/screens/_pid
+  49520-49522     3  img 0x0182e000  cg-header
+  49536-49537     2  img 0x01830000  inode block (cg 19)
+  50116-50116     1  img 0x01878800  data new /etc/saf/serial/_pid
+  50120-50120     1  img 0x01879000  data /etc/saf
+  50126-50126     1  img 0x01879c00  data /etc/saf/serial
+  52144-52146     3  img 0x01976000  cg-header
+  54588-54589     2  img 0x01aa7800  data realloc /etc/saf/tcp/_pid -> /etc/saf/tcp/_pmtab
+  54590-54591     2  img 0x01aa7c00  data realloc /etc/saf/tcp/_pmtab -> /etc/saf/tcp/_pid
+  54768-54770     3  img 0x01abe000  cg-header
+  54785-54785     1  img 0x01ac0200  inode block (cg 21)
+  57392-57394     3  img 0x01c06000  cg-header
+  59760-59760     1  img 0x01d2e000  data freed (was ind:/tmp/apkgcache/cache/APKG-0.2.pkg)
+  59856-59856     1  img 0x01d3a000  data freed (was ind:/tmp/apkgcache/cache/Xbasic-2.1.pkg)
+  60016-60018     3  img 0x01d4e000  cg-header
+  62340-62340     1  img 0x01e70800  data /etc/skel
+  62640-62642     3  img 0x01e96000  cg-header
+  62656-62657     2  img 0x01e98000  inode block (cg 24)
+  63610-63610     1  img 0x01f0f400  data new /etc/skel/.xinitrc
+  65264-65266     3  img 0x01fde000  cg-header
+  67888-67890     3  img 0x02126000  cg-header
+  70128-70135     8  img 0x0223e000  data freed (was ind:/tmp/apkgcache/cache/Xcore-2.1.pkg)
+  70512-70514     3  img 0x0226e000  cg-header
+  73136-73138     3  img 0x023b6000  cg-header
+  75760-75762     3  img 0x024fe000  cg-header
+  77904-77917    14  img 0x0260a000  data realloc /tmp/apkgcache/cache/Xcore-2.1.pkg -> /var/saf/_log
+  78384-78386     3  img 0x02646000  cg-header
+  78401-78401     1  img 0x02648200  inode block (cg 30)
+  78414-78414     1  img 0x02649c00  inode block (cg 30)
+  79696-79696     1  img 0x026ea000  data /var/saf
+  80496-80501     6  img 0x0274e000  data freed (was ind:/tmp/apkgcache/cache/sysadm-2.1.pkg)
+  81008-81010     3  img 0x0278e000  cg-header
+  81025-81028     4  img 0x02790200  inode block (cg 31)
+  83072-83077     6  img 0x02890000  data realloc /tmp/apkgcache/cache/core-2.1.pkg -> /var/saf/screens/log
+  83088-83103    16  img 0x02892000  data realloc /tmp/apkgcache/cache/core-2.1.pkg -> /var/saf/screens/log
+  83120-83122     3  img 0x02896000  cg-header
+  83138-83139     2  img 0x02898400  inode block (cg 32)
+  85680-85689    10  img 0x029d6000  data realloc /tmp/apkgcache/cache/core-2.1.pkg -> /var/saf/serial/log
+  85744-85746     3  img 0x029de000  cg-header
+  85761-85761     1  img 0x029e0200  inode block (cg 33)
+  85888-85889     2  img 0x029f0000  data freed (was ind:/tmp/apkgcache/cache/bsd-2.1.pkg)
+  88272-88275     4  img 0x02b1a000  data realloc /tmp/apkgcache/cache/bsd-2.1.pkg -> /var/saf/tcp/o.log
+  88368-88370     3  img 0x02b26000  cg-header
+  88385-88385     1  img 0x02b28200  inode block (cg 34)
+  88394-88394     1  img 0x02b29400  inode block (cg 34)
+  89726-89726     1  img 0x02bcfc00  data /var/saf/serial
+  89744-89744     1  img 0x02bd2000  data /var/saf/tcp
+  90426-90428     3  img 0x02c27400  data new /var/saf/tcp/log
+  90430-90431     2  img 0x02c27c00  data free space
+  90992-90994     3  img 0x02c6e000  cg-header
+  91640-91640     1  img 0x02cbf000  data /var/saf/screens
+  93456-93458     3  img 0x02da2000  data freed (was ind:/tmp/apkgcache/cache/net-2.1.pkg)
+  93616-93618     3  img 0x02db6000  cg-header
+  93633-93633     1  img 0x02db8200  inode block (cg 36)
+  93635-93635     1  img 0x02db8600  inode block (cg 36)
+  93640-93641     2  img 0x02db9000  inode block (cg 36)
+  96240-96242     3  img 0x02efe000  cg-header
+  96259-96260     2  img 0x02f00600  inode block (cg 37)
+  98864-98866     3  img 0x03046000  cg-header
+ 101488-101490    3  img 0x0318e000  cg-header
+ 104112-104114    3  img 0x032d6000  cg-header
+ 104133-104134    2  img 0x032d8a00  inode block (cg 40)
+ 106736-106738    3  img 0x0341e000  cg-header
+ 106752-106752    1  img 0x03420000  inode block (cg 41)
+ 109008-109009    2  img 0x0353a000  data freed (was ind:/tmp/apkgcache/cache/text-2.1.pkg)
+ 109360-109362    3  img 0x03566000  cg-header
+ 109377-109378    2  img 0x03568200  inode block (cg 42)
+ 109380-109381    2  img 0x03568800  inode block (cg 42)
+ 109389-109389    1  img 0x03569a00  inode block (cg 42)
+ 111984-111986    3  img 0x036ae000  cg-header
+ 114608-114610    3  img 0x037f6000  cg-header
+ 117232-117234    3  img 0x0393e000  cg-header
+ 117249-117249    1  img 0x03940200  inode block (cg 45)
+ 117252-117254    3  img 0x03940800  inode block (cg 45)
+ 117256-117256    1  img 0x03941000  inode block (cg 45)
+ 117258-117261    4  img 0x03941400  inode block (cg 45)
+ 117263-117265    3  img 0x03941e00  inode block (cg 45)
+ 117267-117267    1  img 0x03942600  inode block (cg 45)
+ 117269-117274    6  img 0x03942a00  inode block (cg 45)
+ 117279-117279    1  img 0x03943e00  inode block (cg 45)
+ 117281-117285    5  img 0x03944200  inode block (cg 45)
+ 117287-117288    2  img 0x03944e00  inode block (cg 45)
+ 117290-117291    2  img 0x03945400  inode block (cg 45)
+ 117293-117293    1  img 0x03945a00  inode block (cg 45)
+ 119856-119858    3  img 0x03a86000  cg-header
+ 119872-119872    1  img 0x03a88000  inode block (cg 46)
+ 122480-122482    3  img 0x03bce000  cg-header
+ 124592-124594    3  img 0x03cd6000  cg-header
+ 127152-127153    2  img 0x03e16000  data realloc /tmp/apkgcache/cache/sysadm-2.1.pkg -> /tmp
+ 127216-127218    3  img 0x03e1e000  cg-header
+ 127232-127232    1  img 0x03e20000  inode block (cg 49)
+ 127239-127239    1  img 0x03e20e00  inode block (cg 49)
+ 129840-129842    3  img 0x03f66000  cg-header
+ 129858-129860    3  img 0x03f68400  inode block (cg 50)
+ 129862-129862    1  img 0x03f68c00  inode block (cg 50)
+ 132212-132212    1  img 0x0408e800  data /var/adm/firstboot
+ 132464-132466    3  img 0x040ae000  cg-header
+ 134928-134930    3  img 0x041e2000  data freed (was ind:/tmp/apkgcache/cache/olcore-2.1.pkg)
+ 135088-135090    3  img 0x041f6000  cg-header
+ 137712-137714    3  img 0x0433e000  cg-header
+ 140336-140338    3  img 0x04486000  cg-header
+ 142960-142962    3  img 0x045ce000  cg-header
+ 142976-142976    1  img 0x045d0000  inode block (cg 55)
+ 142978-142979    2  img 0x045d0400  inode block (cg 55)
+ 143562-143565    4  img 0x04619400  data new /var/spool/smtpq/LOG
+ 143590-143590    1  img 0x0461cc00  data /var/spool/smtpq
+ 145282-145282    1  img 0x046f0400  data realloc /tmp -> /var/tmp
+ 145584-145585    2  img 0x04716000  cg-header
+ 145600-145601    2  img 0x04718000  inode block (cg 56)
+ 146136-146141    6  img 0x0475b000  data free space
+ 148208-148210    3  img 0x0485e000  cg-header
+ 148224-148224    1  img 0x04860000  inode block (cg 57)
+ 148229-148229    1  img 0x04860a00  inode block (cg 57)
+ 149196-149196    1  img 0x048d9800  data freed (was /var/tmp)
+ 153472-153472    1  img 0x04af0000  inode block (cg 59)
+ 156097-156097    1  img 0x04c38200  inode block (cg 60)
+ 161346-161346    1  img 0x04ec8400  inode block (cg 62)
+ 176577-176577    1  img 0x05638200  inode block (cg 68)
+ 194946-194946    1  img 0x05f30400  inode block (cg 75)
+ 218049-218050    2  img 0x06a78200  inode block (cg 84)
+ 225920-225921    2  img 0x06e50000  inode block (cg 87)
+ 228545-228546    2  img 0x06f98200  inode block (cg 88)
+ 236010-236011    2  img 0x0733d400  data new /usr/local/bin/startx
+ 236028-236028    1  img 0x0733f800  data /usr/local/bin
+ 236400-236401    2  img 0x0736e000  cg-header
+ 236416-236416    1  img 0x07370000  inode block (cg 91)
+ 264768-264770    3  img 0x08148000  inode block (cg 102)
+ 264772-264772    1  img 0x08148800  inode block (cg 102)
+ 264774-264776    3  img 0x08148c00  inode block (cg 102)
+ 264778-264778    1  img 0x08149400  inode block (cg 102)
+ 264783-264783    1  img 0x08149e00  inode block (cg 102)
+ 264785-264788    4  img 0x0814a200  inode block (cg 102)
+ 264790-264791    2  img 0x0814ac00  inode block (cg 102)
+ 264794-264794    1  img 0x0814b400  inode block (cg 102)
+ 264796-264797    2  img 0x0814b800  inode block (cg 102)
+ 264800-264801    2  img 0x0814c000  inode block (cg 102)
+ 264803-264803    1  img 0x0814c600  inode block (cg 102)
+ 264810-264810    1  img 0x0814d400  inode block (cg 102)
+ 275264-275264    1  img 0x08668000  inode block (cg 106)
+ 277888-277888    1  img 0x087b0000  inode block (cg 107)
+ 280512-280512    1  img 0x088f8000  inode block (cg 108)
+ 285764-285764    1  img 0x08b88800  inode block (cg 110)
+ 300817-300817    1  img 0x092e2200  data /dev
+ 300976-300976    1  img 0x092f6000  cg-header
+ 300992-300994    3  img 0x092f8000  inode block (cg 116)
+ 300996-300996    1  img 0x092f8800  inode block (cg 116)
+ 300999-301000    2  img 0x092f8e00  inode block (cg 116)
+ 301002-301002    1  img 0x092f9400  inode block (cg 116)
+ 303616-303684   69  img 0x09440000  inode block (cg 117)
+ 308864-308864    1  img 0x096d0000  inode block (cg 119)
+ 308873-308873    1  img 0x096d1200  inode block (cg 119)
+ 311488-311488    1  img 0x09818000  inode block (cg 120)
+ 311512-311512    1  img 0x0981b000  inode block (cg 120)
+ 314112-314112    1  img 0x09960000  inode block (cg 121)
+ 316736-316736    1  img 0x09aa8000  inode block (cg 122)
+ 319360-319360    1  img 0x09bf0000  inode block (cg 123)
+ 321984-321984    1  img 0x09d38000  inode block (cg 124)
+ 324608-324610    3  img 0x09e80000  inode block (cg 125)
+ 327232-327232    1  img 0x09fc8000  inode block (cg 126)
+ 331920-331920    1  img 0x0a212000  data /etc/cron.d
+ 331952-331952    1  img 0x0a216000  cg-header
+ 331968-331969    2  img 0x0a218000  inode block (cg 128)
+ 334512-334512    1  img 0x0a356000  data /etc/default
+ 334526-334526    1  img 0x0a357c00  data new /etc/default/login
+ 334576-334577    2  img 0x0a35e000  cg-header
+ 334592-334593    2  img 0x0a360000  inode block (cg 129)
+ 337104-337104    1  img 0x0a49a000  data /etc/dfs
+ 337200-337201    2  img 0x0a4a6000  cg-header
+ 337216-337217    2  img 0x0a4a8000  inode block (cg 130)
+ 339696-339696    1  img 0x0a5de000  data /etc/inet
+ 339698-339698    1  img 0x0a5de400  data freed (was /etc/inet/hosts)
+ 339800-339801    2  img 0x0a5eb000  data new /etc/inet/zen.conf
+ 339802-339803    2  img 0x0a5eb400  data new /etc/inet/hosts
+ 339824-339825    2  img 0x0a5ee000  cg-header
+ 339840-339843    4  img 0x0a5f0000  inode block (cg 131)
