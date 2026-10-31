@@ -23,6 +23,7 @@ source.
 | `io/paula` | Native Paula audio, `/dev/paula` |
 | `io/random` | `/dev/random`, `/dev/urandom` |
 | `io/hydra` | Hydra Systems AmigaNet Ethernet |
+| `io/zz9000` | MNT ZZ9000 framebuffer and console |
 | `io/z3660net` | Z3660 onboard Ethernet, by Jussi Alanärä |
 | `io/z3660scsi` | Z3660 SD storage as SCSI, by Jussi Alanärä |
 | `io/soft3d` | soft3D RTG 3D, with Jussi Alanärä |
