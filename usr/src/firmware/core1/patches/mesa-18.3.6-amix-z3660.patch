@@ -638,10 +638,10 @@ index 6363701..3ae99a6 100644
     for (i = 0; i < sp->num_vertex_buffers; i++) {
 diff --git a/src/gallium/drivers/softpipe/sp_fast.c b/src/gallium/drivers/softpipe/sp_fast.c
 new file mode 100644
-index 0000000..61373d5
+index 0000000..d2f58f1
 --- /dev/null
 +++ b/src/gallium/drivers/softpipe/sp_fast.c
-@@ -0,0 +1,2443 @@
+@@ -0,0 +1,2490 @@
 +/*
 + * sp_fast.c -- see sp_fast.h.
 + *
@@ -679,7 +679,7 @@ index 0000000..61373d5
 +static void pick_level(const struct sp_fast_tex *t, float lambda, int *level, int *linear);
 +static inline unsigned to8(float v);
 +static inline uint32_t pack(unsigned r, unsigned g, unsigned b, unsigned a);
-+enum { BLEND_NONE, BLEND_MODULATE, BLEND_ALPHA, BLEND_ADD, BLEND_GENERIC };
++enum { BLEND_NONE, BLEND_MODULATE, BLEND_ALPHA, BLEND_ADD, BLEND_MODADD, BLEND_ALPHAADD, BLEND_GENERIC };
 +enum { FOG_NONE, FOG_EXP, FOG_LINEAR };
 +
 +
@@ -1336,6 +1336,12 @@ index 0000000..61373d5
 +         else if (rs == PIPE_BLENDFACTOR_ONE && rd == PIPE_BLENDFACTOR_ONE &&
 +                  as == PIPE_BLENDFACTOR_ONE && ad == PIPE_BLENDFACTOR_ONE)
 +            f->blend_kind = BLEND_ADD;
++         else if (rs == PIPE_BLENDFACTOR_DST_COLOR && rd == PIPE_BLENDFACTOR_ONE &&
++                  as == PIPE_BLENDFACTOR_DST_COLOR && ad == PIPE_BLENDFACTOR_ONE)
++            f->blend_kind = BLEND_MODADD;
++         else if (rs == PIPE_BLENDFACTOR_SRC_ALPHA && rd == PIPE_BLENDFACTOR_ONE &&
++                  as == PIPE_BLENDFACTOR_SRC_ALPHA && ad == PIPE_BLENDFACTOR_ONE)
++            f->blend_kind = BLEND_ALPHAADD;
 +      }
 +   }
 +
@@ -1388,6 +1394,8 @@ index 0000000..61373d5
 +
 +   if ((f->u[1].in >= 0 || f->fog_kind) && !f->fixed)
 +      return why(13);             /* fast_span() has one unit and no fog */
++   f->zonly = f->fixed && f->colormask == 0 && f->u[0].in < 0 && f->u[1].in < 0 &&
++              f->afunc == PIPE_FUNC_ALWAYS && f->zformat && !f->fog_kind;
 +   if (f->fixed)
 +      choose_span(f);
 +
@@ -2330,6 +2338,12 @@ index 0000000..61373d5
 +                  const uint8x8_t a = vtbl1_u8(s2, vld1_u8(alpha_idx));
 +
 +                  s2 = n_div255(vmlal_u8(vmull_u8(s2, a), d2, vmvn_u8(a)));
++               } else if (BK == BLEND_MODADD) {
++                  s2 = vqadd_u8(n_mod(s2, d2), d2);
++               } else if (BK == BLEND_ALPHAADD) {
++                  static const uint8_t alpha_idx[8] = { 3, 3, 3, 3, 7, 7, 7, 7 };
++
++                  s2 = vqadd_u8(n_mod(s2, vtbl1_u8(s2, vld1_u8(alpha_idx))), d2);
 +               } else {
 +                  s2 = vqadd_u8(s2, d2);
 +               }
@@ -2458,6 +2472,19 @@ index 0000000..61373d5
 +      zacc = (uint32_t)z0;
 +      dz = f->ZDX;
 +      zsh = fb;
++   }
++
++   if (NT == 0 && BK == BLEND_NONE && zp && z16 && !zfloat && f->zonly) {
++      /* a depth pass: nothing but the test and the Z store */
++      const boolean zw = f->zwrite;
++
++      for (x = x0; x < x1; x++, zacc += (uint32_t)dz, zp += 2) {
++         const unsigned z = zacc >> zsh, old = *(const ushort *)zp;
++
++         if ((ZK == 1 ? z <= old : ZK == 2 ? z == old : ZK == 3 ? z < old : test(f->zfunc, z, old)) && zw)
++            *(ushort *)zp = (ushort)z;
++      }
++      return;
 +   }
 +
 +   for (x = x0; x < x1; ) {
@@ -2645,6 +2672,10 @@ index 0000000..61373d5
 +                  const uint8x8_t a = vdup_lane_u8(s8, 3);
 +
 +                  s8 = n_div255(vmlal_u8(vmull_u8(s8, a), d8, vmvn_u8(a)));
++               } else if (BK == BLEND_MODADD) {
++                  s8 = vqadd_u8(n_mod(s8, d8), d8);
++               } else if (BK == BLEND_ALPHAADD) {
++                  s8 = vqadd_u8(n_mod(s8, vdup_lane_u8(s8, 3)), d8);
 +               } else {
 +                  s8 = vqadd_u8(s8, d8);
 +               }
@@ -2710,6 +2741,21 @@ index 0000000..61373d5
 +                       MIN2(B(src) + B(d), 255), MIN2(A(src) + A(d), 255));
 +            break;
 +         }
++         case BLEND_MODADD: {
++            const uint32_t d = load_pixel(f, cp);
++
++            src = pack(MIN2(mul255(R(src), R(d)) + R(d), 255), MIN2(mul255(G(src), G(d)) + G(d), 255),
++                       MIN2(mul255(B(src), B(d)) + B(d), 255), MIN2(mul255(A(src), A(d)) + A(d), 255));
++            break;
++         }
++         case BLEND_ALPHAADD: {
++            const uint32_t d = load_pixel(f, cp);
++            const unsigned a = A(src);
++
++            src = pack(MIN2(mul255(R(src), a) + R(d), 255), MIN2(mul255(G(src), a) + G(d), 255),
++                       MIN2(mul255(B(src), a) + B(d), 255), MIN2(mul255(a, a) + A(d), 255));
++            break;
++         }
 +         default:
 +            src = blend_generic(f, src, load_pixel(f, cp));
 +         }
@@ -2723,20 +2769,21 @@ index 0000000..61373d5
 +#define SPAN_FN(Z, N, B) \
 +   static void span_##Z##_##N##_##B(SPAN_ARGS) { span_tmpl(f, coef, pos, y, x0, x1, Z, N, B, 0); } \
 +   static void nspan_##Z##_##N##_##B(SPAN_ARGS) { span_tmpl(f, coef, pos, y, x0, x1, Z, N, B, B != BLEND_GENERIC); }
-+#define SPAN_B(Z, N) SPAN_FN(Z, N, 0) SPAN_FN(Z, N, 1) SPAN_FN(Z, N, 2) SPAN_FN(Z, N, 3) SPAN_FN(Z, N, 4)
++#define SPAN_B(Z, N) SPAN_FN(Z, N, 0) SPAN_FN(Z, N, 1) SPAN_FN(Z, N, 2) SPAN_FN(Z, N, 3) SPAN_FN(Z, N, 4) \
++                     SPAN_FN(Z, N, 5) SPAN_FN(Z, N, 6)
 +#define SPAN_N(Z) SPAN_B(Z, 0) SPAN_B(Z, 1) SPAN_B(Z, 2)
 +SPAN_N(0) SPAN_N(1) SPAN_N(2) SPAN_N(3) SPAN_N(4)
 +
 +#define TAB_B(Z, N) { span_##Z##_##N##_0, span_##Z##_##N##_1, span_##Z##_##N##_2, \
-+                      span_##Z##_##N##_3, span_##Z##_##N##_4 }
++                      span_##Z##_##N##_3, span_##Z##_##N##_4, span_##Z##_##N##_5, span_##Z##_##N##_6 }
 +#define TAB_N(Z) { TAB_B(Z, 0), TAB_B(Z, 1), TAB_B(Z, 2) }
-+static void (*const span_tab[5][3][5])(SPAN_ARGS) = {
++static void (*const span_tab[5][3][7])(SPAN_ARGS) = {
 +   TAB_N(0), TAB_N(1), TAB_N(2), TAB_N(3), TAB_N(4)
 +};
 +#define NTAB_B(Z, N) { nspan_##Z##_##N##_0, nspan_##Z##_##N##_1, nspan_##Z##_##N##_2, \
-+                       nspan_##Z##_##N##_3, nspan_##Z##_##N##_4 }
++                       nspan_##Z##_##N##_3, nspan_##Z##_##N##_4, nspan_##Z##_##N##_5, nspan_##Z##_##N##_6 }
 +#define NTAB_N(Z) { NTAB_B(Z, 0), NTAB_B(Z, 1), NTAB_B(Z, 2) }
-+static void (*const nspan_tab[5][3][5])(SPAN_ARGS) = {
++static void (*const nspan_tab[5][3][7])(SPAN_ARGS) = {
 +   NTAB_N(0), NTAB_N(1), NTAB_N(2), NTAB_N(3), NTAB_N(4)
 +};
 +
@@ -2930,7 +2977,7 @@ index 0000000..61373d5
 +                        f->neon_ok;
 +
 +   f->span = (neon ? nspan_tab : span_tab)[zk][nt][f->blend_kind];
-+   f->neon_span = neon && f->blend_kind != BLEND_GENERIC;
++   f->neon_span = (neon && f->blend_kind != BLEND_GENERIC) || f->zonly;
 +   if (debug_get_bool_option("SOFTPIPE_FAST_WHY", FALSE) && !f->neon_span) {
 +      /* why not NEON: one line per kind */
 +      static unsigned seen[64];
@@ -3087,10 +3134,10 @@ index 0000000..61373d5
 +}
 diff --git a/src/gallium/drivers/softpipe/sp_fast.h b/src/gallium/drivers/softpipe/sp_fast.h
 new file mode 100644
-index 0000000..1a200ea
+index 0000000..c057774
 --- /dev/null
 +++ b/src/gallium/drivers/softpipe/sp_fast.h
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,193 @@
 +/*
 + * sp_fast.h -- a fixed-function fast path for softpipe's triangles.
 + *
@@ -3195,6 +3242,7 @@ index 0000000..1a200ea
 +   void (*span)(const struct sp_fast *f, const struct tgsi_interp_coef *coef,
 +                const struct tgsi_interp_coef *pos, int y, int x0, int x1);
 +   boolean neon_span;            /* f->span is a NEON one (profile) */
++   boolean zonly;                /* no colour written and no texture: depth only */
 +
 +   /* the fragment shader, analysed once per variant */
 +   const struct sp_fragment_shader_variant *fs;

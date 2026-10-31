@@ -31,7 +31,15 @@ present(const void *rgba, int w, int h)
    {
       const struct mallinfo mi = mallinfo();
 
-      printf("frame %d %dx%d heap %d in use %d\n", ++frames, w, h, (int)mi.arena, (int)mi.uordblks);
+      extern uint64_t sp_fast_prof[16];
+      static uint64_t p[3];
+
+      printf("frame %d %dx%d heap %d in use %d; pixels affine %u perspective %u scalar %u\n", ++frames, w, h,
+             (int)mi.arena, (int)mi.uordblks, (unsigned)(sp_fast_prof[9] - p[0]), (unsigned)(sp_fast_prof[10] - p[1]),
+             (unsigned)(sp_fast_prof[11] - p[2]));
+      p[0] = sp_fast_prof[9];
+      p[1] = sp_fast_prof[10];
+      p[2] = sp_fast_prof[11];
    }
    fflush(stdout);
    if (out && (f = fopen(out, "wb")) != NULL) {
