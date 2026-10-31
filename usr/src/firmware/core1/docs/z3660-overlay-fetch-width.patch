@@ -1,0 +1,67 @@
+From: isoriano1968 <81116077+isoriano1968@users.noreply.github.com>
+Subject: [PATCH] video: overlay VDMA fetches only the overlay's width
+
+At 1920x1080 the overlay VDMA fetched full screen-width lines (1920 beats
+of 32 bits), which do not fit into one output line: the VDMA slipped to one
+buffer row every second line and the overlay came out twice as tall and
+shifted (screen line L showed buffer row L/2).
+
+Fetch only overlay_w pixels of each line; the stride stays a full screen
+line, so the rows the MPEG decoder writes (pitch vmode_hsize * 4, columns
+0..w-1 at row y + overlay_y) are read as before.  enable_overlay() (INIT,
+and every write of REG_ZZ_OVERLAY_HEIGHT) reconfigures the VDMA when the
+width changed; it is started again at the next vsync as before.
+
+Untested: written against master 97d7dda without a Vitis build.  Points
+to check: the old comment "changing this breaks the output" on
+HoriSizeInput (it came from the main VDMA's setup); init_vdma_ovl()
+sleeps 10 ms, now also from the register handler; overlay widths that
+are not a multiple of 2 are rounded up.
+
+diff --git a/z3660-firmware/Z-TURN/vitis_ide/Z3660/src/video.c b/z3660-firmware/Z-TURN/vitis_ide/Z3660/src/video.c
+index 8e9a720..c3c5a79 100644
+--- a/z3660-firmware/Z-TURN/vitis_ide/Z3660/src/video.c
++++ b/z3660-firmware/Z-TURN/vitis_ide/Z3660/src/video.c
+@@ -342,8 +342,28 @@ void video_reset(void) {
+    pl_mpeg_arm_close();
+    cached_videomode=-1;
+ }
++// How many pixels of each buffer line the overlay VDMA fetches (see
++// init_vdma_ovl).  At 1920x1080 a full-width fetch (1920 beats of 32 bits)
++// does not fit into one output line, so the VDMA slipped to one buffer row
++// every second line and the overlay came out twice as tall.
++static int ovl_fetch_w = -1;
++
++static int overlay_fetch_width(int hsize)
++{
++   int w = overlay_w;
++   if (w <= 0 || w > hsize)
++      w = hsize;
++   return (w + 1) & ~1; // even, so a line is a multiple of 8 bytes
++}
++
+ void enable_overlay(void)
+ {
++   // the fetch width follows the overlay's width: reconfigure the VDMA when
++   // it changed (it is started again at the next vsync, below)
++   if (overlay_fetch_width(vs.vmode_hsize) != ovl_fetch_w) {
++      stop_vdma_ovl();
++      init_vdma_ovl(vs.vmode_hsize, vs.vmode_vsize, 1, 1, RTG_BASE+0x06000000);
++   }
+    video_formatter_write((overlay_y << 16) | overlay_x, MNTVF_OP_OVERLAY_XY);
+    video_formatter_write((overlay_h << 16) | overlay_w, MNTVF_OP_OVERLAY_WH);
+    video_formatter_write(1, MNTVF_OP_OVERLAY_ENABLE);
+@@ -948,7 +968,12 @@ int init_vdma_ovl(int hsize, int vsize, int hdiv, int vdiv, uint32_t bufpos) {
+    //printf("VDMA HDIV: %d VDIV: %d\n", hdiv, vdiv);
+ 
+    OVL_ReadCfg.VertSizeInput = vsize / vdiv;
+-   OVL_ReadCfg.HoriSizeInput = (hsize * (OVL_Config->Mm2SStreamWidth >> 3)) / hdiv; // note: changing this breaks the output
++   // Fetch only the overlay's width of each line: the stride stays a full
++   // screen line (the MPEG decoder writes rows with pitch vmode_hsize * 4),
++   // the line buffer in video_formatter.v starts over at each TLAST and is
++   // read at counter_x - overlay_x, so column 0 is the overlay's first pixel.
++   ovl_fetch_w = overlay_fetch_width(hsize);
++   OVL_ReadCfg.HoriSizeInput = (ovl_fetch_w * (OVL_Config->Mm2SStreamWidth >> 3)) / hdiv;
+    OVL_ReadCfg.FrameDelay = 0; /* This example does not test frame delay */
+    OVL_ReadCfg.EnableCircularBuf = 1; /* Only 1 buffer, continuous loop */
+    OVL_ReadCfg.EnableSync = 0; /* Gen-Lock */

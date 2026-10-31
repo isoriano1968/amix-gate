@@ -1,0 +1,143 @@
+From: isoriano1968 <81116077+isoriano1968@users.noreply.github.com>
+Subject: [PATCH] video, pl_mpeg: double-buffer the MPEG overlay
+
+The MPEG decoder wrote every frame straight into the overlay buffer being
+shown, so lines tore while a frame was drawn.  Now there are two buffers:
+the decoder draws into the one not shown (overlay_back_buffer()) and asks
+for a flip (overlay_flip()); the vblank interrupt points the overlay VDMA
+at it (XAxiVdma_DmaSetBufferAddr, taken at the VDMA's next frame start).
+Before drawing the next frame the decoder waits for a pending flip, at
+most 50 ms.
+
+Also fixes the L2 flush after a frame: it covered rows 0..height-1 of the
+buffer, but the frame is written at rows overlay_y..overlay_y+height-1, so
+part of it could stay in the cache.
+
+Applies on top of "video: overlay VDMA fetches only the overlay's width".
+
+Untested (no Vitis build here).  To check:
+- the second buffer at RTG_BASE+0x06800000 (8 MB, up to the audio buffers
+  at 0x07000000): memorymap.h does not allocate this area, so nothing else
+  (P96 card memory?) may use it;
+- whether the vblank interrupt can run while the MPEG decoder runs (it is
+  called from the register handler); if not, the wait for the flip always
+  times out (50 ms) and the flip has to be made differently, e.g. by
+  polling the vblank state before drawing;
+- whether XAxiVdma_DmaSetBufferAddr on the running read channel really
+  takes the new address at the next frame without a restart.
+
+diff --git a/z3660-firmware/Z-TURN/vitis_ide/Z3660/src/mpg/pl_mpeg_arm/pl_mpeg_handler.c b/z3660-firmware/Z-TURN/vitis_ide/Z3660/src/mpg/pl_mpeg_arm/pl_mpeg_handler.c
+index 295bbd3..9adb1e4 100644
+--- a/z3660-firmware/Z-TURN/vitis_ide/Z3660/src/mpg/pl_mpeg_arm/pl_mpeg_handler.c
++++ b/z3660-firmware/Z-TURN/vitis_ide/Z3660/src/mpg/pl_mpeg_arm/pl_mpeg_handler.c
+@@ -64,6 +64,8 @@ extern int16_t overlay_h;
+ extern int overlay_is_enabled;
+ void enable_overlay(void);
+ void disable_overlay(void);
++uint32_t *overlay_back_buffer(void);
++void overlay_flip(void);
+ // Anti-aliasing intensity control (1-10, higher = more smoothing)
+ int dithering_intensity = 0;
+ // Grayscale mode flag (0 = color, 1 = grayscale)
+@@ -517,7 +519,7 @@ static void pl_mpeg_video_callback(plm_t *plm, plm_frame_t *frame, void *user) {
+ // so we can write directly to it without worrying about the pitch or offsets.
+ //            uint32_t *framebuffer = (uint32_t *)be32_to_host(plm_shared->display_frame.framebuffer_addr);
+ //            uint32_t pitch = be32_to_host(plm_shared->display_frame.framebuffer_pitch);
+-        uint32_t *ovl_framebuffer = (uint32_t *)(RTG_BASE+0x06000000);//(uint32_t *)be32_to_host(plm_shared->display_frame.framebuffer_addr);
++        uint32_t *ovl_framebuffer = overlay_back_buffer(); // double buffered: the one not shown
+         uint32_t ovl_pitch = vs.vmode_hsize * 4; // Calculate pitch based on video mode width and 4 bytes per pixel
+             
+         if (ovl_framebuffer && ovl_pitch > 0) {
+@@ -805,7 +807,10 @@ static void pl_mpeg_video_callback(plm_t *plm, plm_frame_t *frame, void *user) {
+             // Show FPS overlay on framebuffer for debugging
+             if(show_fps)
+                 draw_fps_overlay(ovl_framebuffer, width, height, ovl_pitch);
+-            Xil_L2CacheFlushRange((uintptr_t)ovl_framebuffer, height * ovl_pitch);
++            // the frame is at rows overlay_y.. (it was flushed from row 0)
++            Xil_L2CacheFlushRange((uintptr_t)(ovl_framebuffer + (overlay_y > 0 ? overlay_y : 0) * (ovl_pitch / 4)),
++                                  height * ovl_pitch);
++            overlay_flip();
+         } else {
+             printf("[PL_MPEG ARM] WARNING: Invalid framebuffer address or pitch\n");
+         }
+diff --git a/z3660-firmware/Z-TURN/vitis_ide/Z3660/src/video.c b/z3660-firmware/Z-TURN/vitis_ide/Z3660/src/video.c
+index c3c5a79..1039dae 100644
+--- a/z3660-firmware/Z-TURN/vitis_ide/Z3660/src/video.c
++++ b/z3660-firmware/Z-TURN/vitis_ide/Z3660/src/video.c
+@@ -342,6 +342,41 @@ void video_reset(void) {
+    pl_mpeg_arm_close();
+    cached_videomode=-1;
+ }
++// Overlay double buffering: the MPEG decoder writes a frame into the back
++// buffer and asks for a flip; the vblank interrupt makes it by pointing the
++// overlay VDMA at that buffer.  Before, frames were written into the buffer
++// being shown (torn lines).
++#define OVL_BUFFER0 (RTG_BASE+0x06000000)
++#define OVL_BUFFER1 (RTG_BASE+0x06800000) // FIXME: 8 MB up to the audio buffers at 0x07000000, check nothing else uses it
++static uint32_t ovl_front = OVL_BUFFER0;
++static volatile uint32_t ovl_flip_to;   // a flip asked for, made at the next vblank
++
++static void overlay_set_buffer(uint32_t addr)
++{
++   OVL_ReadCfg.FrameStoreStartAddr[0] = addr;
++   XAxiVdma_DmaSetBufferAddr(&vdma_ovl, XAXIVDMA_READ, OVL_ReadCfg.FrameStoreStartAddr);
++}
++
++// the buffer to draw the next frame into
++uint32_t *overlay_back_buffer(void)
++{
++   // the last flip not made yet: that buffer is about to be shown.  Bounded,
++   // in case no vblank comes (50 ms)
++   for (int i = 0; ovl_flip_to && overlay_is_enabled && i < 1000; i++)
++      usleep(50);
++   if (ovl_flip_to) {      // overlay not running: no vblank will take it
++      ovl_front = ovl_flip_to;
++      ovl_flip_to = 0;
++   }
++   return (uint32_t *)(ovl_front == OVL_BUFFER0 ? OVL_BUFFER1 : OVL_BUFFER0);
++}
++
++// the back buffer holds a whole frame: show it from the next vblank on
++void overlay_flip(void)
++{
++   ovl_flip_to = ovl_front == OVL_BUFFER0 ? OVL_BUFFER1 : OVL_BUFFER0;
++}
++
+ // How many pixels of each buffer line the overlay VDMA fetches (see
+ // init_vdma_ovl).  At 1920x1080 a full-width fetch (1920 beats of 32 bits)
+ // does not fit into one output line, so the VDMA slipped to one buffer row
+@@ -362,7 +397,7 @@ void enable_overlay(void)
+    // it changed (it is started again at the next vsync, below)
+    if (overlay_fetch_width(vs.vmode_hsize) != ovl_fetch_w) {
+       stop_vdma_ovl();
+-      init_vdma_ovl(vs.vmode_hsize, vs.vmode_vsize, 1, 1, RTG_BASE+0x06000000);
++      init_vdma_ovl(vs.vmode_hsize, vs.vmode_vsize, 1, 1, ovl_front);
+    }
+    video_formatter_write((overlay_y << 16) | overlay_x, MNTVF_OP_OVERLAY_XY);
+    video_formatter_write((overlay_h << 16) | overlay_w, MNTVF_OP_OVERLAY_WH);
+@@ -1066,8 +1101,16 @@ void isr_video(void *dummy)
+          video_formatter_write(0, MNTVF_OP_PALETTE_SEL);
+       }
+       init_vdma_irq(vs.vmode_hsize, vs.vmode_vsize, vs.vmode_hdiv, vs.vmode_vdiv, ((uint32_t)vs.framebuffer) + vs.framebuffer_pan_offset);
++      if(ovl_flip_to && overlay_is_enabled)
++      {
++         // the VDMA takes a new address at its next frame start
++         overlay_set_buffer(ovl_flip_to);
++         ovl_front = ovl_flip_to;
++         ovl_flip_to = 0;
++      }
+       if(enable_overlay_on_next_vsync)
+       {
++         overlay_set_buffer(ovl_front);
+          start_vdma_ovl();
+          enable_overlay_on_next_vsync=0;
+          overlay_is_enabled=1;
+@@ -1244,7 +1287,7 @@ void video_system_init(zz_video_mode *mode, int hdiv, int vdiv) {
+    set_pixelclock(mode);
+    sii9022_init(mode);
+    init_vdma_vid(mode->hres, mode->vres, hdiv, vdiv, (uint32_t)vs.framebuffer + vs.framebuffer_pan_offset);
+-   init_vdma_ovl(mode->hres, mode->vres, 1, 1, RTG_BASE+0x06000000); // overlay always uses full res and 32-bit pixels, so hdiv=1, vdiv=1
++   init_vdma_ovl(mode->hres, mode->vres, 1, 1, ovl_front); // overlay always uses full res and 32-bit pixels, so hdiv=1, vdiv=1
+    if(overlay_is_enabled)
+       enable_overlay_on_next_vsync=1;
+ }

@@ -78,7 +78,7 @@ time; MP2 can stay on the 060.
 Not video, but the same ring: vertices and matrices to the board, the ARM
 transforms, clips and lights.  After step 1, when the ARM has room.
 
-## Found in the firmware (shanshe/Z3660, upstream Z3660 checkout, 2026-10-29)
+## Found in the firmware (shanshe/Z3660, ~/Sources/usr-amix/upstream/Z3660, 2026-10-29)
 
 Board: Z-turn MYS-7Z020 (Zynq-7020, two Cortex-A9 with NEON); firmware in
 z3660-firmware/Z-TURN/vitis_ide/Z3660/src (bare metal, Xilinx Vitis).

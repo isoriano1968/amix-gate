@@ -6,7 +6,7 @@ CC      := $(CROSS_COMPILE)gcc
 SIZE    := $(CROSS_COMPILE)size
 OBJCOPY := $(CROSS_COMPILE)objcopy
 
-Z3660   ?= $(abspath ../../../Z3660)
+Z3660   ?= $(abspath ../../../../../../../upstream/Z3660-beta21)
 BSP     := $(Z3660)/z3660-firmware/Z-TURN/vitis_ide/design_1_wrapper/ps7_cortexa9_1/standalone_ps7_cortexa9_1/bsp/ps7_cortexa9_1
 # xil-crt0.o is not in the Z3660 repo: assembled from the BSP's xil-crt0.S
 BSP_CRT0_DIR ?= build

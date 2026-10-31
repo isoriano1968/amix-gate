@@ -1,7 +1,8 @@
 # fetched or built locally
-/ffmpeg-4.4.8/
+/ffmpeg-4.4.8
 /build-arm/
 /src/
+/dl/
 /build/arm/
 /build/host/
 /build/amix/
