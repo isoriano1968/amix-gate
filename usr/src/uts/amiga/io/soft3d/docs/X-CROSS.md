@@ -4,7 +4,7 @@ Running log and recipe for the X lane (started 2026-09-17: X on RTG with olwm
 etc., via the cross route). Everything here is measured unless marked *plan*. Work dir:
 `2026-09-18-xzz9000-cross/` (`src/xc` = the prepared tree, `log/` = every command's
 output, `imakecpp.sh` = the host preprocessor wrapper). Upstream is never edited: the
-reference clone of https://github.com/isoriano1968/x11r6.3-amix at **cb61a21** (= upstream head,
+reference clone of https://github.com/isoriano1968/amix-userland/tree/main/components/x11/x11r6.3 at **cb61a21** (= upstream head,
 confirmed 2026-09-18); every deviation lives in the build tree and is
 listed under "Deviations" with the question it raises for isoriano.
 

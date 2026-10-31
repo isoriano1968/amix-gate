@@ -2,7 +2,7 @@ amix-z3660rtg
 =============
 
 This repository is a fork of isoriano1968/zz9000-amix
-(https://github.com/isoriano1968/zz9000-amix), MIT licence,
+(https://github.com/isoriano1968/amix-gate/tree/main/usr/src/uts/amiga/io/zz9000), MIT licence,
 Copyright (c) 2026 Ignacio Soriano. LICENSE is upstream's, unchanged.
 
 The Z3660 RTG target, the x11/ kit, the bench tools and the documentation
@@ -14,7 +14,7 @@ x11/bench/x11perf-baseline.sh is adapted from Antti Sokero's xrtg-amix
 Copyright (c) 2025-2026 Antti Sokero.
 
 The patches in x11/patches/ modify isoriano1968/x11r6.3-amix
-(https://github.com/isoriano1968/x11r6.3-amix, MIT licence) and the X11R6.3
+(https://github.com/isoriano1968/amix-userland/tree/main/components/x11/x11r6.3, MIT licence) and the X11R6.3
 sources (X Consortium licence). Each patch is under the licence of the file
 it modifies.
 

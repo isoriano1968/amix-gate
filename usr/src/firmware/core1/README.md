@@ -22,7 +22,7 @@ ioquake3 at 640x480 at about 6-7 fps.
 
 - `tools/armbench.c`: the AMIX loader: `-load`, `-reload`, `-dump`.
 - `tools/ztop.c`: the board's and core 1's state as text. The CDE window is
-  `ztopcde` in [cde-apps-amix](https://github.com/isoriano1968/cde-apps-amix).
+  `ztopcde` in [cde-apps-amix](https://github.com/isoriano1968/amix-userland/tree/main/components/desktop/cde-apps).
 - `tools/ovloff.c`: frees a player left running and switches the overlay off.
 - `tools/glshow.c`, `tools/zzglstat.c`: GL demo on the overlay, statistics.
 - `zzgl/`: the GL protocol: 68k encoder, core 1 decoder. `bench/`: the scenes.

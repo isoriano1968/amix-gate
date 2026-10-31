@@ -4,7 +4,7 @@
 
 The Z3660 RTG driver for AMIX, continued from
 [jusii/amix-z3660rtg](https://github.com/jusii/amix-z3660rtg) (itself a fork of
-[isoriano1968/zz9000-amix](https://github.com/isoriano1968/zz9000-amix)), as it runs on an
+[isoriano1968/zz9000-amix](https://github.com/isoriano1968/amix-gate/tree/main/usr/src/uts/amiga/io/zz9000)), as it runs on an
 Amiga 3000 with a Z3660 and a real 68060 under the
 [68040/68060 kernel port](https://github.com/asokero/amix-040-060-port).
 
@@ -33,7 +33,7 @@ Everything else below is amix-z3660rtg's own README, unchanged.
 
 ## This fork: the Z3660 RTG target (amix-z3660rtg)
 
-This is a fork of [isoriano1968/zz9000-amix](https://github.com/isoriano1968/zz9000-amix)
+This is a fork of [isoriano1968/zz9000-amix](https://github.com/isoriano1968/amix-gate/tree/main/usr/src/uts/amiga/io/zz9000)
 (MIT, Ignacio Soriano; `LICENSE` is upstream's, unchanged; see `NOTICE` for this fork's
 additions). It adds the Z3660 accelerator's onboard RTG as a second target. The registers stay
 ZZ9000-compatible, `/dev/zz9000` stays at major 49 and the ioctl ABI does not change. The Z3660
@@ -65,7 +65,7 @@ left unchanged.
   assembled with [amix-kerntools](https://github.com/jusii/amix-kerntools), which builds this
   driver through its `make=ZZ9K_TARGET=…` record (`DESIGN.md` §4.2).
 - **X server.** `docs/X-CROSS.md` cross-builds isoriano's
-  [x11r6.3-amix](https://github.com/isoriano1968/x11r6.3-amix) `Xzz9000` with
+  [x11r6.3-amix](https://github.com/isoriano1968/amix-userland/tree/main/components/x11/x11r6.3) `Xzz9000` with
   [gcc-cross-amix](https://github.com/jusii/gcc-cross-amix) and the patches in `x11/patches/`.
   It needs an AMIX sysroot copied from an installed system. `docs/X-INSTALL-RTG.md` puts the
   result on a disk image; `x11/README.md` lists the kit.
