@@ -1,0 +1,388 @@
+| mainmarks.s -- SWITCH BUILD with DIRECT-SERIAL trace markers (2026-06-23).
+|
+| GOAL: see, as plain text on the serial line, EXACTLY how far the 040 context-switch
+| build gets and where it diverges.  cmn_err/printf are useless for this: they buffer into
+| the SVR4 STREAMS console-log and only surface once the log queue is serviced -- in an
+| unhealthy boot that drain may never run, so a cmn_err "marker" can be silently lost.
+| Therefore every key point ALSO drops a single character STRAIGHT to serdat (serdbg_mark),
+| synchronously, the instant its code runs.  The proven serdbg conputc hook still mirrors the
+| normal console (banner etc.) to serial, so one serial log shows BOTH streams:
+|   - banner / cmn_err TEXT  = the STREAMS-drained console path (proves drain happened)
+|   - single chars P S W R J I r = direct markers (prove raw code execution reached that point)
+|
+| Marker legend (direct, synchronous -- always appear if the code runs):
+|   P = schedpaging entered  (swapconf returned -> proc-1 setup; this is AFTER the banner)
+|   S = sched entered        (proc 0 swapper; all 4 daemons created)
+|   W = about to jsr swtch    (first real 040 context switch)
+|   R = resume entered        (swtch picked a proc to dispatch)
+|   J = resume about to jmp    (context restored; jumping to the proc's resume PC)
+|   I = idle entered          (swtch found maxrunpri==-1; nothing runnable)
+|   r = swtch RETURNED to sched (switched back to proc 0, or no transfer)
+|
+| Reading the log:
+|   banner TEXT present            -> boot healthy to the banner (STREAMS drains pre-sched).
+|   P present                      -> reached proc-1 setup (post-banner) synchronously.
+|   S then W then R then J ...      -> the switch chain runs; J + forward progress = transfer.
+|   J present but nothing after     -> child's saved 040 context is bad (resume jmp'd to junk).
+|   I present                      -> swtch idled (maxrunpri==-1: no child visible to swtch).
+|   r present                      -> swtch returned without transferring.
+| The FIRST marker that the baseline shows but this build does NOT pins the divergence point.
+
+	.text
+| ---------------------------------------------------------------------------
+| serdbg_mark(ch) -- emit ONE char DIRECTLY on the Amiga serial port, bypassing coputc AND
+| the STREAMS console-log drain.  Fully register-preserving (saves d0-d1/a0-a1).  serper is
+| set once (idempotent with serdbg_putc).  Bounded TBE wait so it never hangs.
+	.globl	serdbg_mark
+serdbg_mark:
+	linkw	%fp,&0
+	moveml	%d0-%d1/%a0-%a1,%sp@-
+	movel	%fp@(8),%d0		| d0 = ch
+	movel	&0x00dff000,%a0		| custom-chip base
+	tstw	Lmk_init
+	bnew	Lmk_go
+	movew	&1,Lmk_init
+	movew	&0x0174,%a0@(0x32)	| serper = 9600 baud divisor
+Lmk_go:
+	andiw	&0x00ff,%d0
+	oriw	&0x0100,%d0		| STOPBIT | ch
+	movew	%sr,%sp@-		| ISSUE-23: mask ints, TBE wait BEFORE write
+	oriw	&0x0700,%sr		| (interrupt putc overwrote SERDAT mid-window)
+	movel	&0x00010000,%d1		| bounded TBE wait
+Lmk_wait:
+	btst	&5,%a0@(0x18)		| TBE = word bit13 = bit5 of serdatr HIGH byte
+	bnew	Lmk_send
+	subql	&1,%d1
+	bnew	Lmk_wait
+Lmk_send:
+	movew	%d0,%a0@(0x30)		| serdat <- byte (buffer known empty)
+	movew	%sp@+,%sr		| restore IPL
+Lmk_done:
+	moveml	%sp@+,%d0-%d1/%a0-%a1
+	unlk	%fp
+	rts
+
+| ---------------------------------------------------------------------------
+| serdbg_hex(val) -- emit val as 8 hex digits (MSB first) DIRECTLY on serial, bypassing the
+| STREAMS drain.  Fully register-preserving.  Used to dump curproc@252 (u_va) at resume entry
+| so we can see WHY the remap path was (or wasn't) taken.
+	.globl	serdbg_hex
+serdbg_hex:
+	linkw	%fp,&0
+	moveml	%d0-%d3/%a0-%a1,%sp@-
+	movel	%fp@(8),%d2		| d2 = val
+	movel	&0x00dff000,%a1		| custom-chip base
+	tstw	Lmk_init
+	bnew	Lhx_start
+	movew	&1,Lmk_init
+	movew	&0x0174,%a1@(0x32)	| serper = 9600
+Lhx_start:
+	moveq	&7,%d3			| 8 nibbles
+Lhx_next:
+	roll	&4,%d2			| rotate MSB nibble into the low 4 bits
+	movel	%d2,%d0
+	andiw	&0x000f,%d0
+	cmpiw	&9,%d0
+	bhiw	Lhx_alpha
+	addiw	&0x30,%d0		| '0'..'9'
+	braw	Lhx_emit
+Lhx_alpha:
+	addiw	&0x37,%d0		| 'A'..'F'
+Lhx_emit:
+	andiw	&0x00ff,%d0
+	oriw	&0x0100,%d0		| STOPBIT | digit
+	movew	%sr,%sp@-		| ISSUE-23: mask ints, TBE wait BEFORE write
+	oriw	&0x0700,%sr
+	movel	&0x00008000,%d1		| bounded TBE wait
+Lhx_wait:
+	btst	&5,%a1@(0x18)		| TBE = word bit13 = bit5 of serdatr HIGH byte
+	bnew	Lhx_send
+	subql	&1,%d1
+	bnew	Lhx_wait
+Lhx_send:
+	movew	%d0,%a1@(0x30)		| serdat <- digit (buffer known empty)
+	movew	%sp@+,%sr		| restore IPL
+Lhx_after:
+	dbra	%d3,Lhx_next
+	moveml	%sp@+,%d0-%d3/%a0-%a1
+	unlk	%fp
+	rts
+
+| ---------------------------------------------------------------------------
+| sched OVERRIDE -- the swapper loop entry (proc 0, called once by main() AFTER all 4
+| daemons are created).  THIS BUILD performs the real first context switch.
+| Mechanism: --weaken-symbol sched makes main's `jsr sched` resolve here (detour-jmp entry
+| into relinked code Line-F-crashes on this 040; jsr-override entry works -- see git log).
+| Drops 'S' (entered) + 'W' (about to switch) directly to serial, calls the stock 040 swtch
+| (binary, pmove crp->movec urp already patched), then 'r' if swtch ever returns, then halts.
+	.globl	sched
+sched:
+	linkw	%fp,&0
+	pea	0x53			| 'S' -- sched entered (direct serial)
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	movel	maxrunpri,%sp@-		| maxrunpri via cmn_err (STREAMS -- may or may not surface)
+	pea	Lsch_msg
+	pea	2
+	jsr	cmn_err
+	lea	%sp@(12),%sp
+	pea	0x57			| 'W' -- about to enter the swtch loop (first real 040 switch)
+	jsr	serdbg_mark
+	addqw	&4,%sp
+| --- proc-0 swapper LOOP (2026-06-24): keep dispatching instead of halting after one switch.
+|     The old one-shot `jsr swtch; spin` DEADLOCKED init: the moment proc 1 yields (lookuppn
+|     calls preempt(); or any sleep), swtch resumes proc 0 -- which was spinning, so proc 1 was
+|     never re-dispatched -> boot hangs exactly at 'L'.  A real proc-0 loop lets swtch hand the
+|     CPU back to proc 1 (or idle) each time.  'r' prints only the first 8 returns (no spam). ---
+Lsch_loop:
+	jsr	swtch			| dispatch the highest-priority runnable proc (or idle)
+	movel	Lr_n,%d0
+	cmpil	&8,%d0
+	bccw	Lsch_loop
+	addql	&1,%d0
+	movel	%d0,Lr_n
+	pea	0x72			| 'r' -- swtch returned to proc 0 (first 8 only)
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	braw	Lsch_loop
+	nop
+
+| ---------------------------------------------------------------------------
+| schedpaging override RETIRED 2026-07-15: the writeback Model-B group is converted
+| (patch_writeback.py incl. pageoutd sites) and the STOCK schedpaging tuning +
+| pageout daemon must run so page reclaim works.  The one-shot 'P' marker (proved
+| banner+swapconf reached) is long-served; do NOT re-add a rts-body here -- it
+| silently starves page_get under memory pressure (userspace wedge, sac SIGKILL).
+
+| ---------------------------------------------------------------------------
+| idle (GLOBAL T) -- swtch idles here only when maxrunpri==-1.  One-shot 'I' marker (direct)
+| so we can tell "swtch chose to idle" from "swtch transferred to a child".  --weaken-symbol idle.
+|
+| + HANG PROBE (2026-07-03, the "boot stalls but keyboard echoes" frontier): every 2048th idle
+| wakeup (~10-30s; idle wakes on every interrupt), dump the WHOLE proc table via DIRECT serial
+| (works even if STREAMS is wedged): 'W' then " <pid>:<p_stat>:<p_wchan>" per proc (practive
+| chain, p_next@276, p_pidp@264->pid_id@4, p_stat@0, p_wchan@28).  Max 8 dumps per boot.
+| Reading: stat 1=SSLEEP (wchan names WHAT it waits on -- map the address offline),
+| 2=SRUN, 4=SSTOP, 5=SIDL, 6=SONPROC.  NO W-dumps during a hang = the CPU never idles
+| = some process is SPINNING (equally diagnostic).
+	.balign 4			| pad section to a 4-byte multiple (bss placement: rel.c puts .bss at data_end UNALIGNED)
+	.data
+	.even
+Lidw_cnt:
+	.long	0
+Lidw_dumps:
+	.long	0
+	.balign 4			| pad section to a 4-byte multiple (bss placement: rel.c puts .bss at data_end UNALIGNED)
+	.text
+	.globl	idle
+idle:
+	movel	Lidle_n,%d0
+	bnew	Lidle_stop		| already marked once -> just stop
+	moveq	&1,%d0
+	movel	%d0,Lidle_n
+	pea	0x49			| 'I' -- idle entered (direct serial)
+	jsr	serdbg_mark
+	addqw	&4,%sp
+Lidle_stop:
+	addql	&1,Lidw_cnt
+	movel	Lidw_cnt,%d0
+	andil	&0x7ff,%d0		| every 2048th wakeup
+	bnew	Lidw_skip
+	movel	Lidw_dumps,%d0
+	cmpil	&8,%d0
+	bccw	Lidw_skip
+	addql	&1,%d0
+	movel	%d0,Lidw_dumps
+	moveml	%d3/%a2,%sp@-
+	pea	0x57			| 'W' -- proc-table dump follows
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	moveal	practive,%a2
+	moveq	&40,%d3			| bound: max 40 procs
+Lidw_loop:
+	movel	%a2,%d0
+	beqw	Lidw_done
+	pea	0x20
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	movel	%a2@(264),%d0		| p_pidp (guard: 0 for a half-built proc)
+	beqw	Lidw_pid0
+	moveal	%d0,%a0
+	movel	%a0@(4),%sp@-		| pid_id
+	braw	Lidw_pidgo
+Lidw_pid0:
+	clrl	%sp@-
+Lidw_pidgo:
+	jsr	serdbg_hex
+	addqw	&4,%sp
+	pea	0x3a			| ':'
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	clrl	%d0
+	moveb	%a2@,%d0		| p_stat
+	movel	%d0,%sp@-
+	jsr	serdbg_hex
+	addqw	&4,%sp
+	pea	0x3a			| ':'
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	movel	%a2@(28),%sp@-		| p_wchan
+	jsr	serdbg_hex
+	addqw	&4,%sp
+	moveal	%a2@(276),%a2		| p_next
+	subql	&1,%d3
+	bnew	Lidw_loop
+Lidw_done:
+	pea	0x0a
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	moveml	%sp@+,%d3/%a2
+Lidw_skip:
+	stop	&0x2000			| stock idle wait -- let the boot run naturally
+	rts
+	nop
+
+| ---------------------------------------------------------------------------
+| resume (0x9c, GLOBAL T) -- 040 context-switch core, RELIABILITY-FIXED (2026-06-23) +
+| direct markers R (entered) / J (about to jmp).
+| The child's saved context is VALID (measured: a1=0x070418F8 procdup-save, sp=0x40001F40
+| u-area stack).  The earlier instability was NOT a bad context but resume reading it from the
+| FIXED u-area VA (0x40000318) AFTER the remap -- an 040 cache/timing-fragile access that
+| intermittently read stale memory -> garbage a1 -> wild jmp -> guru.
+| FIX: read the saved context from the STABLE kvsegu VA (curproc@252 + 0x318), always live in
+| kptr040.  The uarea_pt remap (+cpusha) is still done so the CHILD's stack (fixed VA
+| 0x40000000) works after transfer, but the jmp target no longer depends on the remap's timing.
+| u_va==0 (proc 0): REMAP VIA PATH U (p_ubptbl) -- ISSUE-7 fix.  The original port skipped
+| the remap here claiming "as stock resume did"; the vanilla disasm (resume @0x9c) DISPROVES
+| that: stock writes *ublksde = arg2 UNCONDITIONALLY, every resume, proc 0 included.  The
+| skip left the fixed VA mapping the PREVIOUS proc's u-pages; proc 0's save/resume pair
+| stayed self-consistent through that stale mapping (same page both ways), so it "worked" --
+| until the previous proc EXITED: swtch's szombflag path segu_release'd those u-pages, they
+| were reused (file data), and the next user-mode preempt read u.u_procp via u+0x730 from
+| the reused page -> garbage p_clfuncs -> `jsr ([44,clfuncs])` -> the recurring
+| PANIC pc=0x4000001E (ktrap_latch-captured stack: preempt+0x18 / u_trap+0x104).
+| Only if p_ubptbl[0] is ALSO empty (pre-p0init early boot, where pstart040's static
+| uarea_pt mapping is live and correct) is skipping still safe.
+| Both serial markers fire on the SAFE (caller / proc 0) stack -- BEFORE the context-restoring
+| movem -- so serdbg_mark never touches the (suspect) new stack.
+| --weaken-symbol resume.  globals: curproc (C), kptr040 (D).
+	.globl	resume
+resume:
+	moveal	curproc,%a1
+	movel	%a1@(252),%d1		| d1 = u_va (new proc's u-area kvsegu VA; 0 for proc 0)
+	moveal	%sp@(4),%a0		| a0 = arg1 = u+0x318 (fixed VA) -- default read source
+	movew	%sr,%d0			| d0 = sr (preserved to the end; serdbg_mark keeps d0)
+	movew	&0x2700,%sr		| mask interrupts for the remap
+	tstl	%d1
+	bnew	Lr_remap		| u_va!=0 -> forked/kvsegu proc: remap (path U/V dispatch)
+| u_va==0 (proc 0): must STILL remap (see header) -- via path U from p_ubptbl.  Guard: if
+| p_ubptbl[0]==0 too (pre-p0init), skip like before; also prevents path V's kptr040 walk
+| with u_va=0 (a negative table index).
+	moveal	curproc,%a3
+	movel	%a3,%d3
+	addil	&95,%d3
+	andil	&0xfffffff0,%d3
+	moveal	%d3,%a3			| a3 = &p_ubptbl = (proc+95)&~15 (same calc as path U)
+	tstl	%a3@
+	beqw	Lr_rest			| no u_va AND no p_ubptbl: early boot, old behaviour safe
+Lr_remap:
+|	--- remap: make the FIXED-VA u-area (uarea_pt[0..1]) point at the NEW proc's u-area pages ---
+|	DUAL SOURCE -- on this 040 port a proc's u-area lives in ONE of two places:
+|	  path U: curproc->p_ubptbl (proc+80) = the embedded 2KB-granular page table; FILLED for proc 0
+|	          (the static u-area).  040 page k <- p_ubptbl[2k] (2KB->4KB), keep the live 040 flags.
+|	  path V: if p_ubptbl[0]==0 (a FORKED proc whose u-area was hat_pteload'd into kvsegu, not into
+|	          p_ubptbl): walk kptr040 for u_va -> the 040 leaf PTEs directly (already 4KB).
+	moveal	kptr040,%a2
+	movel	%a2@,%d2
+	andil	&0xffffff00,%d2		| d2 = uarea_pt base = kptr040[0] & ~0xFF
+	moveal	%d2,%a2			| a2 = uarea_pt
+	moveal	curproc,%a3
+	movel	%a3,%d3
+	addil	&95,%d3
+	andil	&0xfffffff0,%d3
+	moveal	%d3,%a3			| a3 = &p_ubptbl = (proc+95)&~15
+	tstl	%a3@
+	beqw	Lr_kvsegu		| p_ubptbl[0]==0 -> forked proc, walk kvsegu
+|	--- path U: p_ubptbl (proc 0 / static u-area); 2KB click -> 4KB 040 PTE, keep live flags ---
+	movel	%a2@,%d3
+	andil	&0x00000fff,%d3		| d3 = live 040 leaf status flags (e.g. 0x0F9)
+	oril	&0x60,%d3		| CM-B1: normalize CM=11 NC (keep in sync with runtime040.s)
+	movel	%a3@,%d4		| uarea_pt[0] = (p_ubptbl[0] phys & ~0xFFF) | flags
+	andil	&0xfffff000,%d4
+	orl	%d3,%d4
+	movel	%d4,%a2@
+	movel	%a3@(8),%d4		| uarea_pt[1] = (p_ubptbl[2] phys & ~0xFFF) | flags (4KB stride)
+	andil	&0xfffff000,%d4
+	orl	%d3,%d4
+	movel	%d4,%a2@(4)
+	braw	Lr_flush
+Lr_kvsegu:
+|	--- path V: forked proc -- walk kptr040 for u_va & u_va+0x1000 (already 040 4KB leaf PTEs) ---
+	movel	%d1,%d4			| page 0: index kptr040 for u_va
+	moveq	&18,%d5
+	lsrl	%d5,%d4
+	subil	&4096,%d4
+	asll	&2,%d4
+	addl	kptr040,%d4
+	moveal	%d4,%a3
+	movel	%a3@,%d4
+	andil	&0xffffff00,%d4		| leaf table base
+	movel	%d1,%d5
+	lsrl	&8,%d5
+	lsrl	&4,%d5
+	andil	&0x3f,%d5
+	asll	&2,%d5
+	addl	%d5,%d4
+	moveal	%d4,%a3
+	movel	%a3@,%d4		| kvsegu leaf PTE for u_va
+	oril	&0x60,%d4		| CM-B1: normalize CM=11 NC (keep in sync with runtime040.s)
+	movel	%d4,%a2@		| uarea_pt[0]
+	movel	%d1,%d3			| page 1: u_va + 0x1000
+	addil	&0x1000,%d3
+	movel	%d3,%d4
+	moveq	&18,%d5
+	lsrl	%d5,%d4
+	subil	&4096,%d4
+	asll	&2,%d4
+	addl	kptr040,%d4
+	moveal	%d4,%a3
+	movel	%a3@,%d4
+	andil	&0xffffff00,%d4
+	movel	%d3,%d5
+	lsrl	&8,%d5
+	lsrl	&4,%d5
+	andil	&0x3f,%d5
+	asll	&2,%d5
+	addl	%d5,%d4
+	moveal	%d4,%a3
+	movel	%a3@,%d4		| kvsegu leaf PTE for u_va+0x1000
+	oril	&0x60,%d4		| CM-B1: normalize CM=11 NC (keep in sync with runtime040.s)
+	movel	%d4,%a2@(4)		| uarea_pt[1]
+Lr_flush:
+	.word	0xf4f8			| cpusha bc -- push the uarea_pt writes to RAM for the HW tablewalk
+	.word	0xf518			| pflusha -- invalidate the ATC (fixed-VA stack now remaps away!)
+|	a0 = arg1 = u+0x318 = FIXED VA 0x40000318 (loaded at entry, NOT overridden).  After the
+|	remap+pflusha the fixed VA maps to the NEW proc's u-area, so reading 0x40000318 yields the
+|	new proc's saved context -- exactly the stock design (which also reads from the fixed VA).
+Lr_rest:
+|	Restore the new proc's context from a0 = arg1 = FIXED VA u+0x318 (after the remap the fixed
+|	VA maps to the new proc's u-area).  No stack use between pflusha and the jmp -- exactly the
+|	stock resume tail -- because the fixed-VA stack now points at the new proc's u-area.
+	moveml	%a0@,%d2-%d7/%a1-%sp
+	movew	%d0,%sr
+	moveq	&1,%d0
+	jmp	%a1@
+
+	.balign 4			| pad section to a 4-byte multiple (bss placement: rel.c puts .bss at data_end UNALIGNED)
+	.data
+Lsch_msg:
+	.asciz	"DBG sched ENTRY maxrunpri=%x"
+	.even
+Lidle_n:
+	.long	0
+Lr_n:
+	.long	0
+Lmk_init:
+	.word	0
+	.even
+	.balign 4			| pad section to a 4-byte multiple (bss placement: rel.c puts .bss at data_end UNALIGNED)

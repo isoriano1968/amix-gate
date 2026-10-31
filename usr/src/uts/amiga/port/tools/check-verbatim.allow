@@ -1,0 +1,170 @@
+# check-verbatim.allow -- matches that are known, deliberate and defended.
+#
+# TWO FORMS, and the difference is the whole point:
+#
+#     path/prefix/         a reason        every match under the path.  Blunt.  Only where a
+#                                          whole file is interface by construction.
+#     path <span-id>       a reason        ONE span in ONE file.  The normal form.
+#
+# The span id is printed beside every unexplained match; paste it here with a reason.  It is a
+# HASH of the matched text and not the text itself, because writing the quotation into this file
+# would put the borrowed words into the repository in order to record that we decided not to.
+# It also changes when the span changes, so an edited quotation comes back for a fresh decision
+# instead of quietly inheriting this one.
+#
+# Entries here are still REPORTED, so nobody can forget they exist; they just do not fail the
+# check.  Adding one is a decision to be able to defend, not a way to make output quieter.  The
+# question to answer in the reason is always the same: **is this text dictated, or was it
+# chosen?**  If an author could have written it differently and still been correct, it does not
+# belong here -- it belongs rewritten as a description.
+
+include-modelb/	The Model-B header override: <sys/param.h> and <sys/immu.h> with the page shift
+	changed from 11 to 12.  The macros that match -- ptob/btop/btopr, PAGEMASK, PAGEOFFSET,
+	phystopfn, pfntophys, kvtopfn and the mmu_* forms -- are the kernel's compile-time ABI.
+	Code compiled against them must agree with the kernel bit for bit, so their form is
+	dictated by the interface: there is no other way to write "shift by the page shift" that
+	still interoperates.  What this port changed is the constant; what it kept is the only
+	expression that works.  Twelve lines, all one-liners, all interface.
+	OPEN OPTION, recorded so the decision is not silently permanent: these two files could be
+	GENERATED at build time from the reader's own installed headers, the way this project
+	already ships the AmigaOS loader as patches rather than as files (amix-unix-boot).
+	src/mk_modelb_sysroot.sh already builds the mirror sysroot and already has a geometry
+	probe that would validate the result, so the instrument for the change exists.
+
+
+# ============================================================================================
+# SPAN IDS RECOMPUTED 2026-09-14.  The id is now the first 12 hex digits of the SHA-1 of the
+# span's normalised token stream; it was SHA-256 before.  No decision below changed -- the same
+# spans, the same paths, the same reasons.  Only the key is different.
+#
+# WHY.  The companion scanner on the other machine computes the same kind of id with SHA-1, so
+# the two tools named one quotation with two different strings and neither could read the
+# other's allowlist.  Truncated to 12 hex digits the two hashes are equally strong against the
+# only collision that can occur here -- an accidental one, at a birthday bound four orders of
+# magnitude above the number of spans this repository has -- so the algorithm was the cheap
+# thing to concede and comparability the expensive thing to gain.  `;` entered COMMENT_LEAD in
+# the same change and for the same reason; see span_id() and COMMENT_LEAD in check-verbatim.py.
+#
+# HOW THE 25 ENTRIES BELOW WERE MAPPED, and the one thing that went wrong, because it is the
+# kind of thing that goes wrong again: this file was emptied, both versions of the checker were
+# run over the same tree, and the reported spans were joined on (pass, label, line).  The first
+# attempt joined on label and line ALONE and silently lost five entries -- a location can carry
+# one span in the exact-line pass and a different, longer one in the joined-stream pass, and a
+# commit-message label contains spaces, which a path-shaped pattern does not match.  The gate
+# then read 5 unexplained, 42 known instead of 0 and 47, which is how it was caught.  The proof
+# that the mapping is right is that this file explains every span again.
+# ============================================================================================
+
+# ============================================================================================
+# SPAN DECISIONS, 2026-08-30.  The first joined-stream run of this gate produced 38 unexplained
+# spans; eleven were closed by widening the boilerplate rules and by rewriting five quotations
+# as descriptions (commit 258726f).  What follows is the residue, decided one span at a time.
+# ============================================================================================
+
+# -- the expression a byte patch converts -----------------------------------------------------
+# These are not quotations for their own sake.  A byte patcher's entire claim is "this expression,
+# at this address, becomes that one", and the expression is what makes the claim checkable against
+# the disassembly.  Removing it would leave an address and an assertion with nothing to test.
+# Note the framing this leaves open, and which the next pass over these files should take: the
+# expression is derivable from the binary WE are patching, so it can be stated as what the code
+# does rather than as what the source says.  Recorded here rather than done now.
+
+src/patch_mincore.py 0a23a11fbe80	The mincore alignment gate: the source contract this patcher
+	converts, quoted so the byte assertion at 0x585e2 has something to be checked against.
+src/patch_ufsbmap.py 0e70e42544e0	The blocks-per-page expression ufs_bmap computes; the patch
+	changes the page term of it and the canaries assert the neighbouring block terms.
+src/segvn_softunlock_dbg.s 386db819e537	The anon-slot test this instrument sits in front of; the
+	debug unit exists to report when it is reached and with what.
+src/swapconf_dbg.s 40150dc199be	The swap-device lookup call whose arguments this instrument
+	prints; the argument order IS what the probe reports.
+test-tools/bmaptest.c 7f0dee654d3b	The allocation-size condition this test exercises, in the
+	comment that states what the test is for.
+test-tools/pgcold.c cfc7ae25aea5	The page-boundary condition under test, in the comment that
+	states the contract the program checks.
+
+# -- signatures and declarations: the identifiers ARE the interface ----------------------------
+# A description of a function signature loses the thing that makes it usable -- the names and
+# their order are the contract, and two implementations that agree on behaviour but not on the
+# signature do not interoperate.  Same for a struct whose field order is an ABI.
+
+docs/contracts/HAT-EXEC-AUDIT.md de46a631a063	as_exec's signature.  The audit is about argument
+	handling, so the parameter names and their order are its subject rather than its decoration.
+src/segkmem040.s 06f3366a081b	segkmem_setprot's signature, stated where this override has to
+	match it exactly.
+docs/archive/RAM-BEYOND-16MB-CODEX-TASK.md 110da59cbfcb	The bootinfo struct's first member.  The
+	task is about reading this structure from a running kernel, so field order is the subject.
+docs/archive/RAM-BEYOND-16MB-CODEX-TASK.md 5e152f20934a	The same struct's second member, for the
+	same reason.
+docs/archive/ISSUE40-AVAILRMEM-TASK.md 458300cf9cef	The USIZE declaration and its unit comment.
+	The whole issue is that the constant's UNIT is 2048 bytes; the comment is the evidence.
+src/fpe-compat/sys/cdefs.h 188280d0e371	BSD short type names, absent from AMIX.  There is one
+	spelling of `typedef unsigned char u_char;` and code compiled against it must agree.
+src/fpe-compat/sys/cdefs.h 04ed449b53ef	The same four typedefs, matched as a run.
+
+# -- strings that identify a message or locate code in a binary --------------------------------
+# A printf format string is how a line observed on a serial port is traced back to the code that
+# printed it.  Describing it instead would make the identification unrepeatable.
+
+docs/060-F4-M2-ATT5-RESULTS-260825.md 750a88356bb1	The swap-configuration diagnostic, quoted to
+	identify which message the machine printed.
+docs/060-F4-M2-ATT6-PREREG-260825.md 750a88356bb1	The same message, in the pre-registration that
+	predicted it.
+docs/A3091-WEDGE-PRESTUDY-260826.md 2655758084e6	The A3091 driver's own diagnostic call.  The
+	format string is what appeared on the wire and the three argument names are the mapping this
+	section exists to state; the section decodes exactly this line.
+
+# -- output the machine printed, captured verbatim on purpose ----------------------------------
+# These are transcripts.  The AT&T and Lachman copyright banner is printed by the kernel under
+# test at every boot; a log that edited it would no longer be a record of what happened.
+
+test-tools/issue10-amixadm-emu-repro-260729.log df03ad9b5de0	Kernel boot banner in a captured log.
+test-tools/issue22-serial36-260728.log df03ad9b5de0	Kernel boot banner in a captured log.
+test-tools/issue22-serial45-260728.log df03ad9b5de0	Kernel boot banner in a captured log.
+test-tools/pagecreate-issue27-COLD-PROOF-260725.txt 5027022ff7cb	The contract expression quoted in
+	a captured verification run; the file is a record of that run and is not edited after the fact.
+
+# -- commit messages: recorded because they CANNOT be rewritten --------------------------------
+# Five spans in four messages, found the first time this gate looked at messages at all.  They
+# are contract expressions and one sentence from a source comment, all attributed where they
+# appear.  A pushed commit message cannot be changed without rewriting published history, and
+# this repository cites 83 commit hashes as provenance across 152 documents -- so the cost of
+# removing five short quotations is every one of those references.  Decision, 2026-08-30: they
+# stay, and they are recorded here so that the decision is visible rather than implied.
+# The rule this pays for: the gate now sees a message BEFORE it is pushed, which is the only
+# moment at which this is cheap.
+
+commit 13544a9 message e2afe1e6d143	The zero-fill expression the patch converts, in the message
+	that converted it.
+commit 13544a9 message 73d98ee41241	One sentence from the source comment that states why the
+	tail is zeroed.  The file copy of this quotation was rewritten as a description in 258726f;
+	the message cannot be.
+commit 9c6a886 message 5027022ff7cb	The page-boundary condition, in the message that converted it.
+commit eab3c45 message 7f0dee654d3b	The allocation-size condition, in the message that converted it.
+commit f35ddef message f573cd5e53ac	The device-mmap failure contract, in the message that
+	converted it.
+
+# ============================================================================================
+# SPAN DECISIONS, 2026-09-27: THE MOTOROLA PACKAGES.  Seven spans appeared the first time the
+# FPSP/060SP work trees were given to this gate (--reference build/fpsp-work --reference
+# build/fpsp060-work).  Five are dictated and recorded here; nothing was rewritten.
+# ============================================================================================
+
+test-tools/fpenab060_asm.s c11947fe99e4	An expected FP0 bit pattern.  The test exists to compare
+	against the package's own value, so writing a different triple would break it.
+docs/REALHW-260807-11-ACCEPTANCE.md 98a594093c10	Captured stdout of Motorola's ftest060, inside a
+	fenced block of the acceptance record.  Rewording a capture would falsify the record.
+test-tools/issue34-060-unimpl-integer-260727.txt d6154f75faf4	Motorola's name for the exception,
+	in a captured log.  The same category as the boot banners above.
+commit 612d4c8 message 321200550e01	The licence's own retention clause, in the message of the
+	commit that imported the package.  A pushed message cannot be rewritten.
+commit 612d4c8 message 1261a7b89b43	The second line of the same clause, same commit.
+
+# The other two are covered by THIRD_PARTY_NOTICES/MOTOROLA-M68060-SP.txt, which names this file
+# as a modified version carrying short sequences from the package's integrator skeleton
+# (dist/fskeletn.s; the gate finds them in NetBSD's fill of it, fnetbsd.S).  They are recorded so
+# the gate stays green once the package trees are in the default corpus.
+
+src/fpsp060_glue.s 972baea9b9c2	The skeleton's BSUN prelude (save, clear the NaN condition), with
+	only the destination changed, as the notice says.
+src/fpsp060_glue.s 5e52be45fead	The skeleton's FPU-disabled exit: restore d0 and make the stacked
+	PC name the faulting instruction.  The notice names the file.

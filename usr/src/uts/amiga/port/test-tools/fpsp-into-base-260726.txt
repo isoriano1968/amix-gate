@@ -1,0 +1,313 @@
+FPSP PROMOTED INTO THE BASE LINK -- emulator verification, 2026-07-26
+=====================================================================
+
+WHAT CHANGED
+------------
+The Motorola 68040 FPSP stopped being a separate kernel variant and became part of
+relink-040.sh, so every artifact built from the base carries it.
+
+  relink-040.sh          + FPSP block (last step, after every byte patch)
+                           FPSP=1 default; FPSP=0 builds the old no-FPSP kernel
+  relink-040-fpsp.sh     RETIRED -> stub that exits 1 with a pointer
+  relink-040-fpsp-xsvga.sh, relink-040-va2000.sh
+                         FPSP layer REMOVED (they would have double-linked it);
+                         their guard inverted -- they now REQUIRE FPSP in the base
+
+Placement is deliberate: FPSP is ld -r'd in AFTER all byte patches.  `ld -r` puts the
+base object's .text first, so every patch address survives -- but only in this order.
+
+WHY (the argument, not just the tidiness)
+-----------------------------------------
+The 68040 implements a SUBSET of the FP instruction set in hardware and traps the rest.
+Motorola ships FPSP because completing the ISA is the OS's job.  A 68040 kernel without
+it is an incomplete 68040, not a kernel missing an optional extra.
+
+Our own evidence that this mattered: with vector 55 (unimplemented DATA TYPE) left on
+nullvect, the X server died of SIGILL --
+    DBG SIG sig=4 pid=208 psargs=/usr/X/bin/Xsvga :0
+-- and that was read as a graphics problem for a while.  The graphics-driver goal made an
+FPU completeness gap look like a driver bug.
+
+Second reason: the variant matrix.  FPSP+driver kernels were built by separate scripts with
+their own default bases, which is exactly how the 2026-07-25 near-miss happened (graphics
+kernels silently built from a 260724 base, containing none of that day's VM fixes).  FPSP in
+base collapses two axes to one: base = VM + complete CPU; driver kernels = base + one driver.
+
+BUILDS
+------
+  build/unix-040       68040-260726-01   1 716 532 B  (was 260725-17, 1 525 673 -> +191 KB)
+  build/unix-040-dbg   68040-260726-02   1 753 723 B  (was 260725-18, 1 562 864 -> +191 KB)
+  relocs 0 on both; all 10 FPSP entry points defined; no unresolved FPSP refs.
+  M68Kvec[11] -> fpsp_vec11, vectors 48/51/52/53/54/55 -> FPSP, 49/50 left on nullvect
+  by design (the 040 completes inexact and div-by-zero in hardware).
+  Kept for A/B: build/unix-040{,-dbg}.PRE-FPSPBASE-260725-1{7,8}
+
+emu-040 (68040-260726-02) -- ALL PASS
+------------------------------------
+  boot -> idle, banner 68040-260726-02, telnet login OK
+  fputest      Test A PASS  (add/sub/mul/div, 1/3, sqrt2, checksum 1747546)
+  native cc    WORKS -- it compiled fputest/exectest/proctest/devmaptest on the guest
+  exectest     EXECTEST-RESULT PASS (20 generations, data+bss verified)
+  proctest     PROCTEST-RESULT PASS (parent fails=0)
+  devmaptest   DEVMAPTEST-RESULT PASS (fails=0, T2 mincore canary clean)
+  serial: 0 hits for PANIC / BUS ERROR / 4AFC005F / SIG sig=4 / KMEMCORRUPT
+
+emu-060 (68060-260726-02, SAME dual-CPU binary) -- PASS, with one pre-existing gap
+---------------------------------------------------------------------------------
+  boot -> idle, banner 68060-260726-02, CACR read-back BCD80008000 (B1 active)
+  fputest      Test A PASS   <- the cputype gate HOLDS: the 060 does its FP in hardware
+                                and never enters the 040 FPSP path
+  exectest     EXECTEST-RESULT PASS (20 generations)
+  serial: 0 hits for PANIC / BUS ERROR / 4AFC005F / SIG sig=4
+
+  ** NATIVE cc IS BROKEN ON 060 -- AND IT WAS BROKEN BEFORE THIS CHANGE. **
+  `cc -o fputest fputest.c` gives `gcc: Program cc1 got fatal signal 12` (SIGSYS).
+  A/B PROOF: the SAME failure reproduces on the PRE-FPSP kernel 68060-260725-18 booted on
+  the same golden image.  So this is NOT a regression from FPSP-in-base.  It is the 060
+  equivalent of the gap that FPSP closed on the 040 (M3 = "native cc works again"), and it
+  needs Motorola's 68060SP; src/lmul060.s covers only part of the unimplemented set.
+  Consequence for method: 060 tests must be CROSS-COMPILED on the host --
+      . gcc-cross-amix/build/env.sh
+      m68k-cbm-sysv4-gcc -O -m68020 -o fputest.bin fputest.c
+  then tftp'd in BINARY mode and chmod 755.  This works and is how the two 060 results
+  above were obtained.  It also removes the guest-compiler dependency from 060 testing
+  generally.
+
+  ** ISSUE-29 sighting #4 ** (KMA free-list report), 93% into the boot log:
+      DBG KMEMCORRUPT bin=80EDA04 blk=40250A00 next=80ED9F0 prev=80ED9F0
+                      caller=8042334 size=24
+  Recorded, NOT attributed.  ISSUE-29 has been seen on kernels without FPSP and has never
+  reproduced on demand; one sighting on an FPSP kernel is not evidence that FPSP caused it.
+  Note next==prev here, whereas the 2026-07-25 sightings had small integer next/prev --
+  a different shape, worth comparing if it ever reproduces.
+
+NOT VERIFIED
+------------
+  * NO REAL HARDWARE.  Everything above is emulator only.
+  * The loader/copyit path at the NEW image size was NOT stress-tested.  The base grew
+    1.53 -> 1.72 MB, and the historical cold-boot corruption was a loader buffer OVERLAP
+    at ~0.96 MB.  Three cold boots (2x 060, 1x 040) came up clean, which is a weak
+    positive, not a proof.  On real HW: if the screen flashes white/red at handoff, that
+    is the copyit checksum guard and it is THIS, not FPSP.
+  * pgcold D/E, bmaptest, mlocktest, trunctest, disk truth, msync: NOT re-run on the FPSP
+    kernels.  They passed on 260725-17/-18 and FPSP appends code without touching any
+    patched address, but "should not matter" is not "was tested".
+  * The graphics kernels (260725-19/-20) were NOT rebuilt.  They still carry their own
+    FPSP layer from the old flow; rebuilding them on the new base is the next step and
+    docs/REALHW-VERIFY-260725.md's kernel table is stale until then.
+
+
+===============================================================================
+FOLLOW-UP, same day: durable Xsvga path + ONE combined RTG kernel
+===============================================================================
+
+1. XSVGA OBJECT PROVENANCE FIXED
+-------------------------------
+Both xsvga relink scripts defaulted their driver object to a path under /tmp -- a
+session scratchpad.  Not a hygiene issue but a reproducibility one: the next rebuild
+might not find it, or might find a DIFFERENT exp at the same path and fail with a
+confusing byte-assert instead of a clear one.
+
+  new: src/xsvga-provenance.sh
+       XSVGA_EXP  = /home/asokero/kehitys/va2000-amixdev/svga-dev/svga/exp
+       sha256     = 97a9a39d544aa73c733cd444a18663707c52a22802122f1e7312963481c72301
+       size       = 60464
+       xsvga_check_exp() refuses to build on a mismatch and says why.
+
+The scratchpad copy and the durable copy were verified BYTE-IDENTICAL before the switch
+(cmp + matching sha256), so this changes no bytes in any kernel.  The object stays out of
+the repo -- third-party, not ours to redistribute (same treatment as the AT&T headers).
+
+2. ONE COMBINED RTG KERNEL: 68040-260726-03
+-------------------------------------------
+  relink-040-rtg.sh -> build/unix-040-rtg-dbg   1 817 257 B   relocs 0
+  .data 4-aligned (106780), 330 PC-relative records (needs unix_boot040)
+
+Non-collision was CHECKED, not assumed:
+  * majors distinct -- Xsvga cdevsw[67], VA2000 cdevsw[68]
+  * Xsvga weakens NOTHING (pure .rela.data retarget of 6 slots)
+  * VA2000 weakens only `parinit` (wrapper -> va2000init() -> tail-jmp parinit_orig)
+  * parinit still at 0xfe6c on the FPSP base -- asserted by the script every build,
+    because FPSP appends after the base .text and "base symbols cannot move" is exactly
+    the kind of claim that must be verified rather than reasoned about
+  * exactly 1 strong `parinit` definition after the link
+  * both registrations re-run: 6/6 + 6/6 slots report "already", i.e. idempotent
+
+  relink-040-fpsp-xsvga.sh RETIRED -> stub (with FPSP in base it was a duplicate of
+  relink-040-xsvga.sh).  Single-driver scripts kept for bisecting a driver-specific
+  failure -- same reasoning as FPSP=0.
+
+emu-040 smoke on 68040-260726-03 -- ALL PASS
+--------------------------------------------
+  boot -> multiuser idle, banner 68040-260726-03, telnet login OK
+  serial: `va2000: no board found`  <- the parinit wrapper ran and reported correctly
+  /dev/va2000 (mknod c 68 0):  errno=6 ENXIO -- clean "no board" (expected, not emulatable)
+  /dev/svga0:                  SVGAPROBE open OK, CardID=3 (Piccolo),
+                               FrameBufSize=2097152, MaxPixClk=85, Blitter=1, Panning=1
+                               <- the Xsvga driver DETECTS THE EMULATED PICCOLO with both
+                                  drivers linked in, so they do not interfere
+  fputest      Test A PASS      <- FPSP intact alongside both drivers
+  exectest     PASS (20 generations)
+  devmaptest   PASS (fails=0)
+  serial: 0 hits for PANIC / BUS ERROR / 4AFC005F / KMEMCORRUPT / SIG sig=4
+
+NOT VERIFIED (unchanged from the section above, plus)
+----------------------------------------------------
+  * No real hardware, and this is the artifact that most needs it: the VA2000 side has
+    NEVER run against a physical board, and Xsvga has never run on a physical Piccolo.
+  * `xinit` / a graphical X session was NOT re-run on this kernel.  It worked on
+    260724-09 (test-tools/xsvga-xinit-working-260724.png); this kernel has the same
+    driver plus 260726 VM+FPSP, but that is an inference, not a test.
+  * Both boards present SIMULTANEOUSLY is untested and cannot be tested here -- linking
+    both is proven safe, but which board owns the console/screen switch when two are
+    physically installed is a separate question.
+  * emu-060 was not re-run on the RTG kernel (the drivers are 040-era Zorro-II boards;
+    the 060 line is regression-only for the base).
+
+
+===============================================================================
+FOLLOW-UP 2026-07-27: loader margin quantified + full battery on the 260726 line
+===============================================================================
+
+1. LOADER / copyit AT THE NEW IMAGE SIZE -- risk was overstated, now quantified
+------------------------------------------------------------------------------
+I flagged this twice as an open risk on the strength of three clean cold boots, which is
+weak evidence.  It is answerable exactly, because THE LOADER COMPUTES AND PRINTS THE
+VERDICT ITSELF (unix_boot.c, the 2026-07-09 diagnostic), and the emulator's memory
+geometry is IDENTICAL to the real Mercury machine (mem[0] 0x08000020..0x0a000000 = 32 MiB,
+mem[1] 0x07000020..0x08000000 = 16 MiB).  So the margin transfers to real hardware.
+
+Measured on the largest artifact, the RTG kernel 260726-03 (file 1 817 257 B):
+
+    kernel: entry=08000000 tvaddr=08000000 tsize=000f04a0 dvaddr=080f04a0 dsize=0001a11c
+    buffer: image=09e44550 copysrc=09e44584..09f4eb40 dest=08000000..0810a5bc
+    no overlap (copy is safe)
+
+  destination [0x08000000, 0x0810a5bc)  = 1 090 012 B at the BOTTOM of the 32 MiB region
+  ELF buffer  [0x09e44550, 0x0a000000)  = 1 817 264 B at the TOP (MEMF_REVERSE working
+                                          exactly as designed: top-of-region minus filesize)
+  MARGIN between them = 30 646 164 B = 29.2 MiB
+
+Overlap requires copy_size + file_size >= region_size, i.e. a kernel file of roughly
+16 MiB on this configuration.  We are at 1.82 MiB: about 9x headroom.  Adding 68060SP
+(~350 KB) would not move this meaningfully.
+
+And there are THREE independent guards, all verified in source:
+  * MEMF_REVERSE places the buffer at the top of the region (confirmed by the addresses)
+  * copyit's direction choice is now correct in BOTH directions -- `cmpl a0,a1 / bcs
+    copyfwd`: dest<src ascends, dest>=src descends from the tail (copyit.s:93-95)
+  * a checksum over the DESTINATION is compared against the loader-computed source sum,
+    and a mismatch flashes color0 white/red forever rather than jumping into a corrupt
+    kernel (copyit.s:130-148)
+
+Every boot in this session printed "no overlap (copy is safe)".  CONCLUSION: this is not a
+live risk at the current or foreseeable image size.  The white/red-flash advice stays in the
+run list as a diagnostic, but I was wrong to rank it as an open hazard.
+
+2. FULL BATTERY ON 68040-260726-02 (the gap I recorded on 2026-07-26) -- ALL PASS
+--------------------------------------------------------------------------------
+  bmaptest /pgc            BMAPTEST-RESULT PASS       (ISSUE-31, T5 fragment growth OK)
+  mlocktest                MLOCKTEST-RESULT PASS      (ISSUE-28, fails=0 skipped=0)
+  trunctest 8 /pgc         TRUNCTEST-RESULT ZEROED    (ISSUE-30, expected: no repro)
+  msynctst                 MSYNC-OK sz=65536          (ufs_putpage disk truth)
+  pgcold D 24 /pgc         PHASE-D-DONE files=24 errs=0
+    -> sync; sync; reboot (soft, per ISSUE-24) -- 2 boots in the serial log, both
+       "no overlap (copy is safe)"
+  pgcold E 24 /pgc         PGCOLD-E-RESULT PRESERVED  <- the ISSUE-27 proof holds with
+                           hits=0 zeroed=0 marker=0 errs=0     FPSP in the base
+  disk truth /big.dat      2 950 288 B, sum 8320 5763 BEFORE the reboot and 8320 5763
+                           AFTER it -- and byte-identical to the 260725 baseline
+  serial: 0 hits for PANIC / BUS ERROR / 4AFC005F / KMEMCORRUPT / SIG sig=4
+
+3. emu-060 (68060-260726-02, cross-compiled binaries) -- PASS as far as it goes
+------------------------------------------------------------------------------
+  proctest.bin   PROCTEST-RESULT PASS (parent fails=0)
+  msynctst.bin   MSYNC-OK sz=65536
+  fputest.bin    Test A PASS  (from 2026-07-26)
+  exectest.bin   PASS, 20 generations (from 2026-07-26)
+  serial: 0 hits for PANIC / BUS ERROR / KMEMCORRUPT / "no space" / 4AFC005F
+
+  bmaptest.bin was KILLED (exit 137) on 060 -- chased and ROOT-CAUSED, see
+  test-tools/issue34-060-unimpl-integer-260727.txt.  It is ISSUE-34: the 68060 does not
+  implement 64-bit-result muls.l, M68Kvec[61] goes to nullvect, and any user program
+  containing that instruction is killed.  NOT a regression from anything landed this week.
+
+  The cross-compile workaround is narrower than I claimed on 2026-07-26: mlocktest,
+  trunctest and devmaptest do NOT cross-link (`plock`, `ftruncate`, `mincore` missing from
+  the cross sysroot's libc), so those three are 040-only until either the stubs are added
+  or the 060 compiler works.
+
+4. USER-REPORTED, not run by me
+------------------------------
+  `xinit` WORKS on unix-040-rtg-dbg (68040-260726-03) with the Xsvga driver -- user-tested
+  2026-07-27.  This closes the inference I flagged on 2026-07-26 ("worked on 260724-09, not
+  re-run on this kernel").  Still emulator; the physical Piccolo remains untested.
+
+
+===============================================================================
+FOLLOW-UP 2026-07-27 (2): pressure + fork/COW on 260726-02, and an ISSUE-34 CORRECTION
+===============================================================================
+
+5. PRESSURE / fork-COW REGRESSION, emu-040, 68040-260726-02 -- ALL PASS
+----------------------------------------------------------------------
+This was the last unrun item of the run list's own step 9, and it is not a formality:
+FPSP added 191 KB to the base, which SHIFTS kvseg addresses -- exactly the mechanism I
+offered as the structural argument for ISSUE-29 -- and this project's worst bugs (ISSUE-10,
+22, 29) have all lived under fork and I/O pressure.  The functional battery does not load
+the machine at all.
+
+  /payload.bin           4 425 432 B, sum 12480 8644   (new baseline; the historical
+                         1570 8192 belongs to a file that is not in the repo)
+  hat_dup_cow 1          RESULT PASS
+  hat_dup_cow 32         RESULT PASS
+  hat_dup_cow 64         RESULT PASS
+  issue10-pressure.sh    PRESSURE-DONE, 6 concurrent 4 MiB copies + hat_dup_cow 64 churn,
+                         all six sums 12480 8644 -- 6/6 byte-perfect
+  burst4.sh              ALLBURSTS-DONE, grep -c "12480 8644" = 24 -- 24/24 byte-perfect
+                         across 4 bursts of (6x4 MiB concurrent + hat_dup_cow 64)
+  serial over the whole run: 0 hits for PANIC / BUS ERROR / 4AFC005F / KMEMCORRUPT /
+                         SIG sig / EFAULT.  2 XPAGE lines (hardbus page-crossing
+                         diagnostic, expected under pressure -- see ISSUE-11 notes).
+
+So ISSUE-29 did NOT appear in this run, and neither did ISSUE-22's EFAULT.  Recorded as a
+negative datapoint, not as evidence they are gone.
+
+6. ** CORRECTION TO THE ISSUE-34 WRITE-UP EARLIER TODAY **
+---------------------------------------------------------
+I wrote that ISSUE-34's root cause was proven.  That was too broad, and the signal
+discrepancy I flagged (cc1 = 12/SIGSYS, isolated repro = 9/SIGKILL) turns out to matter.
+
+Direct evidence, obtained by disassembling the guest toolchain out of the READ-ONLY vanilla
+install tree and counting 68060-unimplemented instructions:
+
+  gcc (driver)      72 896 B   clean
+  gcc-cc1          666 440 B   CLEAN -- no 64-bit mul/div, no movep/cas/cas2/cmp2/chk2
+  gcc-cpp           46 468 B   clean
+  gcc-gnulib        36 354 B   clean
+  libc.so.1        206 876 B   clean
+  libc.a           469 242 B   clean
+  ld.so.1          111 104 B   clean
+
+**cc1 contains none of the instructions the 68060 fails to implement.**  So the muls.l /
+vector-61 defect, which IS real and IS proven, is NOT what breaks cc1.  ISSUE-34 is two
+separate problems and must be tracked as such:
+
+  ISSUE-34a  PROVEN.  A 64-bit-result muls.l/divs.l kills any user process on the 68060
+             because M68Kvec[61] is nullvect.  Isolated one-instruction repro, 6/6
+             correlation across the suite.  Fix: 68060SP ISP, or a targeted vector-61
+             handler.  This stands entirely on its own merits.
+  ISSUE-34b  STILL OPEN.  cc1 dies with SIGSYS (12) on the 68060 and works on the 68040.
+             The whole compiler toolchain is clean of unimplemented instructions, so the
+             instruction-set class is RULED OUT by direct evidence.  SIGSYS is literally
+             "bad system call", which redirects the search to the syscall/trap path rather
+             than the ISA.  What differs on 060 in our kernel: wb060.s, lmul060.s, the
+             cputype gates and four FPU Tier-1 overrides -- plus the 060's different
+             exception frame formats.
+
+  Caveat on the scan: these are the VANILLA install's binaries.  The emulator boots the
+  X11R5-net image, whose compiler may not be byte-identical.  The class conclusion (the
+  toolchain does not use these instructions) is robust; a specific offset claim would not be.
+
+  Next step for 34b is instrumentation, not more inference: a probe that records the vector
+  number (exception frame format word, sp@(66) after nullvect's moveml) and the faulting PC,
+  which would also confirm 34a's vector directly instead of by deduction.

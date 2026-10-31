@@ -1,0 +1,63 @@
+# --- Build artifacts (regenerated from source) ---
+build/
+*.o
+*.uaem
+unix_boot/src/unix_boot
+
+# --- Licensed / copyrighted (AT&T / Commodore) — NOT redistributable ---
+# AMIX kernel sources extracted from amix-sources.tar
+amix-src/
+# Kernel binaries and the upstream loader binary
+unix_boot/unix
+unix_boot/bin/
+# AT&T SVR4 ELF headers (must be supplied from one's own licensed AMIX install)
+unix_boot/src/include/sys/
+unix_boot/src/include/elf.h
+# Original distribution archive(s)
+*.lha
+
+# --- Third-party AmigaOS support libs (ARP) — not our work ---
+unix_boot/ARP_13/
+unix_boot/arp.library
+unix_boot/arp40_2/
+
+# --- Machine-specific / editor ---
+# Local Claude Code tool config (permission allowlist with absolute home paths)
+.claude/
+*~
+*.swp
+ghindra-unix/
+
+# --- Out-of-band comms channel (real-HW photos etc. shared with the assistant) ---
+# NOT version-controlled: temporary/ad-hoc, and photos may carry GPS EXIF.
+testimages/
+
+# --- Local-only working notes, deliberately outside version control ---
+# Anything under private/ stays on this machine: notes that must not reach a remote
+# even by accident.  Wholesale rule so a new note needs no new ignore line.
+# NOTE: this means no history and no backup -- `git clean -xdf` WOULD delete it.
+private/
+
+# Third-party reference sources (do NOT commit -- copyright/size)
+svr4-src-3b2/
+svr4-v4/
+usl-svr42/
+fs-uae/
+__pycache__/
+z3660-upstream-patches.zip
+
+# --- Local, machine-specific and secret: never published ---
+local/secrets.env
+LOCAL-BUILD-NOTES.md
+
+# --- Moved to the amix-unix-boot repository (Commodore-copyright sources) ---
+unix_boot/
+unix_boot.lha
+src/copyit.*
+
+# --- Local configuration: never published ---
+config.sh
+local/muistiinpanot.txt
+
+# Transfer bundles for the guest -- regenerated on demand, never committed
+test-tools/*-bundle.tar

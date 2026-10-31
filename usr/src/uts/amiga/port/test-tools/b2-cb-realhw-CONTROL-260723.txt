@@ -1,0 +1,179 @@
+Caches Step B2 -- COPYBACK real-HW controlled comparison (WT-baseline vs B2)
+===========================================================================
+Date: 2026-07-23
+Machine: real A3000 + Mercury 68040 (10.0.10.10)
+Builds: WT-hooks baseline unix-040-dbg 68040-260723-07 (hat_cm_ram=0x00)
+        B2 copyback   unix-040-b2-dbg 68040-260723-10 (hat_cm_ram=0x20)
+        (identical hook group; ONLY the CM class differs -- clean single variable)
+Workload: burstloop.sh R=4 = 4x burst4 = 16 bursts = 96 concurrent-4MiB copies
+          + hat_dup_cow 64 per burst.  Same script, same NAS payload (sum 1570 8192).
+
+VERDICT
+-------
+**>>> SUPERSEDED -- see "UPDATE 2026-07-23 (later)" at the bottom of this file.
+The "silent corruption" reading below was an over-interpretation of `sum` hiding
+errno; the F1 instrumented capture classified the actual failure as
+V1_EFAULT_TRANSIENT (ISSUE-22, file byte-intact on reopen), NOT B2 corruption. <<<**
+
+(original, now-corrected verdict:)
+**B2 COPYBACK BLOCKED: it silently corrupts files on disk under sustained
+pressure; the WT baseline with the identical hook group does not.  Do NOT flip
+hat_cm_ram to 0x20 in a shipping kernel until the coherency gap is root-caused.**
+
+The controlled comparison separates two DISTINCT phenomena that a single run
+conflated:
+
+  1. ISSUE-22 EFAULT (pre-existing, NOT B2): `cp: read: Bad address` under
+     pressure -> the copy aborts cleanly, the dest file is NOT created
+     (`sum: Can't open`).  NOISY (cp reports the error), no on-disk corruption.
+     Appears on BOTH kernels -> pre-existing, unrelated to copyback.
+
+  2. B2 silent corruption (B2-ONLY): a dest file IS created, cp reports NO
+     error, but the on-disk file is SHORT + wrong checksum + gives a read error
+     on readback.  Appears ONLY on -10 (copyback), across two independent boots.
+
+Comparison
+----------
+| kernel        | boots | bursts | ISSUE-22 EFAULT (clean abort) | B2 SILENT on-disk corruption |
+|---------------|-------|--------|-------------------------------|------------------------------|
+| -07 WT        |   1   |   16   | 1 (cp read: Bad address, press4 absent) | 0                     |
+| -10 B2 (R=4)  |   1   |   16   | 0                             | 1 (press5: 32757 5328 + read error) |
+| -10 B2 (prior)|   1   |    8   | 1 (press6 absent)             | 1 (press6: 18645 7648 + read error) |
+
+Key qualitative fact (stronger than the raw counts): on WT the ONLY failure
+mode is a noisy clean-abort EFAULT (no file, no corruption).  On B2 the failure
+mode is a SILENT corrupt-and-unreadable on-disk file.  That difference tracks
+the copyback flip exactly -- same disk, same fs, same workload, same hooks; the
+only changed variable is hat_cm_ram 0x00->0x20.  The corrupt-file signature is
+reproduced on two independent -10 boots and is absent from 16 clean -07 bursts.
+
+The hooks that WERE installed are firing correctly
+--------------------------------------------------
+Counter read-back after the -10 runs: dma_prep_to==dma_cmpl_to and
+dma_prep_from==dma_cmpl_from (perfect pairing), and ALL diagnostic counters 0
+(dma_prep_owned / dma_cmpl_noprep / dma_range_ovf / cb_rel_reject).
+cb_rel_count climbs with every page free.  So the A3091 prepare/complete
+protocol and the cb_page_release barrier are internally consistent -- the gap
+is NOT a missed prepare/complete on the hooked path.  The corruption must come
+from a disk-write path NOT covered by the current hook set, or a subtler race.
+
+Leading root-cause hypotheses (for the next debugging round)
+------------------------------------------------------------
+* UFS metadata writeback (inode / indirect blocks) via the buffer cache whose
+  dirty cache line is not pushed before its A3091 DMA write -> on-disk block
+  map inconsistent -> short file + read error on readback.  Fits the signature
+  (silent, corrupt+unreadable, not just wrong data).
+* a FROM_DEVICE completion invalidate range that misses an endpoint/partial
+  line, leaving a stale dirty CPU line that later evicts over device data.
+* a disk-write initiator path that does not pass through the A3091 startdma
+  prepare retarget (needs a DMA-initiator re-census against the WRITE path
+  specifically, not just the read completion the B1 census focused on).
+* the pilot whole-cache `cpusha dc` prepare racing with async DMA + concurrent
+  CPU dirtying of an unrelated line in the same page.
+
+Actions taken / not taken
+-------------------------
+* POWER-CUT disk-truth NOT run: corruption already reproduces under normal
+  load; a power cut would only add a second variable.
+* No hat_cm_ram flip shipped.  The WT-hooks baseline (260723-06 base / -07 dbg,
+  hat_cm_ram=0x00) remains the current good real-HW state -- it passed 16 clean
+  bursts (only the pre-existing ISSUE-22 EFAULT, which also predates the hooks).
+* B1 (writethrough) remains HW-accepted and unaffected (commit bc27d81).
+
+Next
+----
+1. Keep B2 code committed (381829b) but DORMANT: ship WT (hat_cm_ram=0x00).
+2. Root-cause the silent disk corruption -- Codex analysis round on the WRITE
+   path + targeted instrumentation (per-inode / per-buffer, which file, whether
+   the corrupt block is metadata or data, DMA-initiator write-path re-census).
+3. Re-run this exact controlled comparison after the fix; require -10 to match
+   -07 (0 silent corruptions / >=16 bursts) BEFORE any power-cut or flip.
+
+
+================================================================================
+UPDATE 2026-07-23 (later) -- F1 instrumented capture RESOLVES the alarm
+================================================================================
+Codex (analyysirepo 077f2bc) refuted all five static B2 mechanisms and proved
+from the AMIX `sum` binary disassembly that its "32757 5328 + read error" is a
+PARTIAL read-progress count, not a file size -- so the earlier "silent B2 disk
+corruption" reading was an over-interpretation of sum hiding errno.
+
+The F1 instrumented reproducer (test-tools/b2repro-copy.sh = the SAME burst4
+copy-pressure that produced the alarm, but verified with b2verify instead of
+sum) was run on the B2 copyback kernel (unix-040-b2-dbg, 68040-260723-10,
+hat_cm_ram=0x20) and CAUGHT the failure directly:
+
+    B2V label=b2run-b2-cp1 READFAIL off=73728 errno=14 size_at_fail=4194304
+        retry_transient=1 retry_errno=14 bytes_ok=73728
+    B2V CLASS=V1_EFAULT_TRANSIENT off=73728 errno=14 note=reopen-succeeded-file-intact
+    STOP burst=2 cp=1 class=1
+
+Classification (matches Codex's V1 row exactly):
+* errno=14 = EFAULT (the "read: Bad address" of ISSUE-22), NOT EIO;
+* size_at_fail=4194304 = the FULL 4 MiB inode -- NOT short, no metadata damage;
+* retry_transient=1 -- close/reopen + retry SUCCEEDED, the file is byte-intact
+  on disk;
+* therefore this is a TRANSIENT read-path fault (ISSUE-22 EFAULT), NOT a
+  persistent B2 disk-truth defect.
+
+VERDICT CORRECTION
+------------------
+The "B2 silently corrupts disk" conclusion is REFUTED by direct evidence. The
+burst4 anomalies were ISSUE-22 (a pre-existing, pressure-dependent read(2)
+EFAULT that also occurs on the WT baseline) hitting the verifier's read; `sum`
+discarded the errno and printed a partial count that was misread as a short/
+corrupt file. Under B2 copyback the DISK DATA IS CORRECT (full size, intact on
+reopen) -- which is also positive evidence that B2's DMA coherency is working.
+
+B2 is therefore NOT blocked by disk corruption. Remaining before a B2 flip is
+shipped (measured, not a corruption blocker):
+1. optional WT control with b2verify to confirm B2 does not elevate the ISSUE-22
+   EFAULT rate (both should show the same occasional V1);
+2. a longer all-V0/V1 run + clean-reboot disk truth + (optional) power-cut;
+3. ISSUE-22 itself remains a real pre-existing bug worth chasing, but it is a
+   read-path/fault-resolver issue, NOT a B2 or DMA-coherency defect.
+
+The kernel DMA trace ring (Codex Part B) is NOT needed for this classification;
+it would only be built if a persistent V3+ class had appeared, which it did not.
+
+
+================================================================================
+UPDATE 2026-07-23 (WT control with b2verify) -- ISSUE-22 confirmed kernel-independent
+================================================================================
+The same F1 instrumented reproducer (b2repro-copy.sh, b2verify) was run on the
+WT-hooks baseline (unix-040-dbg, 68040-260723-07, hat_cm_ram=0x00) to confirm
+that B2 does not introduce or elevate the ISSUE-22 EFAULT.
+
+Result -- burst 2 (same burst as B2's failure), copies cp1..cp5 all
+CLASS=V0_COMPLETE_MATCH, then:
+
+    cp: /payload.bin: read: Bad address          (cp's source read EFAULTs)
+    B2V label=wtrun-...-cp6 CLASS=SOURCE_ERROR dst=/cp6.bin stat_errno=2 (ENOENT)
+    STOP burst=2 cp=6 class=20
+
+Interpretation:
+* `cp: read: Bad address` = errno EFAULT -- the ISSUE-22 signature, here on cp's
+  read of the source; cp aborts, so /cp6.bin is never created;
+* b2verify then reports SOURCE_ERROR/ENOENT because the destination is absent
+  (not a V-class -- the file does not exist to classify);
+* this is a cp-side clean abort with NO on-disk corruption, exactly the WT
+  failure mode seen in the original 16-burst control.
+
+Side-by-side (both under identical copy pressure, both first-failed at burst 2):
+
+| kernel        | ISSUE-22 EFAULT hit | manifestation           | on-disk truth     |
+|---------------|---------------------|-------------------------|-------------------|
+| WT  -07 (0x00)| cp's source read    | cp aborts, dest absent  | no file (clean)   |
+| B2  -10 (0x20)| verifier's read     | file full + intact      | correct, reopen OK|
+
+CONCLUSION
+----------
+ISSUE-22 (transient read(2) EFAULT under memory pressure) fires on BOTH kernels
+at the same exposure (~burst 2). It is a pre-existing, kernel-independent
+read-path / fault-resolver bug. Which read the EFAULT lands on (cp vs verifier)
+is incidental; neither kernel produces persistent disk corruption. B2 copyback
+does not introduce or amplify it, and B2's disk data is byte-correct.
+
+The B2 corruption alarm is fully resolved as ISSUE-22. B2 is not corruption-
+blocked. Remaining for a B2 flip is ordinary acceptance (a longer all-V0 run
+with b2verify + clean-reboot disk-truth); ISSUE-22 stays a separate open bug.

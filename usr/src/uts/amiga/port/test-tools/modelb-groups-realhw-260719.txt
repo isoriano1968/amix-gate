@@ -1,0 +1,81 @@
+MODEL-B-JAANNOSRYHMIEN REAL-HW-VERIFY (2026-07-19 ilta, A3000 + Mercury 68040)
+Paketti: docs/REALHW-VERIFY-260719B.md; kernel unix-040-dbg = 68040-260719-14
+(kaikki 4 ryhmaa: 50abe53 swapgeom / 5637b04 execstk / 3425d82 pageoutdefs /
+c79730a mincore). Kanava: telnet 10.0.10.10 (real.py); siirrot NFS /mnt/nasu
+(nasu:Public) -- ei tftp-netascii-riskia; summat verifioitu silti.
+
+AJOLISTA JA TULOKSET (jarjestyksessa):
+1. Boot -14 + login: kayttajan buuttaamana, ei guruja. NFS mountattu valmiiksi.
+2. Siirtoverifiointi: payload.bin 1570 8192; hat_dup_cow 18025 16; pressure.sh
+   5613 2; burst4.sh 15017 1; swapls.c 628 2; bigargv.c 47140 4; mincoretst.c
+   51095 4 -- kaikki identtiset lahteen kanssa.
+3. RYHMA 1 / swapls (swapctl SC_LIST): /dev/dsk/c6d0s2 start 0 len 204800
+   PAGES 25600 FREE 24777 flags 0
+   => tasan 1 slotti / 4K-sivu 100 MiB:lle MYOS RAUDALLA (vanha bugi: 51199).
+4. RYHMA 2 / bigargv x3: BIGARGV PASS 45 args 4500 bytes -- joka kerta.
+   4,5 KiB argv siirtyy execin yli tavuntarkasti (ARG_MAX 5120).
+5. BONUS / mincoretst: MINCORE VEC rc 0 changed 8 tail intact;
+   MINCORE ALIGN2K rc -1 errno 22; MINCORE PASS.
+   => tasan 8 vec-tavua (ei 16), sentinelihanta ehja, PAGEOFFSET-portti toimii.
+6. hat_dup_cow 64: PASS isolation / fork+exec / stress -- RESULT PASS.
+7. pressure.sh (at-jonossa): PRESSURE-DONE, sum 1570 8192 x6. EI EFAULTIA
+   (vrt. ISSUE-22; huom. tama on dbg-kernel -- jahti kuuluu baselle).
+8. RYHMA 3 -mittari / burst4.sh (at-jonossa): ALLBURSTS-DONE, 24/24 summaa
+   1570 8192. KESTO ~10 min / 4 burstia (~2,5 min/bursti); pollaus 90 s valein
+   vastasi JOKA kerta -- EI yhtaan "serial+telnet mykkia minuutteja" -vaihetta,
+   joka edelliskaynnilla (260719-01/-02, ennen ryhmaa 3) oli burstien
+   normaalitila. lotsfree/desfree/minfree-puolituksen vaikutus nakyy raudalla.
+   (Emu-referenssi samalla kernelilla: ~4,5-5,5 min / 4 burstia.)
+9. Regressio / kmem-ENXIO: dd if=/dev/kmem bs=4096 iseek=263974 count=1 ->
+   "dd: read error: No such device or address", 0+0 records -- siisti ENXIO,
+   ei storm/panic (ISSUE-13-luokka pysyy kiinni).
+10. /dev/osm-puskuri: grep -c "BUS ERROR" = 0 koko session ajalta.
+
+EI AJETTU TALLA ETAISTUNNOLLA (vaativat kayttajan kadet / eri kernelin):
+- ISSUE-22-jahti: kylma boot bare baselle (unix-040 = 260719-13) -> valiton
+  pressure, x6 sykli. Vaatii kernel-vaihdon loaderiin + fyysiset bootit
+  (ISSUE-21 musta-ruutu ~1/4 -> retry).
+- Writeback disk-truth virtakatkaisulla (paketti A:n kohta 6 -regressio):
+  vaatii fyysisen virtakatkaisun.
+
+VERDIKTI: kaikki 4 Model-B-ryhmaa REAL-HW-VAHVISTETTU siltae osin kuin etana
+ajettavissa (probet = ryhmien suora HW-totuus; burst-kesto = ryhma-3:n
+kaytosmittari). 0 bus-virhetta, 0 EFAULTia, 24/24 + 6/6 summat.
+
+ISSUE-22-JAHTI (sama ilta, bare base 260719-13, kylma boot -> valiton pressure):
+- Sykli 1: kayttajan boot -> pressure ~2 min bootista: PRESSURE-DONE 6/6, 0 Bad
+  address, 0 bus. Syklit 2-6 ajettiin valvotulla silmukalla (reboot -> automaatti-
+  boot -> at-jonotettu pressure -> tulos).
+- VALIDIT KYLMASYKLIT: 1, 2, 3, 5, 6 = viisi kpl; sykli 4 LAMMIN (init-6-toimitus
+  epaonnistui -> ei kylma; ajettiin silti: puhdas, kesto ~8 min vs kylmien ~2,5 min).
+- TULOS: 0 EFAULTIA / 0 Bad addressia / 0 BUS ERRORia KAIKISSA sykleissa; 36/36
+  kopiosummaa tavuntarkkoja (6 syklia x 6 kopiota). Alkuperainen ISSUE-22 (1 tapaus
+  ensimmaisessa bootin jalkeisessa paineessa vanhalla basella -01) EI TOISTUNUT
+  uusilla Model-B-ryhmilla viidessa kylmassa ensipaineessa. Ei todiste fiksista,
+  mutta vahva signaali: joko swapadd/exec-stack-ryhmat poistivat sen tai esiintyma
+  on hyvin harvinainen. ISSUE-22 jaa auki alennetulla prioriteetilla.
+- SIVULOYDOKSET: ISSUE-21 osui kerran (sykli 6:n 1. boottiyritys, musta ruutu
+  unix_bootin jalkeen, kayttajan resetti + automaattibootin retry OK) = ~1/7
+  boottia taman illan otoksessa, linjassa ~1/4-arvion kanssa. UUSI ISSUE-24:
+  init 6 jaa runlevel-6-limboon (rc6-userland; manuaali-reboot limbosta toimii =
+  kernel-uadmin OK). Kayttaja konfiguroi automaattibootin unix-040:lle (reset
+  riittaa jatkossa, ei nappailyja).
+
+VIRTAKATKAISU-DISK-TRUTH (paketin viimeinen kohta, sama ilta): syklin 6 press-
+tiedostot (6 x 4 MiB) levylla ~15 min -> VIRTA POIS -> boot (ISSUE-21 osui: musta
+ruutu unix_bootin jalkeen, soft reset -> retry; illan tilasto 2 osumaa / ~9 boottia)
+-> fsck -> automaattinen reboot -> login -13. sum /press1..6.bin LEVYLTA:
+1570 8192 x6 TAYDELLISTA. Model-B-pfn-kirjoitukset osuvat oikeisiin lohkoihin
+levylla asti myos uusien ryhmien kanssa -- paketti A:n kohta 6 -regressio LAPI.
+
+PAKETTI B KOKONAAN AJETTU. Lopullinen verdikti: kaikki 4 Model-B-ryhmaa
+real-HW-hyvaksytty taydella listalla (probet + churn + pressure + burst4-kesto +
+ISSUE-22-jahti 5x0 + disk-truth + kmem-ENXIO + osm 0 bus).
+
+EMU-060-REGRESSIO (roadmap kohta 1; sama ilta, dual-CPU dbg 260719-16, banneri
+"68060-260719-16"): swapls PAGES 25600 FREE 24865; BIGARGV PASS x3; MINCORE PASS
+(8 vec-tavua + EINVAL 22); hat_dup_cow 64 RESULT PASS; burst4 ALLBURSTS-DONE
+24/24 sum 1570 8192 (~5 min, sama nopea profiili kuin 040 = ryhma-3 toimii myos
+060-polulla); 0 BUS ERROR, 0 4AFC005F, swapdiff-vs-golden 0->5 MB.
+=> Kaikki 4 Model-B-ryhmaa + ISSUE-23-serialfiksi regressoitu myos 060:lla.
+Molemmat CPU:t katettu emulla; 040 lisaksi real-HW:lla. Real-060 odottaa rautaa.

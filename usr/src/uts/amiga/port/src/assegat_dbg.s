@@ -1,0 +1,1046 @@
+| assegat_dbg.s -- diagnostic WRAPPER around as_segat (0xadefc, GLOBAL T).
+|
+| Purpose: decide why init's dynamic interpreter (libc.so.1 @ 0x80800000) faults
+| its 2nd page (0x80801000) -> SIGSEGV.  as_fault page-aligns the fault addr and
+| calls as_segat(as, addr) to find the containing segment; a NULL return -> as_fault
+| returns FC_NOMAP (3) -> SIGSEGV.  This wrapper prints the segment as_segat finds
+| (or NULL) + its [base, base+size) bounds for user faults (addr >= 0x80800000).
+|   * seg != NULL with base<=0x80801000<base+size  -> the segment COVERS page 1, so
+|     the failure is INSIDE segvn_fault (vnode/file demand-paging) -- an fs-getpage gap.
+|   * seg == NULL, or base+size == 0x80801000       -> the interpreter segment is too
+|     small (only ~1 page) -- an exec interpreter-mapping / sizing bug.
+|
+| Mechanism (preserves the EXACT original logic -- no reimplementation):
+|   objcopy --add-symbol as_segat_orig=.text:0xadefc,function,global  (alias the original)
+|   objcopy --weaken-symbol as_segat                                  (so this strong def wins)
+|   this file's strong `as_segat` calls `as_segat_orig` (= the unchanged original code).
+| as_segat(as@8, addr@12) returns the seg in BOTH d0 and a0 (NULL = 0).  cmn_err
+| preserves d2-d7/a2-a6, so a2 (saved seg) and d2 (print counter) survive the call.
+
+	.text
+	.globl	as_segat
+as_segat:
+	linkw	%fp,&0
+	moveml	%d2-%d3/%a2,%sp@-
+| --- call the original as_segat (unchanged code at 0xadefc) ---
+	movel	%fp@(12),%sp@-		| addr
+	movel	%fp@(8),%sp@-		| as
+	jsr	as_segat_orig
+	addqw	&8,%sp
+	moveal	%a0,%a2			| a2 = returned seg (preserved across cmn_err)
+| (An earlier ISSUE-37 probe lived here, gated on consecutive as_segat calls with the same
+|  address.  It stayed silent through a real loop that reached n=0x2000, because as_segat has
+|  twenty call sites and any other kernel-range lookup between iterations resets such a
+|  streak.  Removed rather than kept as a fallback: two code paths printing the same message
+|  text would make the output ambiguous.  The working version is in the as_fault wrapper.)
+| --- gated trace for user faults (addr >= 0x80800000), max 16 ---
+	movel	%fp@(12),%d0
+	cmpil	&0x80800000,%d0
+	bcsw	Lsg_done
+	movel	Lsg_n,%d2
+	cmpil	&16,%d2
+	bccw	Lsg_done
+	addql	&1,%d2
+	movel	%d2,Lsg_n
+	tstl	%a2
+	beqw	Lsg_null
+	movel	%a2@(8),%sp@-		| seg size
+	movel	%a2@(4),%sp@-		| seg base
+	movel	%a2,%sp@-		| seg
+	movel	%fp@(12),%sp@-		| addr
+	movel	%fp@(8),%sp@-		| as (which address space is searched)
+	pea	Lsg_msg
+	pea	2
+	jsr	cmn_err
+	lea	%sp@(28),%sp
+	braw	Lsg_done
+Lsg_null:
+	movel	%fp@(12),%sp@-		| addr
+	movel	%fp@(8),%sp@-		| as
+	pea	Lsg_nullmsg
+	pea	2
+	jsr	cmn_err
+	lea	%sp@(16),%sp
+Lsg_done:
+	moveal	%a2,%a0			| restore return value (seg) in a0 and d0
+	movel	%a2,%d0
+	moveml	%fp@(-12),%d2-%d3/%a2
+	unlk	%fp
+	rts
+
+| ===========================================================================
+| execmap WRAPPER (orig 0x57a4c, GLOBAL T) -- print the args exec passes when it
+| maps each ELF LOAD segment, to localize the 1-page interpreter-segment bug.
+| execmap(ctx@8, vaddr@12, filesz@16, zfodsz@20, offset@24, prot@28).  If filesz
+| here = 0x2d7f4 (libc.so.1's PT_LOAD) the size reaching execmap is CORRECT -> the
+| bug is in execmap's own segment installer (VOP_MAP / as_map_reliably / segvn);
+| if filesz is small the ELF program-header read (blkatoff / Model B) is wrong.
+| Same --add-symbol/--weaken wrapper mechanism as as_segat.
+	.globl	execmap
+execmap:
+	linkw	%fp,&0
+	movel	%d2,%sp@-
+	movel	Lem_n,%d2
+	cmpil	&12,%d2
+	bccw	Lem_call
+	addql	&1,%d2
+	movel	%d2,Lem_n
+	movel	%fp@(28),%sp@-		| prot
+	movel	%fp@(24),%sp@-		| offset
+	movel	%fp@(16),%sp@-		| filesz
+	movel	%fp@(12),%sp@-		| vaddr
+	pea	Lem_msg
+	pea	2
+	jsr	cmn_err
+	lea	%sp@(24),%sp
+Lem_call:
+	movel	%fp@(28),%sp@-		| forward all 6 args unchanged
+	movel	%fp@(24),%sp@-
+	movel	%fp@(20),%sp@-
+	movel	%fp@(16),%sp@-
+	movel	%fp@(12),%sp@-
+	movel	%fp@(8),%sp@-
+	jsr	execmap_orig
+	lea	%sp@(24),%sp		| d0/a0 = execmap_orig's return
+| --- DBG (do_reloc 0x66000030 frontier): after loading libc.so.1's DATA segment (vaddr
+|     C102E000), dump the GOT slots the runtime linker derefs: C102FE68 (a5+0xdc) and C102FE6C.
+|     File values are 0x0002e050 / 0x0002e580 (R_68K_RELATIVE).  The linker hasn't run yet, so a
+|     correct COW load reads those file values; if it reads 0x66000030 (the faulting addr) the DATA
+|     segment is MISLOADED (page-cache/COW Model B bug) -- otherwise the runtime linker corrupts it
+|     (bias/reloc).  Marker 'G' then the two values.  lfuword reads curproc (proc 1) user space.
+|     d0/a0 = execmap's return value, saved across the dump (lfuword/serdbg clobber d0/d1/a0/a1). ---
+	moveml	%d0/%a0,%sp@-		| save execmap_orig return (errno + seg)
+	movel	%fp@(12),%d2
+	cmpil	&0xc102e000,%d2
+	bnew	Lem_nogot
+	pea	0x47			| 'G'
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	movel	&0xc102fe68,%sp@-
+	jsr	lfuword
+	addqw	&4,%sp
+	movel	%d0,%sp@-
+	jsr	serdbg_hex
+	addqw	&4,%sp
+	movel	&0xc102fe6c,%sp@-
+	jsr	lfuword
+	addqw	&4,%sp
+	movel	%d0,%sp@-
+	jsr	serdbg_hex
+	addqw	&4,%sp
+Lem_nogot:
+	moveml	%sp@+,%d0/%a0		| restore execmap_orig return
+	movel	%sp@+,%d2
+	unlk	%fp
+	rts
+
+| ===========================================================================
+| copyout WRAPPER (orig 0x576, GLOBAL T) -- print src/dst/len/RETVAL for kernel->user
+| copies to user space (dst >= 0x80000000).  Critical case: main()'s
+| copyout(icode, 0x80800000, szicode) installs proc 1's bootstrap.  If this returns
+| NON-ZERO the user-space `moves` faulted and sf_fault recovery fired -> the 040
+| fault-during-moves restart is broken (icode never lands -> proc 1 runs a zero page
+| -> SIGSEGV).  If it returns 0 but the page is still zero, copyout wrote into the
+| wrong MMU context (URP not proc 1's).  copyout reads its args sp-relatively (no
+| frame), so the wrapper re-pushes them for copyout_orig.
+	.globl	copyout
+copyout:
+	linkw	%fp,&0
+	moveml	%d2-%d3,%sp@-
+	movel	%fp@(16),%sp@-		| len
+	movel	%fp@(12),%sp@-		| dst
+	movel	%fp@(8),%sp@-		| src  (top -> copyout_orig's sp@(4))
+	jsr	copyout_orig
+	lea	%sp@(12),%sp
+	movel	%d0,%d3			| save retval
+	.word	0xf4f8			| cpusha bc -- push copyout's (copyback) icode write to RAM so the
+					|   DTT0-identity PTE walk + RAM scan below read COHERENT memory, not
+					|   stale RAM that misses a still-cached write.
+| --- capture the URP active during copyout; compare to proc 1's runtime URP (ptload
+|     prints urp=7A6C000).  If they DIFFER, copyout wrote into a DIFFERENT address space
+|     than proc 1 runs in -> the icode lands in the wrong context (a 040 newproc/context
+|     bug), NOT a write-back-replay problem (no supervisor fault fired -- kt7 silent). ---
+	.word	0x4e7a			| movec %urp,%d0  (68040 URP = ctrl reg 0x806)
+	.word	0x0806
+	movel	%d0,Lco_urp
+| --- POST-COPYOUT PTE walk for dst=0x80800000: dump URP + leaf PTE RIGHT AFTER copyout wrote the
+|     icode.  Compare to the exece-time leaf PTE (0x07A5D019 -> zero page).  SAME -> copyout wrote
+|     to a phys that the PTE never named (stale-ATC / pfn mismatch at fault time); DIFFERENT ->
+|     the PTE was remapped (P1 -> fresh zero page) between copyout and exec.  Marker 'p'. ---
+	movel	%fp@(12),%d2
+	cmpil	&0x80800000,%d2
+	bnew	Lco_nopte
+	pea	0x70			| 'p' -- post-copyout PTE walk follows
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	.word	0x4e7a,0x1806		| movec %urp,%d1
+	movel	%d1,%sp@-
+	jsr	serdbg_hex
+	addqw	&4,%sp
+	moveal	%d1,%a0
+	movel	%a0@(0x100),%d2		| root[Aidx 0x40]
+	movel	%d2,%sp@-
+	jsr	serdbg_hex
+	addqw	&4,%sp
+	andil	&0xffffff00,%d2
+	moveal	%d2,%a0
+	movel	%a0@(0x80),%d2		| ptr[Bidx 0x20]
+	movel	%d2,%sp@-
+	jsr	serdbg_hex
+	addqw	&4,%sp
+	andil	&0xffffff00,%d2
+	moveal	%d2,%a0
+	movel	%a0@,%d2		| leaf PTE (Cidx 0)
+	movel	%d2,%sp@-
+	jsr	serdbg_hex
+	addqw	&4,%sp
+| --- read user[0x80800000] via lfuword RIGHT AFTER copyout = the CPU's live ATC view.  If this is
+|     0x4FFB0170 (icode) but the exece-time read is 0 -> copyout's fault loaded the ATC with the
+|     phys it wrote (P1) while the RAM leaf descriptor named 07A5D000 -> ATC vs RAM-PTE mismatch at
+|     fault time, exposed once the ATC is flushed.  Marker 'f'. ---
+	pea	0x66			| 'f' -- copyout-time lfuword(0x80800000) follows
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	movel	&0x80800000,%sp@-
+	jsr	lfuword
+	addqw	&4,%sp
+	movel	%d0,%sp@-
+	jsr	serdbg_hex
+	addqw	&4,%sp
+| --- SCAN fast RAM (phys 0x07000000..0x08000000, via DTT0 identity, 4KB step) for the icode
+|     signature 0x4FFB0170 = where copyout ACTUALLY wrote the icode.  's' + the phys (or FFFFFFFF).
+|     == 0x0752E800 (half) -> factor-of-2 (pfn doubled); == 0x07A5D000 -> the walk/read is wrong;
+|     elsewhere -> a different mapping bug.  (One-shot via Lco_n cap; copyout dst==0x80800000.) ---
+	pea	0x73			| 's' -- icode-phys scan result follows
+	jsr	serdbg_mark
+	addqw	&4,%sp
+| scan CHIP RAM first (0x00000000..0x00200000), then FAST RAM (0x07000000..0x08000000), for the
+| icode first long; check every long (step 4) to catch any alignment, report the first match phys.
+	movel	&0x00000000,%d2		| chip RAM start
+Lsc_c:
+	cmpil	&0x00200000,%d2
+	bccw	Lsc_fast
+	moveal	%d2,%a0
+	cmpil	&0x4ffb0170,%a0@
+	beqw	Lsc_found
+	addil	&0x1000,%d2
+	braw	Lsc_c
+Lsc_fast:
+	movel	&0x07000000,%d2		| fast RAM start (kernel + page tables region .. main fast RAM)
+Lsc_f:
+	cmpil	&0x09000000,%d2		| extend through 0x08000000.. (AmigaOS ExecBase @0x0800089c)
+	bccw	Lsc_none
+	moveal	%d2,%a0
+	cmpil	&0x4ffb0170,%a0@
+	beqw	Lsc_found
+	addil	&0x1000,%d2
+	braw	Lsc_f
+Lsc_found:
+	movel	%d2,%sp@-		| phys where the icode was found
+	jsr	serdbg_hex
+	addqw	&4,%sp
+	braw	Lsc_sdone
+Lsc_none:
+	movel	&0xffffffff,%sp@-	| not found in chip or fast RAM
+	jsr	serdbg_hex
+	addqw	&4,%sp
+Lsc_sdone:
+| --- BACKED-RAM test: write 0xDEADBEEF to phys 0x07A5D000 (the PTE's phys) via DTT0 identity, read
+|     back.  'b' + readback.  == DEADBEEF -> phys IS backed RAM (so the bug is ATC/translation:
+|     copyout wrote a DIFFERENT phys than the PTE names).  != DEADBEEF -> phys is UNBACKED (the page
+|     allocator handed out a phys not covered by RAM = a 040 physical-memory-map / maxclick bug, the
+|     same root as the 8MB-vs-16MB halving). ---
+| NOTE: the backed-RAM DEADBEEF write probe was REMOVED -- it wrote 0xDEADBEEF to phys 0x07A5D000
+| (= user 0x80800000 offset 0), which would re-corrupt the lea word that the WB040 replay now fixes.
+| --- dump the live CACR ('r').  68040: bit 31 = D-cache enable, bit 15 = I-cache enable.  sup_cacr
+|     .data init is 0x00000800 (an 030-style value); if CACR here has bit31=0 the D-cache is OFF and
+|     the bug is NOT cache coherency (the PTE genuinely names a phys copyout never wrote).  If bit31=1
+|     the copyback D-cache is on -> the page-table coherency story holds. ---
+	pea	0x72			| 'r' -- live CACR follows
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	.word	0x4e7a,0x0002		| movec %cacr,%d0
+	movel	%d0,%sp@-
+	jsr	serdbg_hex
+	addqw	&4,%sp
+| --- CACR=0 (caches off) kills the coherency theory.  Dump the icode page's first 16 bytes via
+|     lfuword (offsets 0/4/8/C) = 'i'.  Expected good icode: 4FFB0170 00000028 700B4E40 60FE....
+|     If offset 0/4 = 0 but offset 8 = 700B4E40 -> the lea (first 8 bytes) was lost while the
+|     moveq#11+trap#0 survived -> the zeros decode as ori.b and fall through to exec, AND the lea
+|     never runs -> USP stays the stale kernel value (070DB958).  That explains the whole failure.
+	pea	0x69			| 'i' -- icode page first 16 bytes follow
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	movel	&0x80800000,%sp@-
+	jsr	lfuword
+	addqw	&4,%sp
+	movel	%d0,%sp@-
+	jsr	serdbg_hex
+	addqw	&4,%sp
+	movel	&0x80800004,%sp@-
+	jsr	lfuword
+	addqw	&4,%sp
+	movel	%d0,%sp@-
+	jsr	serdbg_hex
+	addqw	&4,%sp
+	movel	&0x80800008,%sp@-
+	jsr	lfuword
+	addqw	&4,%sp
+	movel	%d0,%sp@-
+	jsr	serdbg_hex
+	addqw	&4,%sp
+	movel	&0x8080000c,%sp@-
+	jsr	lfuword
+	addqw	&4,%sp
+	movel	%d0,%sp@-
+	jsr	serdbg_hex
+	addqw	&4,%sp
+Lco_nopte:
+	movel	%fp@(12),%d2		| dst
+	cmpil	&0x80000000,%d2
+	bcsw	Lco_done
+| --- NOTE: the old cpusha + user-space readback `moves` probe was REMOVED.  After the
+|     DTT1 fix (S=supervisor-only) user VA 0x80800000 is no longer transparently
+|     translated, so an UNPROTECTED supervisor `moves` to it now faults (the page is
+|     demand-zero, unmapped at copyout time, and this probe has no onfault recovery) ->
+|     kernel bus-error PANIC at copyout+0x44.  The real question (did copyout's own
+|     `moves` land the icode?) is answered downstream: whether proc 1 execs init or
+|     SIGSEGVs, plus the kt7 hook dumping copyout_orig's (recoverable) fault frame. ---
+| --- read copyout's path selector: a0 = *(u+0x730); flag = a0@(140).  Nonzero ->
+|     copyout took rcopyout (RFS remote), not lcopyout (local moves) -> misroute. ---
+	moveal	u+0x730,%a0
+	clrl	%d1
+	movew	%a0@(140),%d1
+	movel	%d1,Lco_flag
+	movel	Lco_n,%d0
+	cmpil	&10,%d0
+	bccw	Lco_done
+	addql	&1,%d0
+	movel	%d0,Lco_n
+	movel	%fp@(4),%sp@-		| caller return addr (which code calls this copyout)
+	movel	Lco_urp,%sp@-		| URP active during copyout (vs proc 1's 70EB000)
+	movel	%d3,%sp@-		| retval
+	movel	%fp@(12),%sp@-		| dst
+	pea	Lco_msg
+	pea	2
+	jsr	cmn_err
+	lea	%sp@(24),%sp
+Lco_done:
+	movel	%d3,%d0			| restore retval
+	moveml	%fp@(-8),%d2-%d3
+	unlk	%fp
+	rts
+
+| ===========================================================================
+| as_map WRAPPER (orig 0xae4f8, GLOBAL T) -- main() does
+|   as_map(as=proc->p_as, 0x80800000, szicode, segvn_create, zfod_argsp)
+| to install the icode segment, then copyout()s into it -- but NEVER checks as_map's
+| return.  If as_map FAILED (segvn_create error / anon), the segment is absent and the
+| copyout `moves` faults with as_segat -> NULL (what we now see).  This prints as_map's
+| `as`, addr and RETURN for the icode mapping, to tell a silent as_map failure (ret!=0)
+| apart from a context/URP mismatch (ret==0 but copyout still faults a different `as`).
+	.globl	as_map
+as_map:
+	linkw	%fp,&0
+	moveml	%d2-%d3,%sp@-
+	movel	%fp@(24),%sp@-		| argsp
+	movel	%fp@(20),%sp@-		| crfp (segvn_create)
+	movel	%fp@(16),%sp@-		| size
+	movel	%fp@(12),%sp@-		| addr
+	movel	%fp@(8),%sp@-		| as
+	jsr	as_map_orig
+	lea	%sp@(20),%sp
+	movel	%d0,%d3			| ret
+	movel	%fp@(12),%d2		| addr
+	cmpil	&0x80800000,%d2		| icode segment?
+	beqw	Lam_print
+	cmpil	&0xc07ff800,%d2		| proc-1 USER STACK segment (main's 2nd as_map)?
+	bnew	Lam_done
+| --- stack as_map RETURNED: proc 1 is past the icode copyout and about to return-to-user.
+|     Drop a DIRECT 'M' marker (survives even if STREAMS never drains) BEFORE the cmn_err so
+|     we can tell "hang in as_map(stack)/return-to-user" (M absent) from "hang in exec" (M+E). ---
+	pea	0x4d			| 'M' -- proc-1 stack mapped; about to rte to user (icode)
+	jsr	serdbg_mark
+	addqw	&4,%sp
+Lam_print:
+	movel	%d3,%sp@-		| ret (0 = success)
+	movel	%fp@(16),%sp@-		| size
+	movel	%fp@(12),%sp@-		| addr
+	movel	%fp@(8),%sp@-		| as (== proc->p_as the segment goes into)
+	pea	Lam_msg
+	pea	2
+	jsr	cmn_err
+	lea	%sp@(24),%sp
+Lam_done:
+	movel	%d3,%d0			| restore as_map's return
+	moveml	%fp@(-8),%d2-%d3
+	unlk	%fp
+	rts
+
+| ===========================================================================
+| as_fault WRAPPER (orig 0xae108, GLOBAL T) -- trace the GOT-page fault handling.  do_reloc's
+| writes to libc.so.1's GOT (page C102F000) don't persist while a kernel suword to the SAME page
+| does -- both go usrxmemflt -> as_fault -> wb040 replay.  Dump (addr, type, rw, ret) for faults in
+| the GOT data segment [C102E000, C1031000) so we can see: is the WRITE classified rw=2 (my 040 SSW
+| fix), and does as_fault RESOLVE it (ret==0, so wb040 replays)?  Capped at 24, CE_WARN.
+	.globl	as_fault
+as_fault:
+	linkw	%fp,&0
+	moveml	%d2-%d3/%a2-%a3,%sp@-
+	movel	%fp@(24),%sp@-		| rw
+	movel	%fp@(20),%sp@-		| type
+	movel	%fp@(16),%sp@-		| len
+	movel	%fp@(12),%sp@-		| addr
+	movel	%fp@(8),%sp@-		| as
+	jsr	as_fault_orig
+	lea	%sp@(20),%sp
+	movel	%d0,%d2			| ret
+| --- FAIL logger (2026-07-03 NIGHT, the date unresolvable-fault loop): the clock sampler
+|     showed pid 24 cycling usrxmemflt -> hardbus -> trapsig forever = as_fault FAILS every
+|     iteration.  Log EVERY nonzero return (pid, addr, type F_INVAL=0/F_PROT=1/F_SOFTLOCK=2,
+|     rw, ret) with its own cap 64 -- names the fault VA + error code in one boot. ---
+	tstl	%d2
+	beqw	Laff_rep
+	movel	Laff_n,%d1
+	cmpil	&64,%d1
+	bccw	Laff_rep
+	addql	&1,%d1
+	movel	%d1,Laff_n
+	movel	%d2,%sp@-		| ret
+	movel	%fp@(24),%sp@-		| rw
+	movel	%fp@(20),%sp@-		| type
+	movel	%fp@(12),%sp@-		| addr
+	moveal	u+0x730,%a0		| curproc
+	moveal	%a0@(264),%a0		| p_pidp
+	movel	%a0@(4),%sp@-		| pid
+	pea	Laff_msg
+	pea	2
+	jsr	cmn_err
+	lea	%sp@(28),%sp
+Laff_rep:
+| --- REPEAT detector (2026-07-03 NIGHT): boot 9 showed the loop's as_fault calls all return 0
+|     (FAIL logger silent) -- so the SAME address gets "resolved" over and over.  Track the last
+|     fault addr; on repeats log every 512th with the USER PC (u_ar0@66 = the faulting user
+|     instruction) so the looping (addr, upc, type, ret) tuple is named.  Cap 16 prints. ---
+	movel	%fp@(12),%d1
+	cmpl	Laflp_addr,%d1
+	beqw	Laflp_same
+	movel	%d1,Laflp_addr
+	clrl	Laflp_n
+	braw	Laff_ok
+Laflp_same:
+	addql	&1,Laflp_n
+| --- ISSUE-37 v2 (2026-07-28): name the segment that owns a LOOPING kernel-VA fault.
+|     v1 put this in the as_segat wrapper, gated on consecutive as_segat calls with the same
+|     address, and it stayed SILENT through a real loop that reached n=0x2000.  The reason is
+|     structural: as_segat has TWENTY call sites, so any other kernel-range lookup between two
+|     loop iterations resets a consecutive-streak counter.  Never gate on a streak in a function
+|     that half the VM calls.
+|     THIS counter is the right one, measured rather than assumed: the as_fault REPEAT detector
+|     produced 0 lines across four healthy emulator boots (040 and 060) and 38 lines on hardware,
+|     all of them inside the two wolf3d loops.  So reaching 512 consecutive faults on ONE address
+|     is already proof of a loop, and the same trigger that prints the REPEAT line can print the
+|     segment identity.  Compare the ops pointer against (runtime .data base + these offsets):
+|         segdev_ops 0xb380  segkmem_ops 0xb3c4  segmap_ops 0xb408  segu_ops 0xb450  segvn_ops 0xb494
+|     as_fault hands as_segat the PAGE-ROUNDED address (andiw #-4096 at 0xae156), so round it the
+|     same way here or the lookup is not the one the loop is doing.  Fires once per streak, cap 4.
+	movel	Laflp_n,%d1
+	cmpil	&512,%d1
+	bnew	Lafseg_skip
+	movel	%fp@(12),%d3
+	cmpil	&0x40000000,%d3
+	bcsw	Lafseg_skip
+	cmpil	&0x50000000,%d3
+	bccw	Lafseg_skip
+	movel	Lafseg_p,%d1
+	cmpil	&4,%d1
+	bccw	Lafseg_skip
+	addql	&1,%d1
+	movel	%d1,Lafseg_p
+	movel	%d3,%d1
+	andil	&0xfffff000,%d1		| the rounded VA as_fault itself looked up
+	movel	%d1,%sp@-
+	movel	%fp@(8),%sp@-		| the SAME address space as_fault used
+	jsr	as_segat_orig		| _orig: never re-enter our own as_segat wrapper
+	addqw	&8,%sp
+	moveal	%a0,%a3			| a3 = seg (NULL possible: that would be FC_NOMAP)
+	tstl	%a3
+	beqw	Lafseg_null
+	movel	%a3@(24),%sp@-		| seg->s_ops -- the driver identity
+	movel	%a3@(8),%sp@-		| seg size
+	movel	%a3@(4),%sp@-		| seg base
+	movel	%a3,%sp@-		| seg
+	movel	%d3,%sp@-		| the faulting address as reported
+	pea	Lafseg_msg
+	pea	2
+	jsr	cmn_err
+	lea	%sp@(28),%sp
+	braw	Lafseg_skip
+Lafseg_null:
+	movel	%d3,%sp@-
+	pea	Lafseg_nullmsg
+	pea	2
+	jsr	cmn_err
+	lea	%sp@(12),%sp
+Lafseg_skip:
+	movel	Laflp_n,%d1		| reload: the block above clobbered d1
+	andil	&0x1ff,%d1		| every 512th repeat
+	bnew	Laff_str
+	movel	Laflp_p,%d1
+	cmpil	&16,%d1
+	bccw	Laff_ok
+	addql	&1,%d1
+	movel	%d1,Laflp_p
+	movel	Laflp_n,%sp@-		| n (repeat count)
+	movel	%d2,%sp@-		| ret
+	movel	%fp@(20),%sp@-		| type
+	moveal	u+0x864,%a0		| u_ar0
+	movel	%a0@(66),%sp@-		| user PC (the faulting instruction)
+	movel	%fp@(12),%sp@-		| addr
+	moveal	u+0x730,%a0
+	moveal	%a0@(264),%a0
+	movel	%a0@(4),%sp@-		| pid
+	pea	Laflp_msg
+	pea	2
+	jsr	cmn_err
+	lea	%sp@(32),%sp
+Laff_str:
+| --- STREAM sampler (2026-07-03 LATE: boot 10 = REPEAT detector silent -> the loop's fault
+|     addresses ALTERNATE (ping-pong page eviction: mapping B evicts A, touching A evicts B --
+|     e.g. two VAs colliding on one hat leaf slot), which a consecutive-same-addr streak can
+|     never see.  Sample the address STREAM instead: every 128th as_fault call (cap 48) log
+|     pid/addr/userPC/type/ret -- the loop dominates the stream, so the samples spell out the
+|     alternating working set directly. ---
+	addql	&1,Lafs_n
+	movel	Lafs_n,%d1
+	andil	&0x7f,%d1		| every 128th call
+	bnew	Laff_ok
+	movel	Lafs_p,%d1
+	cmpil	&48,%d1
+	bccw	Laff_ok
+	addql	&1,%d1
+	movel	%d1,Lafs_p
+	movel	%d2,%sp@-		| ret
+	movel	%fp@(20),%sp@-		| type
+	moveal	u+0x864,%a0
+	movel	%a0@(66),%sp@-		| user PC
+	movel	%fp@(12),%sp@-		| addr
+	moveal	u+0x730,%a0
+	moveal	%a0@(264),%a0
+	movel	%a0@(4),%sp@-		| pid
+	pea	Lafs_msg
+	pea	2
+	jsr	cmn_err
+	lea	%sp@(28),%sp
+Laff_ok:
+	movel	%fp@(12),%d0		| addr
+| --- CRASH probe (2026-06-26 PM): the child bus-errors with FAULT ADDR 0xFFFFFFFF (malloc deref of
+|     its bss global 0x80010e48 == 0xFFFFFFFF).  setregs proved 0x80010e48 = 0 at EXEC time, with NO
+|     re-fault of page 0x80010000 before the crash -> the physical page (exec-time pfn 7CAB) is
+|     OVERWRITTEN with 0xFFFFFFFF during sh's run.  On the FFFFFFFF fault, walk the URP for 0x80010000
+|     and dump (leaf PTE = crash-time pfn) + (RAM @ pfn<<12 +0xe48, DTT0 identity).  pfn==7CAB but
+|     RAM==FFFFFFFF -> page stayed mapped, its RAM was reused = double-alloc / page-free bug (fork +
+|     040-no-op hat_dup).  pfn changed -> the mapping was silently replaced.  Cap 4. ---
+	cmpil	&0xffffffff,%d0
+	bnew	Laf_gate
+	movel	Lcrash_n,%d1
+	cmpil	&4,%d1
+	bccw	Laf_done
+	addql	&1,%d1
+	movel	%d1,Lcrash_n
+	.word	0x4e7a,0x0806		| movec %urp,%d0
+	moveal	%d0,%a2
+	movel	&0x80010000,%d1		| va
+	movel	%d1,%d0
+	lsrl	&8,%d0
+	lsrl	&8,%d0
+	lsrl	&8,%d0
+	lsrl	&1,%d0			| va>>25
+	andil	&0x7f,%d0
+	asll	&2,%d0
+	movel	%a2@(0,%d0:l),%d0	| root[Aidx]
+	andil	&0xfffffe00,%d0
+	moveal	%d0,%a2
+	movel	%d1,%d0
+	lsrl	&8,%d0
+	lsrl	&8,%d0
+	lsrl	&2,%d0			| va>>18
+	andil	&0x7f,%d0
+	asll	&2,%d0
+	movel	%a2@(0,%d0:l),%d0	| ptr[Bidx]
+	andil	&0xffffff00,%d0
+	moveal	%d0,%a2
+	movel	%d1,%d0
+	lsrl	&8,%d0
+	lsrl	&4,%d0			| va>>12
+	andil	&0x3f,%d0
+	asll	&2,%d0
+	movel	%a2@(0,%d0:l),%d3	| d3 = leaf PTE (crash-time pfn for 0x80010000)
+	movel	%d3,%d0
+	andil	&0xfffff000,%d0
+	oril	&0xe48,%d0		| phys RAM byte 0xe48 in that page (DTT0 identity)
+	moveal	%d0,%a2
+	movel	%a2@,%d0		| RAM @ 0x80010e48
+	movel	%d0,%sp@-		| RAM value
+	movel	%d3,%sp@-		| leaf PTE
+	pea	Lcrash_msg
+	pea	2
+	jsr	cmn_err
+	lea	%sp@(16),%sp
+	braw	Laf_done
+Laf_gate:
+| --- REFOCUSED gate (2026-06-26 PM): trace ONLY the failing child program's user region
+|     [0x80000000, 0x80020000) = /sbin/sh's text (0x80000034..0x8000d6f8) + data/bss
+|     (0x8000f6f8..0x800114b4).  ROOT FINDING this session: the child bus-error (FFFFFFFF
+|     PC:800024FE) is malloc dereferencing its bss global at 0x80010e48 which reads 0xFFFFFFFF
+|     (NOT file content "(CDS)" nor zero) = a recycled, UNZEROED page.  This trace shows, for
+|     sh's data page 0x80010000: fault type (F_INVAL=fresh anon zero-fill vs F_PROT=COW), the
+|     resolved leaf PTE/pfn (which phys page), and ret -- to decide whether the bzeroba tail-zero
+|     write was lost (COW) or the page was never zero-filled (anon).  The C102 libc-GOT range is
+|     DROPPED: libc's GOT was already confirmed relocated (G-dump = C10xxxxx).  Cap 48 now all
+|     goes to sh. ---
+	cmpil	&0x80000000,%d0
+	bcsw	Laf_done		| addr < 0x80000000 -> skip
+	cmpil	&0x80020000,%d0
+	bccw	Laf_done		| addr >= 0x80020000 -> skip
+Laf_trace:
+	movel	Laf_n,%d0
+	cmpil	&48,%d0
+	bccw	Laf_done
+	addql	&1,%d0
+	movel	%d0,Laf_n
+| --- walk the ACTIVE user page table (URP) for the fault VA and read the leaf PTE, so we see the
+|     page's protection AFTER as_fault resolved it.  d3 = leaf PTE; bit 2 = W (write-protected),
+|     bits 1:0 = UDT (1 = resident).  Tables live in fast-RAM phys (0x07xxxxxx), reachable as
+|     kernel VAs via the DTT0 identity window (va<0x40000000).  Walk: root[va>>25 &7F] (ptr base
+|     bits 31:9) -> ptr[va>>18 &7F] (leaf base bits 31:8) -> leaf[va>>12 &3F]. ---
+	clrl	%d3
+	.word	0x4e7a,0x0806		| movec %urp,%d0  (active user root phys)
+	moveal	%d0,%a2
+	movel	%fp@(12),%d1		| va
+	movel	%d1,%d0
+	lsrl	&8,%d0			| (lsrl max 8) -- shift va>>25 in two steps
+	lsrl	&8,%d0
+	lsrl	&8,%d0
+	lsrl	&1,%d0			| va>>25
+	andil	&0x7f,%d0
+	asll	&2,%d0
+	movel	%a2@(0,%d0:l),%d0	| Adesc = root[Aidx]
+	andil	&0xfffffe00,%d0		| ptr table base
+	moveal	%d0,%a2
+	movel	%d1,%d0
+	lsrl	&8,%d0
+	lsrl	&8,%d0
+	lsrl	&2,%d0			| va>>18
+	andil	&0x7f,%d0
+	asll	&2,%d0
+	movel	%a2@(0,%d0:l),%d0	| Bdesc = ptr[Bidx]
+	andil	&0xffffff00,%d0		| leaf table base
+	moveal	%d0,%a2
+	movel	%d1,%d0
+	lsrl	&8,%d0
+	lsrl	&4,%d0			| va>>12
+	andil	&0x3f,%d0
+	asll	&2,%d0
+	movel	%a2@(0,%d0:l),%d3	| d3 = leaf PTE
+	lea	%a2@(0,%d0:l),%a3	| a3 = &leaf (stashed below if this is sh's data page;
+					|  a3 is reloaded later for the frame walk -- free here)
+| --- record sh's data-page PHYS base for the hatalloc double-alloc detector (hatalloc_dbg.s):
+|     when this fault is in sh's data segment [0x8000f000,0x80012000), stash (leaf PTE & ~0xfff) in
+|     g_shdatabase.  The hat_sdtalloc/hat_ptalloc wrappers then flag any PT allocation that returns
+|     that same phys page = the double-allocation, and log the caller (allocation path). ---
+	movel	%fp@(12),%d0
+	cmpil	&0x80010000,%d0
+	bcsw	Laf_norec
+	cmpil	&0x80011000,%d0
+	bccw	Laf_norec
+	movel	%d3,%d0
+	andil	&0xfffff000,%d0
+	movel	%d0,g_shdatabase
+	movel	%a3,g_shdataleaf	| &leaf: lets the ptalloc DOUBLE probe test whether sh's
+					|  PTE STILL maps the reallocated frame (live vs stale)
+| also compute g_shdatapp = pages + ((base>>12) - pages_base) * 60  (page struct, 60-byte stride)
+| so the page_free wrapper can detect a spurious free of this exact page by pointer compare.
+	movel	%d0,%d1
+	lsrl	&8,%d1
+	lsrl	&4,%d1			| pfn = base >> 12
+	subl	pages_base,%d1		| idx = pfn - pages_base
+	mulul	&60,%d1			| idx * 60
+	addl	pages,%d1		| + pages array base = pp
+	movel	%d1,g_shdatapp
+Laf_norec:
+| --- read the trap frame's 040 SSW (frame+76) via the frame chain: as_fault's caller is
+|     usrxmemflt_orig, so my fp@(0) = usrxmemflt_orig's fp and *(that)+8 = its arg1 = the trap
+|     frame.  SSW bit 8 = RW (1=read,0=write), bit 10 = ATC fault, bits 2:0 = TM/FC.  This
+|     definitively shows whether do_reloc's WRITE is seen as a write (bit8=0) or read. ---
+	moveal	%fp@(0),%a3		| usrxmemflt_orig's fp
+	moveal	%a3@(8),%a3		| trap frame (usrxmemflt_orig arg1)
+	clrl	%d0
+	movew	%a3@(76),%d0		| 040 SSW
+	movel	%d0,%sp@-		| ssw
+	movel	%d3,%sp@-		| leaf PTE
+	movel	%d2,%sp@-		| ret
+	movel	%fp@(24),%sp@-		| rw
+	movel	%fp@(20),%sp@-		| type
+	movel	%fp@(12),%sp@-		| addr
+	pea	Laf_msg
+	pea	2
+	jsr	cmn_err
+	lea	%sp@(32),%sp
+| --- EARLY .dynamic dump (2026-06-26): if THIS fault is the C1030 COW (addr in page C1030000),
+|     dump the .dynamic entries from the JUST-COW'd physical page -- what _rt_setup's dyn[] build
+|     actually reads DURING THE RUN (vs the rexit 'D' probe).  d3 = leaf PTE (survives cmn_err);
+|     phys page = d3 & 0xFFFFF000 (RAM, <0x40000000 -> DTT0 identity); .dynamic @ +0x73C.  Dump
+|     6 longs from page-off 0x764 (= .dynamic[5..7]: DT_SYMENT(0B/10), DT_RELA(07/d0f8),
+|     DT_RELASZ(08/2250)).  Expected output: "0B 10 07 D0F8 08 2250".  If garbage -> dyn[] bounds
+|     wrong -> reloc loop SKIPPED (the bug).  Capped 2.  (.dynamic @ page-off 0x73C, 8B entries.) ---
+	movel	%fp@(12),%d0
+	andil	&0xfffff000,%d0
+	cmpil	&0xc1030000,%d0
+	bnew	Laf_done
+	movel	Ladyn_n,%d0
+	cmpil	&2,%d0
+	bccw	Laf_done
+	addql	&1,%d0
+	movel	%d0,Ladyn_n
+	movel	%d3,%d0
+	andil	&0xfffff000,%d0		| phys base of page C1030000 (DTT0 identity VA)
+	oril	&0x764,%d0		| + .dynamic[5] page-offset (.dynamic@0x73C + 5*8 = 0x764)
+	moveal	%d0,%a2
+	movel	%a2@(20),%sp@-		| .dynamic[5..7] longs (DT_RELASZ val = 0x2250)
+	movel	%a2@(16),%sp@-
+	movel	%a2@(12),%sp@-
+	movel	%a2@(8),%sp@-
+	movel	%a2@(4),%sp@-
+	movel	%a2@(0),%sp@-
+	pea	Ladyn_msg
+	pea	2
+	jsr	cmn_err
+	lea	%sp@(32),%sp
+Laf_done:
+	movel	%d2,%d0
+	moveml	%fp@(-16),%d2-%d3/%a2-%a3
+	unlk	%fp
+	rts
+
+| ===========================================================================
+| rexit WRAPPER (orig 0x3f2c2, GLOBAL T) -- the dynamic linker (libc.so.1) calls exit()
+| BEFORE transferring to init's _start (proven: NO 0x80000000-region code fault ever appears
+| -- init's text @0x80000034 is never executed).  So the interp FAILS after do_reloc and bails.
+| This dumps the exit status + a window of the user stack so we can read the RETURN ADDRESS of
+| the exit() call (a C10xxxxx value = the linker function that decided to exit) and disassemble
+| libc.so.1 there to find the error condition.  rexit(uap@8): *uap = the exit status.
+| Direct serdbg (survives the respawn loop); capped at 2 firings.  Tail-jmps rexit_orig.
+	.globl	rexit
+rexit:
+	linkw	%fp,&0
+	moveml	%d2-%d3/%a2,%sp@-
+	movel	Lrx_n,%d0
+	cmpil	&2,%d0
+	bccw	Lrx_go			| cap at 2
+	addql	&1,%d0
+	movel	%d0,Lrx_n
+	pea	0x52			| 'R' -- rexit reached (exit syscall dispatched)
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	moveal	%fp@(8),%a0		| uap
+	movel	%a0@,%sp@-		| exit status
+	jsr	serdbg_hex
+	addqw	&4,%sp
+| --- DBG (P1/P2/P3 distinguisher): walk curproc URP for C102FDE4 -> leaf PTE (pfn) and read the
+|     slot DIRECTLY from its physical page (DTT0 identity, va<0x40000000).  'P' <leafPTE> <physval>.
+|     pfn 7CFD == the eager-COW page (NOT re-COW'd/reclaimed -> writes truly never landed = P1/P3);
+|     a DIFFERENT pfn -> the page was replaced after do_reloc (P2).  physval vs the lfuword 'G' read:
+|     differ -> lfuword reads a stale ATC/mapping; same raw -> the RAM page itself is unrelocated. ---
+	pea	0x50			| 'P'
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	.word	0x4e7a,0x0806		| movec %urp,%d0
+	moveal	%d0,%a2
+	movel	&0xC102FDE4,%d3		| va (preserved through the 3-level walk)
+	movel	%d3,%d0
+	lsrl	&8,%d0
+	lsrl	&8,%d0
+	lsrl	&8,%d0
+	lsrl	&1,%d0			| va>>25
+	andil	&0x7f,%d0
+	asll	&2,%d0
+	movel	%a2@(0,%d0:l),%d0	| root[Aidx]
+	andil	&0xfffffe00,%d0
+	moveal	%d0,%a2
+	movel	%d3,%d0
+	lsrl	&8,%d0
+	lsrl	&8,%d0
+	lsrl	&2,%d0			| va>>18
+	andil	&0x7f,%d0
+	asll	&2,%d0
+	movel	%a2@(0,%d0:l),%d0	| ptr[Bidx]
+	andil	&0xffffff00,%d0
+	moveal	%d0,%a2
+	movel	%d3,%d0
+	lsrl	&8,%d0
+	lsrl	&4,%d0			| va>>12
+	andil	&0x3f,%d0
+	asll	&2,%d0
+	movel	%a2@(0,%d0:l),%d2	| d2 = leaf PTE
+	movel	%d2,%sp@-
+	jsr	serdbg_hex		| leaf PTE (pfn in bits 31:12)
+	addqw	&4,%sp
+	pea	0x20			| ' '
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	movel	%d2,%d0
+	andil	&0xfffff000,%d0		| phys page base
+	oril	&0xDE4,%d0		| + (C102FDE4 & 0xFFF) = slot +0x58
+	moveal	%d0,%a0
+	movel	%a0@,%sp@-		| read slot DIRECTLY from RAM (DTT0 identity)
+	jsr	serdbg_hex
+	addqw	&4,%sp
+	pea	0x0a			| '\n'
+	jsr	serdbg_mark
+	addqw	&4,%sp
+| --- dump user stack C07FFFB0..C0800010 (24 words) via lfuword = the AUX VECTOR region (AT_PHDR(3)
+|     appeared at ~C07FFFB8 in the old window).  Looking for AT_BASE (type 7) <value>: must be
+|     C1000000 (the interp libc.so.1 base) or _rt_setup's self-relocation adds the wrong bias and
+|     leaves the GOT raw.  Each word space-separated; newline at the end. ---
+	movel	&0xC07FFFB0,%d2
+	movel	&24,%d3
+Lrx_loop:
+	pea	0x20			| ' '
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	movel	%d2,%sp@-
+	jsr	lfuword
+	addqw	&4,%sp
+	movel	%d0,%sp@-
+	jsr	serdbg_hex
+	addqw	&4,%sp
+	addil	&4,%d2
+	subql	&1,%d3
+	bnew	Lrx_loop
+	pea	0x0a			| '\n'
+	jsr	serdbg_mark
+	addqw	&4,%sp
+| --- dump the libc.so.1 GOT (mapped @C102FD8C) starting at +0x50, 24 slots, so we can verify
+|     the R_68K_RELATIVE relocations: each should be C101xxxx/C102xxxx (file value + C1000000).
+|     A raw 0x000xxxxx = do_reloc never relocated it; garbage = COW page still wrong.  Marker 'G'.
+|     Key slots: +0x58 (C102FDE4) should be _rtmalloc C101116E; +0xDC (C102FE68) C102E050. ---
+	pea	0x47			| 'G'
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	movel	&0xC102FDDC,%d2		| GOT+0x50
+	movel	&40,%d3			| 40 slots -> +0x50..+0xEC (covers +0x58 _rtmalloc and +0xDC)
+Lrx_got:
+	pea	0x20			| ' '
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	movel	%d2,%sp@-
+	jsr	lfuword
+	addqw	&4,%sp
+	movel	%d0,%sp@-
+	jsr	serdbg_hex
+	addqw	&4,%sp
+	addil	&4,%d2
+	subql	&1,%d3
+	bnew	Lrx_got
+	pea	0x0a			| '\n'
+	jsr	serdbg_mark
+	addqw	&4,%sp
+| --- dump libc.so.1's .dynamic (vaddr C103073C, 22 words) via lfuword.  _rt_setup builds dyn[] from
+|     here and self-relocates with reladdr=ld_base+dyn[DT_RELA(7)], rend=reladdr+dyn[DT_RELASZ(8)].
+|     File values: DT_RELA `00000007 0000D0F8` @C103076C, DT_RELASZ `00000008 00002250` @C1030774,
+|     DT_NULL `00000000` @C103078C.  .dynamic ENDS at the data-segment bss boundary 0x30794, so if
+|     Model B partial-page bss handling zeroed/corrupted these tags -> empty self-reloc loop -> raw
+|     GOT -> linker exits.  Marker 'D'.  (Page C1030000 is the bss-COW pfn 7D00 at rexit; lfuword
+|     reads the same copy _rt_setup saw.) ---
+	pea	0x44			| 'D'
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	movel	&0xC103073C,%d2
+	movel	&22,%d3
+Lrx_dyn:
+	pea	0x20			| ' '
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	movel	%d2,%sp@-
+	jsr	lfuword
+	addqw	&4,%sp
+	movel	%d0,%sp@-
+	jsr	serdbg_hex
+	addqw	&4,%sp
+	addil	&4,%d2
+	subql	&1,%d3
+	bnew	Lrx_dyn
+	pea	0x0a			| '\n'
+	jsr	serdbg_mark
+	addqw	&4,%sp
+| --- dump the RELA table _rt_setup's self-reloc loop walks: vaddr C100D0F8, 6 words = first 2
+|     Elf32_Rela entries (r_offset, r_info, r_addend).  Expected `0002E014 00000016 00011080
+|     0002E03C 00000016 0002E02C`.  If garbage/zero -> the loop reads bad relocations.  Marker 'L'. ---
+	pea	0x4c			| 'L'
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	movel	&0xC100D0F8,%d2
+	movel	&6,%d3
+Lrx_rela:
+	pea	0x20
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	movel	%d2,%sp@-
+	jsr	lfuword
+	addqw	&4,%sp
+	movel	%d0,%sp@-
+	jsr	serdbg_hex
+	addqw	&4,%sp
+	addil	&4,%d2
+	subql	&1,%d3
+	bnew	Lrx_rela
+	pea	0x0a
+	jsr	serdbg_mark
+	addqw	&4,%sp
+| --- DID the self-reloc loop EVER write the relocated _rtmalloc (file 0x1116E + C1000000 =
+|     C101116E) ANYWHERE in fast RAM?  Scan phys [0x07000000,0x08000000) via DTT0 identity, step 4.
+|     'Z' <phys|FFFFFFFF>.  Found -> the loop DID run (the page was later discarded/reverted = P2/
+|     teardown); not found -> the loop never executed its writes (bails/skips despite valid bounds). ---
+	pea	0x5a			| 'Z'
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	movel	&0x07000000,%d2
+Lrx_scan:
+	cmpil	&0x08000000,%d2
+	bccw	Lrx_snone
+	moveal	%d2,%a0
+	cmpil	&0xC101116E,%a0@
+	beqw	Lrx_sfound
+	addil	&4,%d2
+	braw	Lrx_scan
+Lrx_sfound:
+	movel	%d2,%sp@-
+	jsr	serdbg_hex
+	addqw	&4,%sp
+	braw	Lrx_sdone
+Lrx_snone:
+	movel	&0xffffffff,%sp@-
+	jsr	serdbg_hex
+	addqw	&4,%sp
+Lrx_sdone:
+	pea	0x0a
+	jsr	serdbg_mark
+	addqw	&4,%sp
+| --- write-persistence test: store a sentinel to GOT+0x58 (C102FDE4) via the fault-safe suword,
+|     then read it back via lfuword.  Format: 'W' <suword_ret> <readback>.
+|       ret=0 & readback=AA55AA55 -> page WRITABLE (do_reloc's writes should have persisted ->
+|         the bug is a read/write page split, or do_reloc never wrote);
+|       ret=FFFFFFFF             -> the store FAULTED = page READ-ONLY (COW never made it writable);
+|       ret=0 & readback!=sentinel -> reads and writes hit DIFFERENT phys pages (COW map split). ---
+	pea	0x57			| 'W'
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	movel	&0xAA55AA55,%sp@-	| value
+	movel	&0xC102FDE4,%sp@-	| addr = GOT+0x58
+	jsr	suword
+	addqw	&8,%sp
+	movel	%d0,%sp@-		| suword return (0 ok, -1 fault)
+	jsr	serdbg_hex
+	addqw	&4,%sp
+	pea	0x20			| ' '
+	jsr	serdbg_mark
+	addqw	&4,%sp
+	movel	&0xC102FDE4,%sp@-
+	jsr	lfuword
+	addqw	&4,%sp
+	movel	%d0,%sp@-		| read-back value
+	jsr	serdbg_hex
+	addqw	&4,%sp
+	pea	0x0a			| '\n'
+	jsr	serdbg_mark
+	addqw	&4,%sp
+Lrx_go:
+	moveml	%fp@(-12),%d2-%d3/%a2
+	unlk	%fp
+	jmp	rexit_orig
+	nop				| pad appended .text to keep text/data contiguous
+
+	.balign 4			| pad section to a 4-byte multiple (bss placement: rel.c puts .bss at data_end UNALIGNED)
+	.data
+	.even
+Lsg_msg:
+	.asciz	"DBG as_segat as=%x addr=%x -> seg=%x base=%x size=%x"
+	.even
+Lsg_nullmsg:
+	.asciz	"DBG as_segat as=%x addr=%x -> seg=NULL (FC_NOMAP)"
+	.even
+Lsg_n:
+	.long	0
+	.even
+Lem_msg:
+	.asciz	"DBG execmap vaddr=%x filesz=%x off=%x prot=%x"
+	.even
+Lem_n:
+	.long	0
+	.even
+Lco_msg:
+	.asciz	"DBG copyout dst=%x ret=%x urp=%x caller=%x"
+	.even
+Lco_n:
+	.long	0
+Lco_rb:
+	.long	0
+Lco_flag:
+	.long	0
+Lco_urp:
+	.long	0
+	.even
+Lrx_n:
+	.long	0
+	.even
+Laf_msg:
+	.asciz	"DBG as_fault addr=%x type=%x rw=%x ret=%x pte=%x ssw=%x"
+	.even
+Laf_n:
+	.long	0
+	.even
+Ladyn_msg:
+	.asciz	"DBG dynRUN[5..7] %x %x %x %x %x %x (expect 0B 10 07 D0F8 08 2250)"
+	.even
+Ladyn_n:
+	.long	0
+	.even
+Lcrash_msg:
+	.asciz	"DBG CRASH 80010000 leafPTE=%x RAM@e48=%x (exec-pfn was 7CAB; pfn same+RAM FFFF=double-alloc)"
+	.even
+Laff_n:
+	.long	0
+Laff_msg:
+	.asciz	"DBG as_fault FAIL pid=%d addr=%x type=%x rw=%x ret=%x"
+	.even
+Laflp_addr:
+	.long	0
+Laflp_n:
+	.long	0
+Laflp_p:
+	.long	0
+Lafseg_msg:
+	.asciz	"DBG segat LOOP addr=%x seg=%x base=%x size=%x ops=%x"
+	.even
+Lafseg_nullmsg:
+	.asciz	"DBG segat LOOP addr=%x seg=NULL -> as_fault should be returning FC_NOMAP"
+	.even
+Lafseg_p:
+	.long	0
+Laflp_msg:
+	.asciz	"DBG as_fault REPEAT pid=%d addr=%x upc=%x type=%x ret=%x n=%x"
+	.even
+Lafs_n:
+	.long	0
+Lafs_p:
+	.long	0
+Lafs_msg:
+	.asciz	"DBG as_fault STREAM pid=%d addr=%x upc=%x type=%x ret=%x"
+	.even
+Lcrash_n:
+	.long	0
+	.even
+Lam_msg:
+	.asciz	"DBG as_map as=%x addr=%x size=%x ret=%x"
+	.balign 4			| pad section to a 4-byte multiple (bss placement: rel.c puts .bss at data_end UNALIGNED)

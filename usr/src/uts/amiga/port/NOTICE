@@ -1,0 +1,159 @@
+NOTICE
+======
+
+What is in this repository
+--------------------------
+Override units, byte-patch scripts, build tooling, test instruments and documentation written
+for this project.  MIT-licensed; see LICENSE.
+
+How this was made
+-----------------
+Developed by observing, testing and analysing a lawfully acquired AMIX installation, with
+historical System V sources and the Motorola architecture manuals used as behavioural references.
+What this repository distributes is independently written patches, specifications and
+measurements.  It does not distribute the AMIX kernel, decompiled kernel listings, or the
+reference source trees.
+
+Relevant law, stated as references rather than as a conclusion: Finland's Tekijänoikeuslaki
+25 j § (lawful use, error correction, and observing, studying and testing a program's operation)
+and 25 k § (decompilation where necessary for interoperability, under strict conditions); the
+same division appears in Articles 5 and 6 of Directive 2009/24/EC.  The CJEU has separately held
+that a program's functionality and the ideas underlying it are not themselves protected
+expression (C-406/10).  This is not legal advice and no legal conclusion is asserted here.
+
+What is NOT here, and why
+-------------------------
+**Amiga UNIX itself.**  The kernel this port patches is
+
+    Copyright (C) 1991, Commodore Business Machines, Inc. / AT&T
+
+and is not redistributed here in any form -- no kernel binary appears in this repository or its
+releases.  You supply your own licensed installation, and what you build with this repository
+you build from your own copy.
+
+**The AmigaOS bootstrap.**  `unix_boot` is **Markus Wild's** program, distributed on Aminet as
+version 1.1c (`misc/unix/unix_boot`).  It is not a Commodore product, though it is derived from
+Commodore's AMIX boot sources: its own readme says the author took the boot sources from
+`/usr/sys/amiga/boot`, changed them to use DOS instead of device I/O, and converted the assembler
+from SGS to MIT syntax for GCC.  The derived files accordingly still carry
+`Copyright (C) 1991, Commodore Business Machines, Inc.`, and no licence is stated for Markus
+Wild's own work.
+
+Both facts point the same way, which is why the patches that make it work on a 68040/68060 live in
+the companion repository `amix-unix-boot` as **patches only**: you supply `unix_boot` yourself.
+(Until 2026-08-15 this notice said the loader was "likewise Commodore's".  That was wrong, and the
+correction came from the person who knows the Amiga history rather than from the files.)
+
+Third-party material
+--------------------
+One kind only: material **extracted at build time** from a tarball you supply.  No third-party
+source file is checked into this repository.  What is checked in is the licence texts the
+attribution requires, in `THIRD_PARTY_NOTICES/` — those are a condition of the licences rather
+than an exception to the rule, and they are reproduced in full.
+
+**Motorola 68040/68060 Support Packages** (FPSP, ISP).  Extracted at build time from a NetBSD
+source tarball you supply.
+
+Motorola's licence grants use, modification and distribution on two conditions: that the entire
+notice is retained without alteration in any modified or redistributed version, and that modified
+versions are clearly identified as such.  Both are met here:
+
+* the notices are reproduced in full and unaltered in `THIRD_PARTY_NOTICES/`, one file per
+  package;
+* the same notices are assembled and linked into every kernel this repository builds
+  (`copyright.s` / `copyright.S`), and the build fails if either file is missing;
+* the three files in this repository that are modified versions under that licence --
+  `src/fpsp_glue040.s`, `src/fpsp060_glue.s` and `src/fpsp060_head.s` -- each say so in their own
+  header and point at the notice.
+
+**Motorola's own skeleton files.**  The 060SP kit ships `fskeletn.s`, a skeleton the integrator is
+expected to fill in, and two short sequences in `src/fpsp060_glue.s` follow it exactly because the
+package's contract leaves no freedom there: the three-instruction prelude of the six IEEE
+arithmetic exits (`fsave`, write `0x6000` into the saved status word, `frestore`), and the five
+instructions of the BSUN exit that clear the FPSR NaN condition and discard the saved state.  Only
+the destination differs -- ours dispatches to the stock SVR4 signal policy.  NetBSD's `fnetbsd.S`
+is derived from the same skeleton and is identical in these places, which is why the source
+comments name both; the attribution that matters here is Motorola's, and it travels with the
+package as described above.
+
+**NetBSD/m68k FPE** — extracted at build time, exactly as the Motorola packages are, and it is
+not in this repository.  The soft-FPU lane compiles 25 files from `usr/src/sys/arch/m68k/fpe/`
+of the same NetBSD tarball, plus four machine-ABI headers from it (`m68k/cpuframe.h`,
+`m68k/fpreg.h`, `m68k/ieee.h`, `sys/ieee754.h`) that the emulator's own `#include`s reach for and
+AMIX has no equivalent of.  `src/extract_fpe.sh` takes all twenty-nine out of the pinned tarball
+into `build/fpe-src/` on every build: it verifies the tarball's sha256 first, then diffs the
+extracted tree against a second fresh extraction, so an edit or an addition anywhere in that tree
+stops the build instead of reaching a kernel.  `build/` is not tracked, so no file of theirs
+appears in this repository or in its history.  Nothing in the tree is a modified version.  The
+first-party compatibility headers the port had to write live in `src/fpe-compat/`, outside the
+extracted space, and none of them is a copy of a NetBSD header.
+
+That surface is **not one licence**.  It is five families with materially different conditions,
+mapped file by file in `THIRD_PARTY_NOTICES/NETBSD-M68K-FPE.txt`, where all five are reproduced in
+full:
+
+* the **UC Regents / Lawrence Berkeley Laboratory** notice, three numbered conditions plus an
+  unnumbered LBL advertising acknowledgement (UC rescinded the advertising clause for its own BSD
+  files in 1999; stated there as a reference, not as a conclusion) — 10 files;
+* **Ken Nakata**, three-clause — 6 files and part of 2 more; and a two-clause variant on 2 files;
+* **Tetsuya Isaki**, two-clause — 1 file and part of 2 more;
+* **Gordon W. Ross**, genuine four-clause with a **live advertising clause** — 5 files, including
+  the emulator's top-level dispatcher `fpu_emulate.c` and the FP register bit names in
+  `m68k/fpreg.h`, so no build of this emulation avoids it by any route.  Clause 4 binds whoever
+  builds or distributes such a kernel rather than this repository's file list: **all advertising
+  material mentioning features or use of the floating-point emulation must display the
+  acknowledgement "This product includes software developed by Gordon Ross".**
+  `fpu_fscale.c` is the trap worth naming: its copyright line says Ken Nakata and its clause 4
+  says Gordon Ross, so classifying it by copyright holder would lose the obligation;
+* the **University of Utah / UC Regents** notice on `m68k/cpuframe.h` — plain three-clause, no
+  advertising acknowledgement, and the only new copyright holder the header set brought in.
+
+Extracting rather than checking in reduces none of that.  It changes what this repository
+distributes, not what the kernel you build with it carries, and that kernel carries all five.
+
+**NetBSD** was also used as a reference for architectural *behaviour* rather than as a source of
+code, in places unrelated to the above:
+
+* `wb040.s` -- the 68040 write-back realignment, where NetBSD's `m68040_writeback` documents how
+  WB1D/WB2D are justified against WB3D;
+* `fpu060.s` -- confirmation of a single fact, that the 68060 frame discriminator is at `frame+2`
+  and not at byte zero (`switch_subr.s` tests `2(%a2)` on the 060, `(%a2)` otherwise). That file
+  deliberately does **not** follow NetBSD's register ordering, and says so in a section written
+  for the purpose.
+
+NetBSD is BSD-licensed; attribution is given here and at each site in the source.
+
+**Linux/m68k** was consulted for behaviour when establishing contracts (notably the 68060 MA
+fault rounding and the write-back propagation model).  No code was copied.
+
+The one place where interface text is reproduced
+------------------------------------------------
+`include-modelb/sys/param.h` and `include-modelb/sys/immu.h` are this port's page-geometry
+override: the vendor's own headers with the page shift changed from 11 to 12, substituted into a
+mirror sysroot so that C compiled into the kernel sees the same 4 KiB page the kernel uses.
+
+Eleven one-line macros in them are identical to the originals -- `ptob`, `btop`, `btopr`,
+`PAGEMASK`, `PAGEOFFSET`, `phystopfn`, `pfntophys`, `kvtopfn` and the `mmu_*` forms.  That is not
+a shortcut: these macros are the kernel's compile-time ABI, code compiled against them has to
+agree with the kernel bit for bit, and there is no second way to write "shift by the page shift"
+that still interoperates.  What this port changed is the constant.
+
+This is stated rather than buried because the rest of the repository claims to reproduce no
+vendor text, and one exception that nobody mentions is worse than one exception that is argued
+for.  `tools/check-verbatim.py` reports them on every run.
+
+They could be generated at build time from the reader's own installed headers instead -- the same
+patches-not-files pattern this project already uses for the AmigaOS loader.  See
+`tools/check-verbatim.allow` for that option; it is open, not closed.
+
+Patches to other projects
+-------------------------
+`z3660-upstream-patches/` holds two diffs written here and intended for the separate upstream
+projects `amix-z3660scsi` and `amix-z3660net`.  The patch text is ours; the context lines are
+theirs, and those projects carry their own terms.  Nothing in this repository builds or modifies
+them.
+
+Hardware documentation
+----------------------
+Motorola MC68040 and MC68060 user manuals, and Commodore's AMIX headers as installed on the
+user's own system, are the normative references for the architectural work.

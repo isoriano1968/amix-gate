@@ -1,0 +1,263 @@
+F3 M4 -- the five unmeasured enabled classes, measured on silicon, 2026-08-11
+=============================================================================
+
+Kernel: 68060-260810-03, real hardware (solon).  Instrument: test-tools/fpenab060.{c,_asm.s},
+built from the recipes in amix-kernel-analysis/vm-map/F3-M4-UNMEASURED-CLASSES-AUDIT.md.
+Every FPCR enable, input operand, instruction and expected FP0/FPSR/FPIAR is Motorola's, taken
+from dist/ftest.s via that audit.  Nothing was chosen to make a case pass.
+
+WHY A NEW INSTRUMENT.  Motorola's `enabled` group runs all six sub-tests in ONE process, and on
+a signal-delivering Unix the first SIGFPE kills it -- so five of six classes had never executed.
+One child per class, the fp060probe / ftunimp0 / isp61ea shape.
+
+RESULT: THE MAP IS NOW PROVEN FOR ALL SIX CLASSES; FIVE OF SIX ARE BIT-EXACT
+-----------------------------------------------------------------------------
+```
+  OPERR v52  OK  fp0 ffff0000:00000000:00000000  fpsr 01002080  fpiar 800005b0  sigs 1
+  OVFL  v53  OK  fp0 7fff0000:00000000:00000000  fpsr 02001048  fpiar 80000614  sigs 1
+  UNFL  v51  OK  fp0 00000000:40000000:00000000  fpsr 00000800  fpiar 80000678  sigs 1
+  DZ    v50  FP0  got 7fff0000:ffffffff:ffffffff  want 40000000:80000000:00000000
+             FPSR got 00000000  want 02000410
+             FPIAR got 00000000  want 800006da
+  INEX  v49  OK  fp0 50000000:80000000:00000000  fpsr 00000208  fpiar 8000073c  sigs 1
+  SNAN  v54  OK  fp0 7fff0000:80000000:00000001  fpsr 01004080  fpiar 8000079e  sigs 1
+```
+
+FPIAR is compared against the instruction's own exported label, not against a constant typed a
+second time.  Counter deltas across the run, and this is the part that settles attribution:
+
+```
+  f60_vec49_n .. f60_vec54_n   +1 each      all six vectors reached the package
+  f60_snan_n .. f60_inex_n     +1 each      all six left through their OWN class call-out
+  f60_entry_n +6   f60_real_n +6   f60_arith_n +6   f60_done_n +0
+```
+
+So for every class the vector→entry→call-out chain is correct, DZ included.  The M4 map -- a
+permutation, verified statically 9 of 9 from relocations -- is now confirmed by measurement.
+
+THE ONE ANOMALY: DZ's user-visible state, and a hypothesis that explains all three symptoms
+--------------------------------------------------------------------------------------------
+Using the audit's three-way split:
+
+1. wrong vector or wrong package class  -> **ruled out**: f60_vec50_n +1 and f60_dz_n +1,
+   correctly paired, exactly like the five that pass.
+2. right class, wrong package destination/FPSR/FPIAR
+3. right package state, and the SIGNAL path changed it
+
+The evidence points hard at 3, and specifically at an FP state RESET rather than a restore:
+
+```
+  FP0   = 7fff0000:ffffffff:ffffffff     a NaN with every mantissa bit set
+  FPSR  = 0
+  FPIAR = 0
+```
+
+**That triple is the 68k FPU's reset state.** An `frestore` of a null/reset frame format leaves
+exactly that: FP data registers NaN, FPSR and FPIAR zero.  It is not a plausible arithmetic
+result of `fdiv.b #0` on +2 (which is ±Inf), and FPSR/FPIAR being *both* zero is not something
+an arithmetic path produces -- it is what initialisation produces.
+
+So the leading hypothesis is: **on the DZ path the interrupted FP context is reset instead of
+restored across the signal return.**  Stated as a hypothesis, not a conclusion: what is
+measured is the triple above plus correct counters; the mechanism is inferred.
+
+Why only DZ, when five other classes take the same shared exit body and the same signal route,
+is the question that has to be answered next.  Note `_060_fpsp_dz` is the one entry the audit
+records as *adjusting the operand* before exiting (`fpsp.s:3749-3813`), which makes the state it
+leaves behind different from the others by construction.
+
+This is exactly the defect class this instrument was built to find, and it is localised on the
+first run: not "DZ is broken" but "DZ's kernel wiring is right and its post-state is reset".
+
+A DEFECT IN THE INSTRUMENT, FOUND THE SAME WAY
+------------------------------------------------
+The first run reported SNAN as taking no signal at all (`f60_vec54_n` +0).  That was this test's
+fault, not the kernel's: the audit's table does not give SNAN's fixture (it is the control), so
+the input was chosen here -- and `7fff0000:40000000:00000000` sets mantissa bit 62, the QUIET
+bit.  A quiet NaN does not signal.  Corrected to `7fff0000:80000000:00000001` (integer bit set,
+quiet bit clear, one mantissa bit set so it is a NaN and not an Inf), SNAN passes bit-exactly.
+
+Recorded because it is the same lesson twice over: a case that measures nothing looks identical
+to a case that passes, unless a counter says the code was entered.
+
+AN ASSEMBLY TRAP WORTH KEEPING
+--------------------------------
+FPIAR is updated by every FP instruction EXCEPT moves to/from the control registers.  So
+`fmovem.x %fp0,mem` -- the obvious way to capture the result -- overwrites the FPIAR being
+measured.  The snapshot therefore reads FPIAR and FPSR first through control-register moves,
+and FP0 only after.  Reversed, every class would report a wrong FPIAR and it would look like a
+kernel defect.
+
+STATUS
+-------
+* M4's vector map: proven on silicon for all six classes.
+* The shared exit body and `0x6000`: confirmed correct by the audit from three independent
+  implementations, and now consistent with five bit-exact classes.
+* OPERR, OVFL, UNFL, INEX, SNAN: closed.
+* **DZ: open.**  Kernel wiring correct, user-visible post-state is the FPU reset state.
+
+===============================================================================
+DZ SOLVED: it is a STOCK assumption that the 68060 FPSP invalidates
+===============================================================================
+Added 2026-08-11 after two measurement rounds on hardware.
+
+ROUND 1 -- the frame.  `Lco_fparith` was instrumented to record the first word of its own
+fsave frame.  One run named it:
+
+    OPERR 0x7fff        INEX 0x4000        DZ 0x0000
+
+DZ's frame is NULL, because `_fpsp_dz` has already done `frestore FP_SRC(%a6)` before branching
+to the call-out (fpsp.s:3810) and leaves nothing pending.  The frame SIZE was measured too, not
+assumed -- sp either side of the fsave, 12 bytes for both the null and the non-null case, which
+`Lco_bsun`'s own `addl #0xc,%sp` independently agrees with.
+
+ROUND 2 -- the fix that did NOT work, and what that proved.  `Lco_fparith` now skips the
+clear-and-restore when the frame is null (`tstw %sp@` / `lea %sp@(12),%sp`), because
+`frestore` of a null frame is the documented way to RESET the FPU, and because
+`movew #0x6000,2(sp)` was writing into a frame that is not there.
+
+  f60_nullfr_n  0 -> 1     the branch ran, exactly once, on DZ
+  DZ still returned FP0 = all-ones NaN, FPSR = 0, FPIAR = 0
+
+**So our exit was not what reset the FPU.**  Stated plainly because the hypothesis was written
+down before the run: it was wrong.
+
+THE ACTUAL MECHANISM, found by disassembling the kernel's own FP context code:
+
+```
+fpu_save   0x132:  fsave  %a0@(112)          the kernel's OWN fsave
+           0x144:  tstb   %a0@(112)          test the frame's first byte
+           0x148:  beqs   no_fpu1            ZERO -> do NOT save fp0-7/fpcr/fpsr/fpiar
+           0x14a:  fmovemx %fp0-%fp7,%a0@(4)
+
+fpu_restore 0x15e: tstb   %a0@(112)
+            0x162: beqs   null_state         ZERO -> frestore the null frame = RESET the FPU,
+                                             and restore no registers
+```
+
+Called from `savecontext` / `restorecontext` (0x58f8a / 0x58ea4), which is the path `sendsig`
+uses.  So the full chain is:
+
+1. `_fpsp_dz` restores FP_SRC and leaves nothing pending;
+2. our exit reaches `nullvect` -> u_trap -> savecontext -> `fpu_save`;
+3. `fpu_save`'s own fsave yields a NULL frame, so **fp0-7 are never saved**;
+4. the handler returns -> restorecontext -> `fpu_restore` -> `null_state` -> `frestore` of a
+   null frame **resets the FPU** and restores nothing;
+5. the snapshot sees the reset state.
+
+**This is stock AMIX logic and it is not our bug.**  Using a null fsave frame as "this process
+has no live FP state" is a sound optimisation on an 030 or an 040: there, a null frame really
+does mean the FPU was not in use.  The 68060 support package breaks that equivalence -- it
+consumes the internal state before handing control to the OS, so a null frame no longer implies
+dead FP registers.  Same species as ISSUE-41: a stock assumption that this port's new
+circumstances invalidate.
+
+WHY THE NULL-FRAME GUARD STAYS ANYWAY.  It fixes nothing observable today, because `fpu_save`
+discards the registers regardless -- but without it our exit resets the FPU *before*
+`fpu_save` runs, so a corrected `fpu_save` would faithfully save reset registers.  The guard is
+a precondition for the real fix, not an alternative to it.  It also removes the second bug in
+that sequence, the status-word write into a frame that does not exist.
+
+STILL OPEN: `fpu_save` / `fpu_restore` must not use frame-null as a proxy for
+"no live FP state" on the 68060.  That is a change to a path every signal and every context
+switch takes, on both CPUs, so it wants the usual treatment: cputype-gated, counted, and
+measured on both emulator CPUs before hardware.  Not started.
+
+===============================================================================
+ROUND 3: a fix that made it WORSE, reverted, and what it taught
+===============================================================================
+
+Attempted: override `fpu_save` so that on cputype == 60 a NULL fsave frame still saves fp0-7
+and the control registers, and SET bit 0 of `fpu_ptr@(3)` so that `fpu_restore`'s existing
+`null_state` path would bring them back.  The reasoning was that the stock code already
+contains the "null frame but restore the registers" mechanism, so the fix should reuse it
+rather than add a parallel one.
+
+Built clean (reloc 0), all five callers verified to resolve to the override and none to
+`fpu_save_orig`, instruction encodings byte-identical to stock where they should be.  On
+hardware, kernel 68060-260811-04:
+
+```
+  before the change:  5 of 6 bit-exact, DZ alone wrong
+  after  the change:  FPENAB060 bad=6  -- ALL SIX return the FPU reset state
+```
+
+**The change was reverted immediately.**  The tree and `build/unix-040` are back to stock
+`fpu_save` at 0x132 (68040-260811-05); nothing of this attempt is committed except this record.
+
+WHY IT WAS WRONG.  Bit 0 of `fpu_ptr@(3)` was read backwards.  In stock `fpu_save` the test is
+
+    btst &0,%a0@(3) ; bne -> skip saving entirely
+
+so the bit does not mean "a restore is pending"; it means **"the FPU registers are NOT live,
+the pcb copy is authoritative"** -- a lazy-restore flag whose owner is elsewhere in the kernel.
+Setting it whenever the frame is null told the rest of the kernel the exact opposite of the
+truth, on a path taken constantly: `f60_nullsave_n` reached **7100 during boot alone**, so the
+flag was being set thousands of times per minute while the registers were live.
+
+WHAT THIS COSTS AND WHAT IT BUYS.  It cost one hardware boot and it bought two things.
+
+First, the counter that made the blast radius obvious: 7100 null-frame saves in a boot means
+this is the COMMON case, not an exceptional one -- most processes have no live FP state, and
+"always save on the 060" would be a permanent cost on every context switch, not a rare one.
+That reframes the fix: unconditional saving is not obviously the right answer even if it were
+correct.
+
+Second, and more useful: the flag has an owner and a contract, and neither is understood here.
+Before touching this path again someone has to establish, from the sources, **who sets bit 0 of
+`fpu_ptr`, what invariant it carries, and what the lazy-FP contract between fpu_save,
+fpu_restore, savecontext, restorecontext and setuctxt actually is.**  That is a static-analysis
+question of exactly the shape Codex has answered well twice this week, and it should be asked
+before another instruction is written.
+
+STATUS UNCHANGED FROM ROUND 2: five of six enabled classes are bit-exact on silicon; DZ returns
+the FPU reset state because stock `fpu_save` reads a null frame as "no live FP state", which the
+68060 FPSP invalidates.  The cause is known exactly.  The fix is not.
+
+===============================================================================
+CORRECTION (2026-08-11, after Codex's FPU-LAZY-CONTRACT-AUDIT.md, 64b55cf)
+===============================================================================
+**The null-frame diagnosis above is WRONG, and so was the guard written from it.**
+
+On a 68060 the frame discriminator is at **frame + 2**, not at word zero.  Word zero belongs to
+the extended SOURCE OPERAND and carries its exponent.  Motorola writes the exception/idle status
+at `2 + FP_SRC` and NetBSD tests byte two for exactly this reason.
+
+The three words measured in ROUND 1 are therefore not null/non-null tags at all -- they are the
+exponents of this test's own operands, and they predict themselves:
+
+    OPERR   source -Inf        exponent 0x7fff     measured 0x7fff
+    INEX    source +2          exponent 0x4000     measured 0x4000
+    DZ      source  0          exponent 0x0000     measured 0x0000
+
+So DZ never demonstrated a null frame.  The five passing classes passed because their operand's
+exponent happened to be non-zero, which is not a property anyone should be relying on.
+
+CONSEQUENCES, each of which invalidates something asserted earlier in this file:
+
+* `f60_nullfr_n` counted "word zero was zero", not "the frame was null".
+* The 7100 figure from `f60_nullsave_n` was collected through the same wrong predicate and
+  cannot support the cost estimate that was built on it.  It must be remeasured at byte two.
+* **The guard added in ROUND 2 was itself a defect**: `tstw %sp@` classifies a ZERO SOURCE
+  OPERAND as a null frame and discards the state.  It has been removed and Motorola's original
+  three-instruction prelude -- FSAVE, write 0x6000 at offset TWO, FRESTORE -- is restored for
+  all six IEEE exits including DZ (68040-260811-06).
+* The same offset error exists in stock `fpu_save` (0x144) and `fpu_restore` (0x15e), which
+  test byte zero.  That, not a null frame, is why DZ's registers are dropped: for a zero source
+  operand byte zero reads as zero and the stock code concludes there is no live FP state.
+
+WHAT SURVIVES.  The symptom, the counters, the class attribution and the conclusion that the
+cause is in stock context handling rather than in the M4 wiring all stand.  What was wrong was
+the mechanism -- and it was wrong because a byte offset was assumed rather than read from the
+060's frame definition.
+
+Also settled by the audit, and worth recording as a negative: bit 0 of `u.u_fpu.ustate` is
+**UFPRWRT**, meaning a programmatically modified register image.  It is not a lazy-FPU ownership
+flag, its only confirmed setter is `procxmt` / old ptrace at 0x47fac, and the /proc path
+`prsetfpregs` does NOT set it -- a separate latent gap.  All 22 `_fpsp_done` exits were walked
+and no genuine null-frame-with-live-registers state was found statically.
+
+THE CORRECTIVE UNIT is now specified rather than guessed: a cputype-gated 68060 state path that
+tests `fp+0x72` in `fpu_save`/`fpu_restore`, keeps the inherited UFPRWRT semantics and ordering,
+uses a full 12-byte 68060 reset frame in `fpu_setup`, and leaves the 68040 byte-identical.  Not
+started.

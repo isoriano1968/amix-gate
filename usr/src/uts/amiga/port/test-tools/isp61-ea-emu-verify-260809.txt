@@ -1,0 +1,226 @@
+isp61_060.s widened EA decode -- emulator verification, 2026-08-09
+==================================================================
+
+Kernel: 68040/68060-260809-02, one image, both emulator CPU configurations.
+Built by:  sh relink-040.sh
+Reloc validation: TOTAL complaints: 0
+textsize 0xf25dc  (260807-11 was 0xf2508; the delta is this unit plus three counters)
+
+WHY THIS CHANGE EXISTS
+----------------------
+F2's vector-61 unit accepted exactly one encoding, mulsl/mulul #imm32,Dh:Dl, because the
+census of the installed compiler found nothing else.  On 2026-08-09 wolf3d died on real
+hardware at vector 61 and the kernel named the instruction itself:
+
+    isp61_last_insn 4c2e2c01   isp61_last_pc 8000995a   isp61_unsupported_n 1
+    = muls.l (12,%a6),%d1:%d2
+
+a 64-bit multiply taking its source from the stack frame.  See
+docs/REALHW-260807-11-ACCEPTANCE.md section 8 for the attribution: the FPSP served wolf3d 632
+times and declined nothing; this was never a floating-point fault.
+
+SCOPE, MEASURED RATHER THAN GUESSED
+-----------------------------------
+scan060.py over the binary that actually failed -- copied off the machine over NFS and
+checked byte-for-byte against the faulting PC before it was trusted:
+
+    wolf3d     98 x #imm32     20 x (d16,An)     1 x Dn     0 divides, no other mode
+    cpp/cc1   103 x #imm32     (F2's census, 2026-08-06)
+
+Accepted set is now #imm32, (d16,An), (An), Dn -- every mode whose operand address is a pure
+function of the saved state.  Declined, counted, unchanged in behaviour: (An)+ and -(An)
+(they would have to write An back, a second commit), mode 6 and 7/0..7/3 (brief/full
+extension decoder).  Zero measured sites for any of them.
+
+Consequences the change forced, each of which would have been a silent defect:
+  * the encoding length now VARIES (4, 6, 8), so the PC advance is computed, not constant.
+    A fixed +8 would skip the instruction after a short form; a fixed +4 would execute a
+    displacement or immediate as opcodes.
+  * a displacement is SIGNED, a register index is NOT.  Both now appear in the routine.
+  * A7 is declined for (An) and (d16,An): on a user-origin trap it is the USP, which is not
+    in the 60-byte block -- a6+60 is the stacked SR, so indexing it would compute a product
+    from the SR and commit it.
+
+REVIEW BEFORE THE FIRST RUN
+---------------------------
+1. The branch sequence was modelled in Python for ALL 64 EA encodings and compared against
+   the intended table: 0 disagreements.  Ranges land where they should --
+   dn 0x00-0x07, an 0x10-0x17, d16an 0x28-0x2f, imm 0x3c, everything else declined.
+2. This unit now needs copyin to preserve d2/d3/a3/a4, which the original never did (its
+   single copyin ran before any of them was set).  copyin's fast path (0x4fa in
+   build/unix-040) touches only d0/d1/a0/a1; the decisive argument is that every C caller in
+   the kernel already requires d2-d7/a2-a6 to survive it.
+3. objdump prints the brief-format index displacement in HEX and a full 16-bit displacement
+   in DECIMAL, in the same listing.  `%fp@(20,%d0:l)` looked like a wrong constant and is
+   not: assembling 32 gives 0x20.  Verified with a three-line isolation file rather than
+   assumed.
+
+1. isp61ea -- emulated 68060.  7/7 bit-exact, and the decline still declines.
+-----------------------------------------------------------------------------
+Every instruction under test is a literal .word sequence: gcc will not emit these forms on
+purpose, so asking the compiler for them would have measured the compiler.  Expected products
+were computed on the host in exact 64-bit arithmetic and compared as bit patterns -- the
+guest has no long long, and survival is not correctness.
+
+  imm_u  mulu.l #imm     OK  0b00ea4e:242d2080
+  imm_s  muls.l #imm     OK  f8cc93d6:242d2080
+  d16pos muls.l (12,a6)  OK  00000000:0000000f      <- wolf3d's own form
+  d16neg muls.l (-4,a6)  OK  00000000:0000000f      <- NEGATIVE d16: the sign-extension test
+  d16u   mulu.l (12,a6)  OK  fffffffe:00000001
+  an     muls.l (a0)     OK  00000000:80000000      <- 0x80000000 * -1, the N-flag edge case
+  dn     muls.l d3       OK  ffffffff:ffffffc1
+  postinc muls.l (a0)+   declined as designed (status 0x9 = SIGKILL)
+  ISP61EA bad=0
+
+wolf3d cannot test two of these: it only ever uses a POSITIVE displacement, so a missing
+sign-extension would pass end-to-end, and it does not contain the N-flag edge case.
+
+Counters across that one run -- the run is only evidence if the new path was entered:
+
+  isp61_entry_n         0 -> 8      all eight trapped; nothing was retired in hardware
+  isp61_ok_n            0 -> 7
+  isp61_mulu_n          0 -> 2      \  2 + 5 = 7 = ok
+  isp61_muls_n          0 -> 5      /
+  isp61_mem_n           0 -> 4      (12,a6) x2, (-4,a6), (a0)   <- THE NEW PATH
+  isp61_reg_n           0 -> 1      %d3                          <- THE NEW PATH
+  isp61_unsupported_n   0 -> 1      the (a0)+ case
+  isp61_last_insn       4c180c01    exactly the declined encoding
+  isp61_last_pc         80000608    exactly ea_postinc's mulsl address in the disassembly
+  isp61_opfetch_fail_n  0
+  ifetch / nonuser / badframe / trace   all 0
+
+The accounting closes from both directions: entry 8 = ok 7 + unsupported 1, and by source
+imm 2 + mem 4 + reg 1 = 7.
+
+2. Battery -- emulated 68060
+-----------------------------
+Sources compiled in the guest by /usr/ccs/bin/cc (mkall6.sh): 12/12, no errors.
+batteryrun7.sh verified segvn_prot_magic and f60_magic before running anything.
+
+  31 PASS, 0 FAIL
+  PROCTEST, MLOCKTEST, PTRACEPOKE, BMAPTEST, DEVMAPTEST, EXECTEST, MUL64, PROTFAULT a+b
+
+The isp61 block did not move at all across the whole battery -- it stood exactly where
+isp61ea left it (entry 8 / ok 7 / unsupported 1 / mem 4 / reg 1).  Worth recording: even
+MUL64-RESULT PASS costs zero vector-61 traps on this CPU, so the battery is not an
+instrument for this unit.  isp61ea is.
+
+3. The 040 path -- the control, and it came out exactly as registered
+---------------------------------------------------------------------
+Same image, same isp61ea binary, emulated 68040:
+
+  all seven products IDENTICAL to the 68060's, bit for bit
+  EVERY isp61_* counter still 0        <- the unit was never entered
+
+A 68040 retires all eight instructions in hardware, so nothing reaches vector 61.  That is a
+stronger statement than reading the cputype gate: the gate is proven by counter.
+
+  postinc  reported "emulated" here, which is CORRECT on a 68040 -- (a0)+ is a hardware
+  instruction on that CPU.  The first version of the driver judged that case unconditionally
+  and printed bad=1 on the 040 for a kernel that was behaving perfectly.  The case is now
+  reported rather than judged, and its authority is isp61_unsupported_n, which names the
+  reason instead of inferring it from a signal.  The 040 run above was made with the
+  ORIGINAL binary, deliberately: the same binary on both CPUs is worth more than a tidy
+  transcript, and the counters make the interpretation unambiguous either way.
+
+4. Battery -- emulated 68040
+-----------------------------
+Same image, 12/12 compiled in the guest, 31 PASS, 0 FAIL -- identical to the 68060 run.
+
+  every isp61_* counter STILL 0 after the entire battery
+
+So the 040 path is untouched by measurement and not merely by construction, on both the unit
+test and the full battery.
+
+5. HARDWARE -- accepted 2026-08-10 on 68060-260809-03 (unix-040-rtg-isp)
+------------------------------------------------------------------------
+Amiga 3000, 68060 @ 66 MHz, solon.  isp61_magic read at 08113C50 before anything else was
+believed; every counter 0 at boot; kvp_vec[11] and kvp_vec[61] both 0.
+
+5a. isp61ea on real silicon -- IDENTICAL to the emulator, number for number
+
+  7/7 OK, bad=0, and the same seven bit patterns as emu-060 and emu-040
+  postinc  declined (status 0x9)
+  entry 8 = ok 7 + unsupported 1     mulu 2 + muls 5 = 7
+  mem_n 4   reg_n 1                  last_pc 80000608   last_insn 4c180c01
+  ifetch / nonuser / badframe / trace / opfetch_fail   all 0
+
+d16neg passed on hardware: the sign-extension is right on real silicon, and that is the case
+wolf3d could never have exposed.
+
+5b. wolf3d -- THE END-TO-END CASE.  It gets past the level load.
+
+The game started and the level loaded -- the exact point at which it died on 2026-08-09.
+Counter deltas across that one run (baseline = the isp61ea state above):
+
+  isp61_entry_n         8 -> 315496     (+315488)
+  isp61_ok_n            7 -> 315495     (+315488)
+  isp61_mulu_n          2 ->  84207     ( +84205)
+  isp61_muls_n          5 -> 231288     (+231283)
+  isp61_mem_n           4 -> 228438     (+228434)   <- THE FORM THAT USED TO DECLINE
+  isp61_reg_n           1 ->      1     (      0)   wolf3d's single Dn site was not reached
+  isp61_unsupported_n   1 ->      1     (      0)   <- PRE-REGISTERED, and it held
+  isp61_opfetch_fail_n  0 ->      0
+  kvp_vec[61]           1 ->      1     (      0)   the same single event as unsupported_n
+  kvp_vec[11]           0 ->      0     no FP instruction reached nullvect either
+
+The accounting closes: ok = mulu + muls exactly, entry = ok + unsupported exactly, and by
+source imm 87054 + mem 228434 + reg 0 = 315488.
+
+READ THE 1s CAREFULLY.  isp61_unsupported_n and kvp_vec[61] are both 1, and both are
+isp61ea's own deliberate (a0)+ case from 5a -- not wolf3d.  wolf3d declined NOTHING and
+reached nullvect NOT ONCE.  A later reader seeing "unsupported = 1" must not mistake it for
+a failure; that is why the baseline is written out above.
+
+228438 memory-operand multiplies served in a single session, on the encoding that was
+declining one day earlier.  The census said 20 static sites; this is what 20 sites cost in a
+render loop.
+
+5c. Battery on the RTG kernel, on hardware -- 11/11
+
+Run because the RTG image had never carried a battery of its own, on hardware or anywhere.
+Sources compiled in the guest by /usr/ccs/bin/cc: 12/12, no errors.  batteryrun8.sh is
+re-addressed for textsize 0xfb608 -- the two graphics drivers move EVERY anchor, so not one
+of batteryrun7.sh's addresses applies.
+
+  31 PASS, 0 FAIL
+  PROCTEST, FPUTEST Test A, MLOCKTEST, MSYNC-OK, MINCORE, BIGARGV, PTRACEPOKE,
+  BMAPTEST, DEVMAPTEST, EXECTEST, MUL64, PROTFAULT a+b
+
+Counters after it, and this is the point of reading them:
+
+  the ENTIRE isp61 block is byte-identical to the post-wolf3d state -- entry 315496,
+  mem 228438, unsupported 1, last_insn 4c3c1400.  The battery caused ZERO vector-61 traps.
+
+That confirms on hardware what the emulator already showed: the battery is a regression net,
+not an instrument for this unit.  Even MUL64-RESULT PASS costs nothing here.  isp61ea is the
+instrument; without it this change could have shipped with nothing under test having run.
+
+  f60 after the battery: entry 634 = done 634, real 0, last_co 12.
+  634 = wolf3d's 632 + the battery's own fputest Test A (2).  wolf3d's 632 FPSP entries
+  reproduce EXACTLY the figure measured on the previous RTG build (68060-260809-01) in
+  docs/REALHW-260807-11-ACCEPTANCE.md section 8 -- two different kernel builds, same count.
+
+6. Two defects in the harness, found and fixed here rather than glossed
+-----------------------------------------------------------------------
+batteryrun8.sh was generated from batteryrun6.sh by substitution, and substitution is exactly
+where stale addresses survive:
+
+  * ONE ANCHOR DID NOT SUBSTITUTE.  `cputype` still pointed at the -11 image's 0810AB48.  It
+    would not have crashed -- it would have printed an unrelated kernel variable labelled
+    "cputype".  Caught by auditing every address in the script against nm, which is now the
+    rule for a re-addressed runner: check all of them, not the ones you edited.
+  * THE LOG NAME AND SENTINEL DID NOT SUBSTITUTE either (battery6 -> battery8 never matched,
+    because the source said battery6).  The run wrote to /tmp/battery6.log and printed
+    BATTERYRUN6-DONE.  The "verify the log file appears" rule fired correctly and, followed
+    properly, showed the run was HEALTHY under a different name -- not failed.  Both the wrong
+    conclusions available at that moment were wrong in opposite directions.
+  * The AFTER isp61 read was silently dropped for the same reason, so 5c's after-state was
+    read live instead.  Both are fixed in the committed batteryrun8.sh.
+
+5. Files
+---------
+src/isp61_060.s        the widened decode (this unit)
+test-tools/isp61ea.c          the driver: values compared as bit patterns, one child per case
+test-tools/isp61ea_asm.s      one hand-encoded instruction per accepted mode + one declined
+test-tools/batteryrun7.sh     battery re-addressed for textsize 0xf25dc, now reading isp61 too
