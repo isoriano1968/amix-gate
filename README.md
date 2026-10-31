@@ -26,7 +26,7 @@ source.
 | `io/zz9000` | MNT ZZ9000 framebuffer and console |
 | `io/z3660net` | Z3660 onboard Ethernet, by Jussi Alanärä |
 | `io/z3660scsi` | Z3660 SD storage as SCSI, by Jussi Alanärä |
-| `io/soft3d` | soft3D RTG 3D, with Jussi Alanärä |
+| `io/soft3d` | soft3D RTG 3D, with Jussi Alanärä; the current driver is `io/zz9000` |
 | `port` | 68040/68060 port, by Antti Sokero and Jussi Alanärä |
 | `firmware/core1` | Video and GL on core 1, zzgl |
 
