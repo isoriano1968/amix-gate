@@ -1,3 +1,5 @@
+<p align="center"><img src="doc/assets/amix-logo.png" alt="AMIX" width="240"></p>
+
 # amix-gate
 
 The kernel side of AMIX on an A3000 with a Z3660: our drivers, the 68040/68060
@@ -32,6 +34,11 @@ source.
 
 GCC 2.7.2.3, which builds all of the kernel side, is `developer/gcc-27` in
 amix-userland.
+
+## Building
+
+**[doc/building.md](doc/building.md)** covers the compilers, the kernel, drivers and
+core 1.
 
 ## Licence
 
