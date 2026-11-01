@@ -319,8 +319,11 @@ void zzgl_platform_close(void)
 
    if (fd < 0)
       return;
-   if (zblk)
+   if (zblk) {
       zblk[ZB_OWNER] = 0;
+      if (overlay_on)
+         zblk[ZB_OVL_ROW] = ZB_OVL_OFF;      /* a slow last frame must not bring it back */
+   }
    zzgl_close();
    for (t0 = now(); ctl && ctl[W_STATE] == HB_RUNNING && now() - t0 < 2.0; )
       usleep(10000);

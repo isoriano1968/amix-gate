@@ -4594,10 +4594,10 @@ index 2c0bafa..ac99de1 100644
  
 diff --git a/src/gallium/drivers/zz3660/zz_board.c b/src/gallium/drivers/zz3660/zz_board.c
 new file mode 100644
-index 0000000..30c75c9
+index 0000000..ea2645a
 --- /dev/null
 +++ b/src/gallium/drivers/zz3660/zz_board.c
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,204 @@
 +/*
 + * zz_board.c -- the zz3660 stream over the Z3660's ring: zzgl's transport, with
 + * core 1's server underneath.
@@ -4768,6 +4768,9 @@ index 0000000..30c75c9
 +   double t;
 +   uint32_t c[2];
 +
++   /* one overlay: a program's other windows go through X */
++   if (cur && d->drawable != cur)
++      return 0;
 +   gettimeofday(&tv, NULL);
 +   t = tv.tv_sec + tv.tv_usec * 1e-6;
 +   if (w != cur_w || h != cur_h || d->drawable != cur || (!watcher && t >= next)) {
@@ -4801,10 +4804,10 @@ index 0000000..30c75c9
 +}
 diff --git a/src/gallium/drivers/zz3660/zz_driver.c b/src/gallium/drivers/zz3660/zz_driver.c
 new file mode 100644
-index 0000000..55b35f0
+index 0000000..cc79f23
 --- /dev/null
 +++ b/src/gallium/drivers/zz3660/zz_driver.c
-@@ -0,0 +1,898 @@
+@@ -0,0 +1,920 @@
 +/*
 + * zz_driver.c -- zz3660, a Gallium driver that does no work: each pipe_context
 + * call goes to the GPU as a command (zz_proto.h, zz_exec.c).  Modelled on noop
@@ -4909,6 +4912,25 @@ index 0000000..55b35f0
 +   p[0] = op | words << 8;
 +   used += words + 1;
 +   return p + 1;
++}
++
++/* a program may have several contexts: the stream says whose state follows */
++struct zz_context {
++   struct pipe_context base;
++   unsigned id;
++};
++static unsigned contexts, cur_context;
++
++static uint32_t *
++ccmd(struct pipe_context *c, unsigned op, unsigned words)
++{
++   const unsigned id = ((struct zz_context *)c)->id;
++
++   if (id != cur_context) {
++      cmd(ZP_CONTEXT, 1)[0] = id;
++      cur_context = id;
++   }
++   return cmd(op, words);
 +}
 +
 +static inline uint32_t fw(float f) { union { uint32_t u; float f; } c; c.f = f; return c.u; }
@@ -5078,7 +5100,7 @@ index 0000000..55b35f0
 +static void *
 +zz_create_blend(struct pipe_context *pipe, const struct pipe_blend_state *b)
 +{
-+   uint32_t id = new_id(), *p = cmd(ZP_BLEND, 7 + 8 * PIPE_MAX_COLOR_BUFS);
++   uint32_t id = new_id(), *p = ccmd(pipe, ZP_BLEND, 7 + 8 * PIPE_MAX_COLOR_BUFS);
 +   unsigned i;
 +
 +   *p++ = id;
@@ -5094,7 +5116,7 @@ index 0000000..55b35f0
 +static void *
 +zz_create_dsa(struct pipe_context *pipe, const struct pipe_depth_stencil_alpha_state *d)
 +{
-+   uint32_t id = new_id(), *p = cmd(ZP_DSA, 1 + 6 + 14 + 3);
++   uint32_t id = new_id(), *p = ccmd(pipe, ZP_DSA, 1 + 6 + 14 + 3);
 +
 +   *p++ = id;
 +#define PD(x) *p++ = d->depth.x;
@@ -5114,7 +5136,7 @@ index 0000000..55b35f0
 +zz_create_rast(struct pipe_context *pipe, const struct pipe_rasterizer_state *s)
 +{
 +#define ONE(x) + 1
-+   uint32_t id = new_id(), *p = cmd(ZP_RAST, 1 ZZP_RAST(ONE, ONE));
++   uint32_t id = new_id(), *p = ccmd(pipe, ZP_RAST, 1 ZZP_RAST(ONE, ONE));
 +
 +   *p++ = id;
 +   ZZP_RAST(PI, PF)
@@ -5124,7 +5146,7 @@ index 0000000..55b35f0
 +static void *
 +zz_create_sampler(struct pipe_context *pipe, const struct pipe_sampler_state *s)
 +{
-+   uint32_t id = new_id(), *p = cmd(ZP_SAMPLER, 5 ZZP_SAMPLER(ONE, ONE));
++   uint32_t id = new_id(), *p = ccmd(pipe, ZP_SAMPLER, 5 ZZP_SAMPLER(ONE, ONE));
 +   unsigned i;
 +
 +   *p++ = id;
@@ -5137,7 +5159,7 @@ index 0000000..55b35f0
 +static void *
 +zz_create_velems(struct pipe_context *pipe, unsigned n, const struct pipe_vertex_element *e)
 +{
-+   uint32_t id = new_id(), *p = cmd(ZP_VELEMS, 2 + n * 4);
++   uint32_t id = new_id(), *p = ccmd(pipe, ZP_VELEMS, 2 + n * 4);
 +   unsigned i;
 +
 +   *p++ = id;
@@ -5152,7 +5174,7 @@ index 0000000..55b35f0
 +/* as text, as virgl: TGSI tokens are bitfields and do not survive a change of
 +   byte order */
 +static void *
-+create_shader(enum zzp_kind kind, const struct pipe_shader_state *s)
++create_shader(struct pipe_context *pipe, enum zzp_kind kind, const struct pipe_shader_state *s)
 +{
 +   static char *text;
 +   unsigned bytes;
@@ -5165,7 +5187,7 @@ index 0000000..55b35f0
 +      abort();
 +   }
 +   bytes = strlen(text) + 1;
-+   p = cmd(ZP_SHADER, 3 + (bytes + 3) / 4);
++   p = ccmd(pipe, ZP_SHADER, 3 + (bytes + 3) / 4);
 +   p[0] = id;
 +   p[1] = kind;
 +   p[2] = bytes;
@@ -5173,14 +5195,14 @@ index 0000000..55b35f0
 +   return (void *)(uintptr_t)id;
 +}
 +
-+static void *zz_create_vs(struct pipe_context *c, const struct pipe_shader_state *s) { return create_shader(ZK_VS, s); }
-+static void *zz_create_fs(struct pipe_context *c, const struct pipe_shader_state *s) { return create_shader(ZK_FS, s); }
-+static void *zz_create_gs(struct pipe_context *c, const struct pipe_shader_state *s) { return create_shader(ZK_GS, s); }
++static void *zz_create_vs(struct pipe_context *c, const struct pipe_shader_state *s) { return create_shader(c, ZK_VS, s); }
++static void *zz_create_fs(struct pipe_context *c, const struct pipe_shader_state *s) { return create_shader(c, ZK_FS, s); }
++static void *zz_create_gs(struct pipe_context *c, const struct pipe_shader_state *s) { return create_shader(c, ZK_GS, s); }
 +
 +static void
-+bind(enum zzp_kind kind, void *o)
++bind(struct pipe_context *c, enum zzp_kind kind, void *o)
 +{
-+   uint32_t *p = cmd(ZP_BIND, 2);
++   uint32_t *p = ccmd(c, ZP_BIND, 2);
 +
 +   p[0] = kind;
 +   p[1] = (uint32_t)(uintptr_t)o;
@@ -5197,7 +5219,7 @@ index 0000000..55b35f0
 +}
 +
 +#define BD(name, kind) \
-+   static void zz_bind_##name(struct pipe_context *c, void *o) { bind(kind, o); } \
++   static void zz_bind_##name(struct pipe_context *c, void *o) { bind(c, kind, o); } \
 +   static void zz_del_##name(struct pipe_context *c, void *o) { del(kind, o); }
 +BD(blend, ZK_BLEND) BD(dsa, ZK_DSA) BD(rast, ZK_RAST) BD(velems, ZK_VELEMS)
 +BD(vs, ZK_VS) BD(fs, ZK_FS) BD(gs, ZK_GS)
@@ -5207,7 +5229,7 @@ index 0000000..55b35f0
 +static void
 +zz_bind_samplers(struct pipe_context *c, enum pipe_shader_type sh, unsigned start, unsigned n, void **s)
 +{
-+   uint32_t *p = cmd(ZP_BIND_SAMPLERS, 3 + n);
++   uint32_t *p = ccmd(c, ZP_BIND_SAMPLERS, 3 + n);
 +   unsigned i;
 +
 +   p[0] = sh; p[1] = start; p[2] = n;
@@ -5227,7 +5249,7 @@ index 0000000..55b35f0
 +   pipe_resource_reference(&v->base.texture, r);
 +   v->base.context = c;
 +   v->id = new_id();
-+   p = cmd(ZP_VIEW, 12);
++   p = ccmd(c, ZP_VIEW, 12);
 +   p[0] = v->id; p[1] = zr(r)->id; p[2] = t->format; p[3] = t->u.tex.first_layer;
 +   p[4] = t->u.tex.last_layer; p[5] = t->u.tex.first_level; p[6] = t->u.tex.last_level;
 +   p[7] = t->swizzle_r; p[8] = t->swizzle_g; p[9] = t->swizzle_b; p[10] = t->swizzle_a; p[11] = t->target;
@@ -5246,7 +5268,7 @@ index 0000000..55b35f0
 +zz_set_views(struct pipe_context *c, enum pipe_shader_type sh, unsigned start, unsigned n,
 +             struct pipe_sampler_view **v)
 +{
-+   uint32_t *p = cmd(ZP_SET_VIEWS, 3 + n);
++   uint32_t *p = ccmd(c, ZP_SET_VIEWS, 3 + n);
 +   unsigned i;
 +
 +   p[0] = sh; p[1] = start; p[2] = n;
@@ -5268,7 +5290,7 @@ index 0000000..55b35f0
 +   s->base.width = u_minify(r->width0, t->u.tex.level);
 +   s->base.height = u_minify(r->height0, t->u.tex.level);
 +   s->id = new_id();
-+   p = cmd(ZP_SURFACE, 6);
++   p = ccmd(c, ZP_SURFACE, 6);
 +   p[0] = s->id; p[1] = zr(r)->id; p[2] = t->format; p[3] = t->u.tex.level;
 +   p[4] = t->u.tex.first_layer; p[5] = t->u.tex.last_layer;
 +   return &s->base;
@@ -5287,7 +5309,7 @@ index 0000000..55b35f0
 +static void
 +zz_set_framebuffer(struct pipe_context *c, const struct pipe_framebuffer_state *f)
 +{
-+   uint32_t *p = cmd(ZP_FRAMEBUFFER, 6 + f->nr_cbufs);
++   uint32_t *p = ccmd(c, ZP_FRAMEBUFFER, 6 + f->nr_cbufs);
 +   unsigned i;
 +
 +   p[0] = f->width; p[1] = f->height; p[2] = f->nr_cbufs; p[3] = f->layers; p[4] = f->samples;
@@ -5313,7 +5335,7 @@ index 0000000..55b35f0
 +static void
 +zz_set_viewports(struct pipe_context *c, unsigned start, unsigned n, const struct pipe_viewport_state *v)
 +{
-+   uint32_t *p = cmd(ZP_VIEWPORT, 6);
++   uint32_t *p = ccmd(c, ZP_VIEWPORT, 6);
 +   unsigned i;
 +
 +   for (i = 0; i < 3; i++) {
@@ -5325,7 +5347,7 @@ index 0000000..55b35f0
 +static void
 +zz_set_scissors(struct pipe_context *c, unsigned start, unsigned n, const struct pipe_scissor_state *s)
 +{
-+   uint32_t *p = cmd(ZP_SCISSOR, 4);
++   uint32_t *p = ccmd(c, ZP_SCISSOR, 4);
 +
 +   p[0] = s->minx; p[1] = s->miny; p[2] = s->maxx; p[3] = s->maxy;
 +}
@@ -5333,7 +5355,7 @@ index 0000000..55b35f0
 +static void
 +zz_set_blend_color(struct pipe_context *c, const struct pipe_blend_color *b)
 +{
-+   uint32_t *p = cmd(ZP_BLEND_COLOR, 4);
++   uint32_t *p = ccmd(c, ZP_BLEND_COLOR, 4);
 +   unsigned i;
 +
 +   for (i = 0; i < 4; i++)
@@ -5343,24 +5365,24 @@ index 0000000..55b35f0
 +static void
 +zz_set_stencil_ref(struct pipe_context *c, const struct pipe_stencil_ref *r)
 +{
-+   uint32_t *p = cmd(ZP_STENCIL_REF, 2);
++   uint32_t *p = ccmd(c, ZP_STENCIL_REF, 2);
 +
 +   p[0] = r->ref_value[0];
 +   p[1] = r->ref_value[1];
 +}
 +
-+static void zz_set_sample_mask(struct pipe_context *c, unsigned m) { cmd(ZP_SAMPLE_MASK, 1)[0] = m; }
++static void zz_set_sample_mask(struct pipe_context *c, unsigned m) { ccmd(c, ZP_SAMPLE_MASK, 1)[0] = m; }
 +
 +static void
 +zz_set_clip(struct pipe_context *c, const struct pipe_clip_state *s)
 +{
-+   memcpy(cmd(ZP_CLIP, sizeof(s->ucp) / 4), s->ucp, sizeof(s->ucp));
++   memcpy(ccmd(c, ZP_CLIP, sizeof(s->ucp) / 4), s->ucp, sizeof(s->ucp));
 +}
 +
 +static void
 +zz_set_stipple(struct pipe_context *c, const struct pipe_poly_stipple *s)
 +{
-+   memcpy(cmd(ZP_STIPPLE, sizeof(s->stipple) / 4), s->stipple, sizeof(s->stipple));
++   memcpy(ccmd(c, ZP_STIPPLE, sizeof(s->stipple) / 4), s->stipple, sizeof(s->stipple));
 +}
 +
 +static void
@@ -5374,7 +5396,7 @@ index 0000000..55b35f0
 +   if (cb)
 +      data = cb->user_buffer ? cb->user_buffer :
 +             cb->buffer ? zr(cb->buffer)->data + cb->buffer_offset : NULL;
-+   p = cmd(ZP_CONSTBUF, 3 + (size + 3) / 4);
++   p = ccmd(c, ZP_CONSTBUF, 3 + (size + 3) / 4);
 +   p[0] = sh; p[1] = index; p[2] = data ? size : 0;
 +   if (data)
 +      memcpy(&p[3], data, size);
@@ -5383,7 +5405,7 @@ index 0000000..55b35f0
 +static void
 +zz_set_vertex_buffers(struct pipe_context *c, unsigned start, unsigned n, const struct pipe_vertex_buffer *b)
 +{
-+   uint32_t *p = cmd(ZP_VBUFS, 1 + n * 3);
++   uint32_t *p = ccmd(c, ZP_VBUFS, 1 + n * 3);
 +   unsigned i;
 +
 +   p[0] = n;
@@ -5404,7 +5426,7 @@ index 0000000..55b35f0
 +   if (d->index_size)
 +      idx = (d->has_user_indices ? (const uint8_t *)d->index.user : zr(d->index.resource)->data) +
 +            (d->has_user_indices ? 0 : d->start * d->index_size);
-+   p = cmd(ZP_DRAW, 11 + (bytes + 3) / 4);
++   p = ccmd(c, ZP_DRAW, 11 + (bytes + 3) / 4);
 +   p[0] = d->mode; p[1] = d->index_size;
 +   p[2] = d->index_size ? 0 : d->start;
 +   p[3] = d->count; p[4] = d->start_instance; p[5] = d->instance_count;
@@ -5419,7 +5441,7 @@ index 0000000..55b35f0
 +zz_clear(struct pipe_context *c, unsigned buffers, const union pipe_color_union *col, double depth,
 +         unsigned stencil)
 +{
-+   uint32_t *p = cmd(ZP_CLEAR, 7);
++   uint32_t *p = ccmd(c, ZP_CLEAR, 7);
 +
 +   p[0] = buffers;
 +   memcpy(&p[1], col, 16);
@@ -5432,7 +5454,7 @@ index 0000000..55b35f0
 +zz_clear_rt(struct pipe_context *c, struct pipe_surface *d, const union pipe_color_union *col,
 +            unsigned x, unsigned y, unsigned w, unsigned h, bool cond)
 +{
-+   uint32_t *p = cmd(ZP_CLEAR_RT, 9);
++   uint32_t *p = ccmd(c, ZP_CLEAR_RT, 9);
 +
 +   p[0] = ((struct zz_surface *)d)->id;
 +   memcpy(&p[1], col, 16);
@@ -5444,7 +5466,7 @@ index 0000000..55b35f0
 +zz_clear_ds(struct pipe_context *c, struct pipe_surface *d, unsigned flags, double depth, unsigned stencil,
 +            unsigned x, unsigned y, unsigned w, unsigned h, bool cond)
 +{
-+   uint32_t *p = cmd(ZP_CLEAR_DS, 8);
++   uint32_t *p = ccmd(c, ZP_CLEAR_DS, 8);
 +
 +   p[0] = ((struct zz_surface *)d)->id; p[1] = flags; p[2] = fw(depth); p[3] = stencil;
 +   p[4] = x; p[5] = y; p[6] = w; p[7] = h;
@@ -5454,7 +5476,7 @@ index 0000000..55b35f0
 +zz_copy_region(struct pipe_context *c, struct pipe_resource *dst, unsigned dl, unsigned x, unsigned y,
 +               unsigned z, struct pipe_resource *src, unsigned sl, const struct pipe_box *b)
 +{
-+   uint32_t *p = cmd(ZP_COPY, 13);
++   uint32_t *p = ccmd(c, ZP_COPY, 13);
 +
 +   p[0] = zr(dst)->id; p[1] = dl; p[2] = x; p[3] = y; p[4] = z; p[5] = sl;
 +   p[6] = b->x; p[7] = b->y; p[8] = b->z; p[9] = b->width; p[10] = b->height; p[11] = b->depth;
@@ -5465,7 +5487,7 @@ index 0000000..55b35f0
 +static void
 +zz_blit(struct pipe_context *c, const struct pipe_blit_info *b)
 +{
-+   uint32_t *p = cmd(ZP_BLIT, 20);
++   uint32_t *p = ccmd(c, ZP_BLIT, 20);
 +
 +   p[0] = zr(b->dst.resource)->id; p[1] = b->dst.level; p[2] = b->dst.format;
 +   p[3] = b->dst.box.x; p[4] = b->dst.box.y; p[5] = b->dst.box.z;
@@ -5480,7 +5502,7 @@ index 0000000..55b35f0
 +static void
 +zz_flush(struct pipe_context *c, struct pipe_fence_handle **fence, unsigned flags)
 +{
-+   cmd(ZP_FLUSH, 0);
++   ccmd(c, ZP_FLUSH, 0);
 +   flush_cmds();
 +   if (fence)
 +      *fence = (struct pipe_fence_handle *)1;   /* one kind: everything sent */
@@ -5540,13 +5562,16 @@ index 0000000..55b35f0
 +static struct pipe_context *
 +zz_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
 +{
-+   struct pipe_context *c = CALLOC_STRUCT(pipe_context);
++   struct zz_context *z = CALLOC_STRUCT(zz_context);
++   struct pipe_context *c = &z->base;
 +
++   z->id = contexts++ % ZZP_MAX_CONTEXTS;
 +   c->screen = screen;
 +   c->priv = priv;
 +   c->stream_uploader = u_upload_create_default(c);
 +   c->const_uploader = c->stream_uploader;
-+   cmd(ZP_OPEN, 0);
++   if (!z->id && contexts == 1)
++      cmd(ZP_OPEN, 0);
 +   c->destroy = zz_destroy;
 +   c->create_stream_output_target = zz_so_create;
 +   c->stream_output_target_destroy = zz_so_destroy;
@@ -5705,10 +5730,10 @@ index 0000000..55b35f0
 +}
 diff --git a/src/gallium/drivers/zz3660/zz_exec.c b/src/gallium/drivers/zz3660/zz_exec.c
 new file mode 100644
-index 0000000..e7421d5
+index 0000000..6475cba
 --- /dev/null
 +++ b/src/gallium/drivers/zz3660/zz_exec.c
-@@ -0,0 +1,649 @@
+@@ -0,0 +1,721 @@
 +/*
 + * zz_exec.c -- the zz3660 executor: the command stream into a pipe_context.
 + * Nothing here knows which driver is underneath.
@@ -5727,7 +5752,9 @@ index 0000000..e7421d5
 +
 +static struct pipe_screen *screen;
 +static struct pipe_context *gp;
++static struct pipe_context *gps[ZZP_MAX_CONTEXTS];
 +static void *obj[ZZP_MAX_OBJ];                  /* state objects, views, surfaces */
++static uint8_t kinds[ZZP_MAX_OBJ];              /* of obj: ZK_ */
 +static struct pipe_resource *res[ZZP_MAX_OBJ];
 +#define ZZ_TOKENS (1 << 18)
 +static struct tgsi_token *tokens;     /* from the heap: the GL needs the room */
@@ -5740,6 +5767,13 @@ index 0000000..e7421d5
 +static unsigned nvbs, cur_nve;
 +static void *scratch[PIPE_MAX_ATTRIBS];
 +static unsigned scratch_size[PIPE_MAX_ATTRIBS];
++/* what the draw needs of the other contexts */
++static struct {
++   const struct pipe_vertex_element *ve;
++   struct pipe_vertex_buffer vb[PIPE_MAX_ATTRIBS];
++   unsigned nvb, nve;
++} kept[ZZP_MAX_CONTEXTS];
++static unsigned cur_context;
 +
 +static inline uint32_t sw32(uint32_t v) { return __builtin_bswap32(v); }
 +static inline float wf(uint32_t w) { union { uint32_t u; float f; } c; c.u = w; return c.f; }
@@ -5963,13 +5997,6 @@ index 0000000..e7421d5
 +   zzp_present(rgba, w, h, again);
 +}
 +
-+/* a new client, of either kind: its screen is no longer ours to refresh */
-+void
-+zz3660_forget(void)
-+{
-+   shown = 0;
-+}
-+
 +/* the ring is empty: the display keeps being fed, as a real one scans out.  One
 +   frame alone does not reach the screen; a program that draws once has no more */
 +void
@@ -5990,6 +6017,85 @@ index 0000000..e7421d5
 +#define GF(x) s.x = wf(*w++);
 +
 +static void
++drop(unsigned i)
++{
++   void *o = obj[i];
++
++   if (!o)
++      return;
++   switch (kinds[i]) {
++   case ZK_BLEND: gp->delete_blend_state(gp, o); break;
++   case ZK_DSA: gp->delete_depth_stencil_alpha_state(gp, o); break;
++   case ZK_RAST: gp->delete_rasterizer_state(gp, o); break;
++   case ZK_SAMPLER: gp->delete_sampler_state(gp, o); break;
++   case ZK_VELEMS: gp->delete_vertex_elements_state(gp, o); break;
++   case ZK_VS: gp->delete_vs_state(gp, o); break;
++   case ZK_FS: gp->delete_fs_state(gp, o); break;
++   case ZK_GS: gp->delete_gs_state(gp, o); break;
++   case ZK_VIEW: {
++      struct pipe_sampler_view *v = o;
++      pipe_sampler_view_reference(&v, NULL);
++      break;
++   }
++   case ZK_SURFACE: {
++      struct pipe_surface *v = o;
++      pipe_surface_reference(&v, NULL);
++      break;
++   }
++   }
++   obj[i] = NULL;
++}
++
++/* a new client: nothing of the last one stays behind.  Views and surfaces hold
++   their resources: all objects go first, or the textures stay for good */
++static void
++release(void)
++{
++   unsigned i;
++
++#ifdef __z3660core__
++   shown = 0;
++#endif
++   if (!gp)
++      return;
++   for (i = 0; i < ZZP_MAX_OBJ; i++)
++      drop(i);
++   for (i = 0; i < ZZP_MAX_OBJ; i++) {
++      pipe_resource_reference(&res[i], NULL);
++      FREE(ves[i]);
++      ves[i] = NULL;
++   }
++   for (i = 0; i < ZZP_MAX_CONTEXTS; i++) {
++      if (gps[i])
++         gps[i]->destroy(gps[i]);
++      gps[i] = NULL;
++   }
++   memset(kept, 0, sizeof(kept));
++   cur_context = 0;
++   gp = NULL;
++   cur_ve = NULL;
++   cur_nve = 0;
++   nvbs = 0;
++}
++
++static void
++context(unsigned id)
++{
++   kept[cur_context].ve = cur_ve;
++   kept[cur_context].nve = cur_nve;
++   kept[cur_context].nvb = nvbs;
++   memcpy(kept[cur_context].vb, vbs, sizeof(vbs));
++   if (!gps[id])
++      gps[id] = screen->context_create(screen, NULL, 0);
++   gp = gps[id];
++   cur_context = id;
++   cur_ve = kept[id].ve;
++   cur_nve = kept[id].nve;
++   nvbs = kept[id].nvb;
++   memcpy(vbs, kept[id].vb, sizeof(vbs));
++}
++
++static void
 +command(unsigned op, const uint32_t *w, unsigned n, void *reply)
 +{
 +   unsigned i;
@@ -5997,22 +6103,11 @@ index 0000000..e7421d5
 +   switch (op) {
 +   case ZP_OPEN:
 +      /* a new client: nothing of the last one stays behind */
-+#ifdef __z3660core__
-+      shown = 0;
-+#endif
-+      if (gp) {
-+         for (i = 0; i < ZZP_MAX_OBJ; i++) {
-+            pipe_resource_reference(&res[i], NULL);
-+            FREE(ves[i]);
-+            ves[i] = NULL;
-+            obj[i] = NULL;
-+         }
-+         gp->destroy(gp);
-+         cur_ve = NULL;
-+         cur_nve = 0;
-+         nvbs = 0;
-+      }
-+      gp = screen->context_create(screen, NULL, 0);
++      release();
++      gps[0] = gp = screen->context_create(screen, NULL, 0);
++      break;
++   case ZP_CONTEXT:
++      context(w[0] % ZZP_MAX_CONTEXTS);
 +      break;
 +   case ZP_RES_CREATE: {
 +      struct pipe_resource t;
@@ -6023,6 +6118,8 @@ index 0000000..e7421d5
 +      t.bind = w[10] & ~(PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SCANOUT | PIPE_BIND_SHARED);
 +      t.flags = w[11];
 +      res[w[0]] = screen->resource_create(screen, &t);
++      if (!res[w[0]])
++         zzp_refused(t.format << 16 | t.target, w[3] << 16 | w[4]);
 +      break;
 +   }
 +   case ZP_RES_DESTROY:
@@ -6045,6 +6142,7 @@ index 0000000..e7421d5
 +#define GR(x) b.rt[i].x = *w++;
 +         ZZP_RTBLEND(GR, GR)
 +      }
++      kinds[id] = ZK_BLEND;
 +      obj[id] = gp->create_blend_state(gp, &b);
 +      break;
 +   }
@@ -6063,6 +6161,7 @@ index 0000000..e7421d5
 +#define GA(x) d.alpha.x = *w++;
 +#define GAF(x) d.alpha.x = wf(*w++);
 +      ZZP_ALPHA(GA, GAF)
++      kinds[id] = ZK_DSA;
 +      obj[id] = gp->create_depth_stencil_alpha_state(gp, &d);
 +      break;
 +   }
@@ -6072,6 +6171,7 @@ index 0000000..e7421d5
 +
 +      memset(&s, 0, sizeof(s));
 +      ZZP_RAST(GI, GF)
++      kinds[id] = ZK_RAST;
 +      obj[id] = gp->create_rasterizer_state(gp, &s);
 +      break;
 +   }
@@ -6083,6 +6183,7 @@ index 0000000..e7421d5
 +      ZZP_SAMPLER(GI, GF)
 +      for (i = 0; i < 4; i++)
 +         s.border_color.ui[i] = *w++;
++      kinds[id] = ZK_SAMPLER;
 +      obj[id] = gp->create_sampler_state(gp, &s);
 +      break;
 +   }
@@ -6099,6 +6200,7 @@ index 0000000..e7421d5
 +         e->src_offset = *w++; e->vertex_buffer_index = *w++;
 +         e->src_format = *w++; e->instance_divisor = *w++;
 +      }
++      kinds[id] = ZK_VELEMS;
 +      obj[id] = gp->create_vertex_elements_state(gp, c, ves[id]->e);
 +      break;
 +   }
@@ -6113,6 +6215,7 @@ index 0000000..e7421d5
 +      if (!tgsi_text_translate((const char *)&w[3], tokens, ZZ_TOKENS))
 +         break;
 +      s.tokens = tokens;
++      kinds[id] = kind;
 +      obj[id] = kind == ZK_VS ? gp->create_vs_state(gp, &s) :
 +                kind == ZK_FS ? gp->create_fs_state(gp, &s) : gp->create_gs_state(gp, &s);
 +      break;
@@ -6125,6 +6228,9 @@ index 0000000..e7421d5
 +      t.u.tex.first_level = w[5]; t.u.tex.last_level = w[6];
 +      t.swizzle_r = w[7]; t.swizzle_g = w[8]; t.swizzle_b = w[9]; t.swizzle_a = w[10];
 +      t.target = w[11];
++      if (!res[w[1]])
++         break;
++      kinds[w[0]] = ZK_VIEW;
 +      obj[w[0]] = gp->create_sampler_view(gp, res[w[1]], &t);
 +      break;
 +   }
@@ -6133,31 +6239,15 @@ index 0000000..e7421d5
 +
 +      memset(&t, 0, sizeof(t));
 +      t.format = w[2]; t.u.tex.level = w[3]; t.u.tex.first_layer = w[4]; t.u.tex.last_layer = w[5];
++      if (!res[w[1]])
++         break;
++      kinds[w[0]] = ZK_SURFACE;
 +      obj[w[0]] = gp->create_surface(gp, res[w[1]], &t);
 +      break;
 +   }
 +   case ZP_FREE:
-+      switch (w[1]) {
-+      case ZK_BLEND: gp->delete_blend_state(gp, obj[w[0]]); break;
-+      case ZK_DSA: gp->delete_depth_stencil_alpha_state(gp, obj[w[0]]); break;
-+      case ZK_RAST: gp->delete_rasterizer_state(gp, obj[w[0]]); break;
-+      case ZK_SAMPLER: gp->delete_sampler_state(gp, obj[w[0]]); break;
-+      case ZK_VELEMS: gp->delete_vertex_elements_state(gp, obj[w[0]]); break;
-+      case ZK_VS: gp->delete_vs_state(gp, obj[w[0]]); break;
-+      case ZK_FS: gp->delete_fs_state(gp, obj[w[0]]); break;
-+      case ZK_GS: gp->delete_gs_state(gp, obj[w[0]]); break;
-+      case ZK_VIEW: {
-+         struct pipe_sampler_view *v = obj[w[0]];
-+         pipe_sampler_view_reference(&v, NULL);
-+         break;
-+      }
-+      case ZK_SURFACE: {
-+         struct pipe_surface *v = obj[w[0]];
-+         pipe_surface_reference(&v, NULL);
-+         break;
-+      }
-+      }
-+      obj[w[0]] = NULL;
++      kinds[w[0]] = w[1];
++      drop(w[0]);
 +      break;
 +   case ZP_BIND: {
 +      void *o = w[1] ? obj[w[1]] : NULL;
@@ -6335,6 +6425,13 @@ index 0000000..e7421d5
 +   }
 +}
 +
++/* a new client, of either kind */
++void
++zz3660_forget(void)
++{
++   release();
++}
++
 +/* whole commands; payloads (ZP_RES_WRITE, ZP_DRAW, ZP_SHADER) keep their byte order */
 +void
 +zzp_exec(uint32_t *words, unsigned n, void *reply)
@@ -6430,10 +6527,10 @@ index 0000000..6fd76ba
 +int zzp_start(void) { return 1; }
 diff --git a/src/gallium/drivers/zz3660/zz_proto.h b/src/gallium/drivers/zz3660/zz_proto.h
 new file mode 100644
-index 0000000..4e27c35
+index 0000000..cfd393f
 --- /dev/null
 +++ b/src/gallium/drivers/zz3660/zz_proto.h
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,50 @@
 +/*
 + * zz_proto.h -- the zz3660 command stream: pipe_context calls in 32-bit words,
 + * from the driver on the 060 to the executor on the GPU (for now core 1 of the
@@ -6452,7 +6549,7 @@ index 0000000..4e27c35
 +   ZP_FREE, ZP_BIND, ZP_BIND_SAMPLERS, ZP_SET_VIEWS, ZP_FRAMEBUFFER, ZP_VIEWPORT,
 +   ZP_SCISSOR, ZP_BLEND_COLOR, ZP_STENCIL_REF, ZP_SAMPLE_MASK, ZP_CLIP, ZP_STIPPLE,
 +   ZP_CONSTBUF, ZP_VBUFS, ZP_DRAW, ZP_CLEAR, ZP_CLEAR_RT, ZP_CLEAR_DS, ZP_COPY, ZP_BLIT,
-+   ZP_FLUSH, ZP_PRESENT, ZP_COUNT
++   ZP_FLUSH, ZP_PRESENT, ZP_CONTEXT, ZP_COUNT
 +};
 +
 +/* what ZP_BIND and ZP_FREE name */
@@ -6461,6 +6558,7 @@ index 0000000..4e27c35
 +};
 +
 +#define ZZP_MAX_OBJ 8192
++#define ZZP_MAX_CONTEXTS 8
 +
 +/* the executor, fed whole commands; reply: where ZP_RES_READ puts its bytes.
 +   swapped: the sender has the other byte order: the words are turned here
@@ -6479,6 +6577,7 @@ index 0000000..4e27c35
 +int zzp_start(void);
 +int zzp_show(void *priv, uint32_t id, unsigned w, unsigned h);
 +/* the board's: a frame ready, top row first, for its output */
++void zzp_refused(uint32_t what, uint32_t size);
 +void zzp_present(const void *rgba, int w, int h, int again);
 +
 +#endif

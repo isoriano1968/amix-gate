@@ -285,7 +285,7 @@ int main(void)
     put(W_STAGE, 3);
     /* keep off the 060's RAM (and Zorro III RAM) and core 0's firmware:
        a stray pointer faults instead of writing there */
-    for (i = 0x010; i < 0x180; i++)
+    for (i = 0; i < 0x180; i++)      /* from 0: a NULL pointer faults too */
         set_section(i * 0x100000UL, FAULT_POLICY);
     for (i = 0x200; i < 0x300; i++)
         set_section(i * 0x100000UL, FAULT_POLICY);

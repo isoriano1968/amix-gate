@@ -35,6 +35,7 @@ static int fb_w, fb_h;
 void zzp_exec(uint32_t *words, unsigned n, void *reply);
 void zz3660_exec_start(void);
 void zzp_present(const void *rgba, int w, int h, int again);
+#include <malloc.h>
 void zz3660_idle(void);
 void zz3660_forget(void);
 
@@ -341,6 +342,7 @@ command(uint32_t op, uint32_t n)
       zz3660_forget();
       blk_put(ZB_OVL_ROW, 0);
       open_ctx((int)W(0), (int)W(1), (int)W(2), (int)W(3));
+      blk_put(ZB_HEAP_KB, (uint32_t)mallinfo().uordblks >> 10);
       break;
    case ZZ_CLOSE:
       return 1;
@@ -422,6 +424,14 @@ command(uint32_t op, uint32_t n)
       blk_put(ZB_ERROR, op);
    }
    return 0;
+}
+
+/* a resource softpipe would not make: what, for zzglstat */
+void
+zzp_refused(uint32_t what, uint32_t size)
+{
+   blk_put(ZB_ERROR, what | 0x80000000u);
+   blk_put(ZB_MARK, size);
 }
 
 void

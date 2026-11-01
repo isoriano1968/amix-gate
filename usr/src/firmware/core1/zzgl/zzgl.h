@@ -49,6 +49,7 @@ enum {
    ZB_STATS_US,         /* core 1: time of the last frame, us (swap to swap) */
    ZB_OWNER = 10,       /* 060: the process using the server, 0: unknown */
    ZB_OVL_ROW,          /* 060: the overlay's row0 + 1 since ZZ_OVERLAY, 0: as ZZ_OVERLAY said, ZB_OVL_OFF: no more */
+   ZB_HEAP_KB,          /* core 1: heap in use when the last client opened */
    ZB_OVL_SKIP,         /* 060, with ZB_OVL_ROW: columns << 16 | rows of the frame off the screen left and top */
    ZB_OVL_CLIP,         /* 060, with ZB_OVL_ROW: width << 16 | height of what is on the screen */
    ZB_PROF = 16,        /* core 1: sp_fast_prof[0..7] of the last frame (k cycles / counts) */
