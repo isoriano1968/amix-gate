@@ -41,7 +41,7 @@ void zz3660_forget(void);
 
 static uint32_t *buf;           /* the command being decoded */
 static size_t buf_cap;
-static int client_unit;
+static int client_unit, shown_one;
 static unsigned ticks;
 
 static inline uint32_t blk_get(int w) { return be32(E->blk[w]); }
@@ -340,6 +340,7 @@ command(uint32_t op, uint32_t n)
    switch (op) {
    case ZZ_OPEN:
       zz3660_forget();
+      shown_one = 0;
       blk_put(ZB_OVL_ROW, 0);
       open_ctx((int)W(0), (int)W(1), (int)W(2), (int)W(3));
       blk_put(ZB_HEAP_KB, (uint32_t)mallinfo().uordblks >> 10);
@@ -352,6 +353,10 @@ command(uint32_t op, uint32_t n)
    case ZZ_SWAP:
       glFinish();
       E->present(fb, fb_w, fb_h);
+      /* both overlay buffers: a program that loads for minutes has shown one frame */
+      if (!shown_one)
+         E->present(fb, fb_w, fb_h);
+      shown_one = 1;
       blk_put(ZB_FRAMES, blk_get(ZB_FRAMES) + 1);
       break;
    case ZZ_EFFECT:
