@@ -47,6 +47,7 @@ enum {
    ZB_AUDIO_POS,        /* core 1: the HDMI sound DMA's byte position in its ring */
    ZB_AUDIO_SEQ,        /* core 1: counts the updates of ZB_AUDIO_POS */
    ZB_STATS_US,         /* core 1: time of the last frame, us (swap to swap) */
+   ZB_OWNER = 10,       /* 060: the process using the server, 0: unknown */
    ZB_PROF = 16,        /* core 1: sp_fast_prof[0..7] of the last frame (k cycles / counts) */
    ZB_PROF_PATH = 28,   /* core 1: pixels drawn affine (NEON), perspective (NEON), */
    ZB_PROF_EVT = 30,    /* core 1: L1 data cache refills in the spans, last frame */

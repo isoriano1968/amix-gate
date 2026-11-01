@@ -6,6 +6,8 @@
  * switched on the way vplay's zzav.c and glshow do it.
  */
 #include <stdio.h>
+#include <signal.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
@@ -161,8 +163,21 @@ static int start_server(volatile unsigned long *blk)
               "armbench -reload z3660ARM_Core_gpu.bin\n", name);
       return -1;
    }
-   if (blk[ZB_MAGIC] == ZZGL_MAGIC && ctl[W_STATE] == HB_RUNNING)
+   if (blk[ZB_MAGIC] == ZZGL_MAGIC && ctl[W_STATE] == HB_RUNNING) {
+      /* one program at a time: a second stream would wreck the first */
+      const long owner = (long)blk[ZB_OWNER];
+
+      if (owner == 0 || owner == (long)getpid()) {
+         if (owner == 0) {
+            fprintf(stderr, "zzgl: core 1's server is in use (zzglstat -close ends a stale one)\n");
+            return -1;
+         }
+      } else if (kill((pid_t)owner, 0) == 0 || errno == EPERM) {
+         fprintf(stderr, "zzgl: core 1 is in use by process %ld\n", owner);
+         return -1;
+      }
       return 0;                 /* a server left by a program that died */
+   }
    if (ctl[W_STATE] == HB_POSTED || ctl[W_STATE] == HB_RUNNING) {
       fprintf(stderr, "zzgl: core 1 is busy (state %lu)\n", ctl[W_STATE]);
       return -1;
@@ -246,6 +261,7 @@ int zzgl_platform_open(void *dpy, unsigned long win, int x, int y, int w, int h)
    if (start_server(blk) < 0)
       return -1;
    zblk = blk;
+   blk[ZB_OWNER] = (unsigned long)getpid();
    tr.blk = (volatile uint32_t *)blk;
    tr.copy = copy;
    tr.wait = wait_core1;
@@ -282,6 +298,8 @@ void zzgl_platform_close(void)
 
    if (fd < 0)
       return;
+   if (zblk)
+      zblk[ZB_OWNER] = 0;
    zzgl_close();
    for (t0 = now(); ctl && ctl[W_STATE] == HB_RUNNING && now() - t0 < 2.0; )
       usleep(10000);
