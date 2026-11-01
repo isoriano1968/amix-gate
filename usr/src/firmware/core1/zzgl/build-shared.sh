@@ -31,7 +31,7 @@ includedir=\${prefix}/include
 Name: zzgl
 Description: GL on the Z3660's core 1, and sound on its HDMI
 Version: 1
-Libs: -L\${libdir} -R\${libdir} -lzzgl
+Libs: -L\${libdir} -lzzgl
 Cflags: -I\${includedir}/zzgl
 P
 rm -rf "$O"
