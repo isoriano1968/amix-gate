@@ -5587,10 +5587,10 @@ index 0000000..6a2d152
 +}
 diff --git a/src/gallium/drivers/zz3660/zz_exec.c b/src/gallium/drivers/zz3660/zz_exec.c
 new file mode 100644
-index 0000000..9938b95
+index 0000000..ced8e6a
 --- /dev/null
 +++ b/src/gallium/drivers/zz3660/zz_exec.c
-@@ -0,0 +1,597 @@
+@@ -0,0 +1,608 @@
 +/*
 + * zz_exec.c -- the zz3660 executor: the command stream into a pipe_context.
 + * Nothing here knows which driver is underneath.
@@ -5613,6 +5613,8 @@ index 0000000..9938b95
 +static struct pipe_resource *res[ZZP_MAX_OBJ];
 +#define ZZ_TOKENS (1 << 18)
 +static struct tgsi_token *tokens;     /* from the heap: the GL needs the room */
++static void *cbuf[PIPE_SHADER_TYPES][PIPE_MAX_CONSTANT_BUFFERS];
++static unsigned cbuf_size[PIPE_SHADER_TYPES][PIPE_MAX_CONSTANT_BUFFERS];
 +static int swapped;                             /* the sender is big-endian */
 +static const struct pipe_vertex_element *cur_ve;
 +static struct { unsigned n; struct pipe_vertex_element e[PIPE_MAX_ATTRIBS]; } *ves[ZZP_MAX_OBJ];
@@ -5708,10 +5710,11 @@ index 0000000..9938b95
 +      gp->transfer_unmap(gp, t);
 +      for (e = 0; e < cur_nve; e++)
 +         if (cur_ve[e].vertex_buffer_index == b)
-+            for (v = 0; v <= last - first; v++)
++            /* stride 0: one value for all, to turn once */
++            for (v = 0; v <= (stride ? last - first : 0); v++)
 +               swap_element((uint8_t *)scratch[b] + v * stride + cur_ve[e].src_offset, cur_ve[e].src_format);
 +      vb[b].is_user_buffer = true;
-+      vb[b].buffer.user = (const uint8_t *)scratch[b] - first * stride;
++      vb[b].buffer.user = (const uint8_t *)scratch[b] - (ptrdiff_t)first * stride;
 +      vb[b].buffer_offset = 0;
 +   }
 +   gp->set_vertex_buffers(gp, 0, nvbs, vb);
@@ -6097,8 +6100,16 @@ index 0000000..9938b95
 +      struct pipe_constant_buffer c;
 +
 +      memset(&c, 0, sizeof(c));
++      /* softpipe keeps the pointer, past this batch of commands */
++      if (w[2] > cbuf_size[w[0]][w[1]]) {
++         FREE(cbuf[w[0]][w[1]]);
++         cbuf[w[0]][w[1]] = MALLOC(w[2]);
++         cbuf_size[w[0]][w[1]] = w[2];
++      }
++      if (w[2])
++         memcpy(cbuf[w[0]][w[1]], &w[3], w[2]);
 +      c.buffer_size = w[2];
-+      c.user_buffer = c.buffer_size ? &w[3] : NULL;
++      c.user_buffer = c.buffer_size ? cbuf[w[0]][w[1]] : NULL;
 +      gp->set_constant_buffer(gp, w[0], w[1], c.buffer_size ? &c : NULL);
 +      break;
 +   }
