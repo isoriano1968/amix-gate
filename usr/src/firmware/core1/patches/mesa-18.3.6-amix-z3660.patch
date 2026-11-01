@@ -482,7 +482,7 @@ index e149799..1d0f21b 100644
    'draw/draw_vs_variant.c',
    'driver_ddebug/dd_context.c',
 diff --git a/src/gallium/auxiliary/target-helpers/inline_sw_helper.h b/src/gallium/auxiliary/target-helpers/inline_sw_helper.h
-index 5bb77a5..c1e789f 100644
+index 5bb77a5..be735ad 100644
 --- a/src/gallium/auxiliary/target-helpers/inline_sw_helper.h
 +++ b/src/gallium/auxiliary/target-helpers/inline_sw_helper.h
 @@ -2,6 +2,7 @@
@@ -502,19 +502,31 @@ index 5bb77a5..c1e789f 100644
  #endif
  
  #ifdef GALLIUM_LLVMPIPE
-@@ -48,6 +51,12 @@ sw_screen_create_named(struct sw_winsys *winsys, const char *driver)
+@@ -48,6 +51,15 @@ sw_screen_create_named(struct sw_winsys *winsys, const char *driver)
  #if defined(GALLIUM_SOFTPIPE)
     if (screen == NULL && strcmp(driver, "softpipe") == 0)
        screen = softpipe_create_screen(winsys);
-+   if (screen == NULL && strcmp(driver, "zz3660") == 0) {
++   if (screen == NULL && strcmp(driver, "zz3660") == 0 && zzp_start()) {
 +      struct pipe_screen *caps = softpipe_create_screen(winsys);
 +
 +      zzp_exec_init(caps, getenv("ZZ_BE") != NULL);
 +      screen = zz3660_create_screen(caps, winsys);
 +   }
++   /* core 1 runs something else: drawing here is slow, but it draws */
++   if (screen == NULL && strcmp(driver, "zz3660") == 0)
++      screen = softpipe_create_screen(winsys);
  #endif
  
  #if defined(GALLIUM_SWR)
+@@ -67,6 +79,8 @@ sw_screen_create(struct sw_winsys *winsys)
+ 
+ #if defined(GALLIUM_LLVMPIPE)
+    default_driver = "llvmpipe";
++#elif defined(GALLIUM_SOFTPIPE) && defined(__amix__)
++   default_driver = "zz3660";
+ #elif defined(GALLIUM_SOFTPIPE)
+    default_driver = "softpipe";
+ #elif defined(GALLIUM_SWR)
 diff --git a/src/gallium/auxiliary/tgsi/tgsi_exec.c b/src/gallium/auxiliary/tgsi/tgsi_exec.c
 index 5db515a..1cea615 100644
 --- a/src/gallium/auxiliary/tgsi/tgsi_exec.c
@@ -4582,16 +4594,18 @@ index 2c0bafa..ac99de1 100644
  
 diff --git a/src/gallium/drivers/zz3660/zz_board.c b/src/gallium/drivers/zz3660/zz_board.c
 new file mode 100644
-index 0000000..80e5958
+index 0000000..75adf44
 --- /dev/null
 +++ b/src/gallium/drivers/zz3660/zz_board.c
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,119 @@
 +/*
 + * zz_board.c -- the zz3660 stream over the Z3660's ring: zzgl's transport, with
 + * core 1's server underneath.
 + */
 +#include <stdio.h>
 +#include <stdlib.h>
++#include <signal.h>
++#include <unistd.h>
 +#include <sys/time.h>
 +#include <X11/Xlib.h>
 +#include <X11/Xutil.h>
@@ -4606,18 +4620,37 @@ index 0000000..80e5958
 +#include "zzgl_enc.h"
 +#include "zzgl_platform.h"
 +
++static int up;
++
++/* killed: the overlay and core 1's server must not stay behind */
++static void
++on_signal(int s)
++{
++   zzgl_platform_close();
++   signal(s, SIG_DFL);
++   kill(getpid(), s);
++}
++
++int
++zzp_start(void)
++{
++   if (!up && zzgl_platform_server() == 0) {
++      atexit(zzgl_platform_close);
++      if (signal(SIGTERM, on_signal) == SIG_IGN)
++         signal(SIGTERM, SIG_IGN);
++      if (signal(SIGINT, on_signal) == SIG_IGN)
++         signal(SIGINT, SIG_IGN);
++      up = 1;
++   }
++   return up;
++}
++
 +static void
 +start(void)
 +{
-+   static int up;
-+
-+   if (!up) {
-+      if (zzgl_platform_server() != 0) {
-+         fprintf(stderr, "zz3660: no GPU on core 1\n");
-+         exit(1);
-+      }
-+      atexit(zzgl_platform_close);
-+      up = 1;
++   if (!zzp_start()) {
++      fprintf(stderr, "zz3660: no GPU on core 1\n");
++      exit(1);
 +   }
 +}
 +
@@ -4681,14 +4714,15 @@ index 0000000..80e5958
 +   c[1] = id;
 +   zzgl_pipe(c, 2);
 +   zzgl_flush();
++   zzgl_pipe_frame();
 +   return 1;
 +}
 diff --git a/src/gallium/drivers/zz3660/zz_driver.c b/src/gallium/drivers/zz3660/zz_driver.c
 new file mode 100644
-index 0000000..7b68999
+index 0000000..6a2d152
 --- /dev/null
 +++ b/src/gallium/drivers/zz3660/zz_driver.c
-@@ -0,0 +1,855 @@
+@@ -0,0 +1,862 @@
 +/*
 + * zz_driver.c -- zz3660, a Gallium driver that does no work: each pipe_context
 + * call goes to the GPU as a command (zz_proto.h, zz_exec.c).  Modelled on noop
@@ -4761,8 +4795,11 @@ index 0000000..7b68999
 +   free_ids[nfree++] = id;
 +}
 +
-+/* the stream */
-+static uint32_t buf[1 << 21];
++/* the stream, and a shader's text: from the heap, as core 1 links this file too
++   and its GL needs the room */
++#define ZZ_BUF (1 << 21)
++#define ZZ_TEXT (1 << 22)
++static uint32_t *buf;
 +static unsigned used;
 +
 +static void
@@ -4778,9 +4815,11 @@ index 0000000..7b68999
 +{
 +   uint32_t *p;
 +
-+   if (used + words + 1 > ARRAY_SIZE(buf))
++   if (!buf)
++      buf = MALLOC(ZZ_BUF * 4);
++   if (used + words + 1 > ZZ_BUF)
 +      flush_cmds();
-+   if (words + 1 > ARRAY_SIZE(buf)) {
++   if (words + 1 > ZZ_BUF) {
 +      fprintf(stderr, "zz3660: command of %u words\n", words);
 +      abort();
 +   }
@@ -4903,7 +4942,7 @@ index 0000000..7b68999
 +   unsigned y;
 +
 +   /* a big one in pieces of rows, or of bytes for a buffer */
-+   if (words + 1 > ARRAY_SIZE(buf)) {
++   if (words + 1 > ZZ_BUF) {
 +      struct pipe_box part = *b;
 +
 +      if (r->base.target == PIPE_BUFFER) {
@@ -5033,11 +5072,13 @@ index 0000000..7b68999
 +static void *
 +create_shader(enum zzp_kind kind, const struct pipe_shader_state *s)
 +{
-+   static char text[1 << 22];
++   static char *text;
 +   unsigned bytes;
 +   uint32_t id = new_id(), *p;
 +
-+   if (!tgsi_dump_str(s->tokens, TGSI_DUMP_FLOAT_AS_HEX, text, sizeof(text))) {
++   if (!text)
++      text = MALLOC(ZZ_TEXT);
++   if (!tgsi_dump_str(s->tokens, TGSI_DUMP_FLOAT_AS_HEX, text, ZZ_TEXT)) {
 +      fprintf(stderr, "zz3660: shader too long\n");
 +      abort();
 +   }
@@ -5546,10 +5587,10 @@ index 0000000..7b68999
 +}
 diff --git a/src/gallium/drivers/zz3660/zz_exec.c b/src/gallium/drivers/zz3660/zz_exec.c
 new file mode 100644
-index 0000000..a7abb60
+index 0000000..9938b95
 --- /dev/null
 +++ b/src/gallium/drivers/zz3660/zz_exec.c
-@@ -0,0 +1,594 @@
+@@ -0,0 +1,597 @@
 +/*
 + * zz_exec.c -- the zz3660 executor: the command stream into a pipe_context.
 + * Nothing here knows which driver is underneath.
@@ -5570,7 +5611,8 @@ index 0000000..a7abb60
 +static struct pipe_context *gp;
 +static void *obj[ZZP_MAX_OBJ];                  /* state objects, views, surfaces */
 +static struct pipe_resource *res[ZZP_MAX_OBJ];
-+static struct tgsi_token tokens[1 << 18];
++#define ZZ_TOKENS (1 << 18)
++static struct tgsi_token *tokens;     /* from the heap: the GL needs the room */
 +static int swapped;                             /* the sender is big-endian */
 +static const struct pipe_vertex_element *cur_ve;
 +static struct { unsigned n; struct pipe_vertex_element e[PIPE_MAX_ATTRIBS]; } *ves[ZZP_MAX_OBJ];
@@ -5904,7 +5946,9 @@ index 0000000..a7abb60
 +
 +      memset(&s, 0, sizeof(s));
 +      s.type = PIPE_SHADER_IR_TGSI;
-+      if (!tgsi_text_translate((const char *)&w[3], tokens, ARRAY_SIZE(tokens)))
++      if (!tokens)
++         tokens = MALLOC(ZZ_TOKENS * sizeof(*tokens));
++      if (!tgsi_text_translate((const char *)&w[3], tokens, ZZ_TOKENS))
 +         break;
 +      s.tokens = tokens;
 +      obj[id] = kind == ZK_VS ? gp->create_vs_state(gp, &s) :
@@ -6165,10 +6209,10 @@ index 0000000..b7c004c
 +   I(wrap_s) I(wrap_t) I(wrap_r) I(min_img_filter) I(min_mip_filter) I(mag_img_filter) I(compare_mode) I(compare_func) I(normalized_coords) I(max_anisotropy) I(seamless_cube_map) F(lod_bias) F(min_lod) F(max_lod)
 diff --git a/src/gallium/drivers/zz3660/zz_loop.c b/src/gallium/drivers/zz3660/zz_loop.c
 new file mode 100644
-index 0000000..96d1868
+index 0000000..6fd76ba
 --- /dev/null
 +++ b/src/gallium/drivers/zz3660/zz_loop.c
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,45 @@
 +/*
 + * zz_loop.c -- the stream straight into the executor in this process, on softpipe
 + * (GALLIUM_DRIVER=zz3660): the driver tested with no board.  ZZ_BE=1 turns the
@@ -6213,12 +6257,13 @@ index 0000000..96d1868
 +
 +int zzp_show(void *priv, uint32_t id, unsigned w, unsigned h) { return 0; }
 +void zzp_sync(void) { }
++int zzp_start(void) { return 1; }
 diff --git a/src/gallium/drivers/zz3660/zz_proto.h b/src/gallium/drivers/zz3660/zz_proto.h
 new file mode 100644
-index 0000000..0984555
+index 0000000..1120f34
 --- /dev/null
 +++ b/src/gallium/drivers/zz3660/zz_proto.h
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,48 @@
 +/*
 + * zz_proto.h -- the zz3660 command stream: pipe_context calls in 32-bit words,
 + * from the driver on the 060 to the executor on the GPU (for now core 1 of the
@@ -6260,6 +6305,8 @@ index 0000000..0984555
 +/* the resource in the window on the GPU's own output; 0: the transport has
 +   none, the driver goes through the winsys.  priv: flush_frontbuffer's */
 +void zzp_sync(void);
++/* the GPU is there: 1, it may serve from now on */
++int zzp_start(void);
 +int zzp_show(void *priv, uint32_t id, unsigned w, unsigned h);
 +/* the board's: a frame ready, top row first, for its output */
 +void zzp_present(const void *rgba, int w, int h);

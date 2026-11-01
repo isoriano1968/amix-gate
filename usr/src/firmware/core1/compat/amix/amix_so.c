@@ -32,6 +32,13 @@ amix_so_ctors(void)
 		(*c)();
 }
 
+/* static destructors do not run (see above); a program of gcc 14 has its own */
+int __cxa_atexit(void (*f)(void *), void *a, void *d) { return 0; }
+
+/* in libc's stub, which a shared library cannot use */
+int poll(void *fds, unsigned long n, int ms);
+int usleep(unsigned us) { return poll((void *)0, 0, (us + 999) / 1000); }
+
 /* no dynamic loading of drivers, and no HUD (hud_context.c needs siginfo) */
 void *dlopen(const char *f, int m) { return 0; }
 void *dlsym(void *h, const char *s) { return 0; }

@@ -211,6 +211,16 @@ zzgl_pipe(const uint32_t *words, unsigned n)
 }
 
 void
+zzgl_pipe_frame(void)
+{
+   static uint32_t sent;
+
+   sent++;
+   while (sent - blk_get(ZB_FRAMES) > 2)
+      T->wait();
+}
+
+void
 zzgl_pipe_read(const uint32_t *words, unsigned n, void *reply, size_t bytes)
 {
    cmd_big(ZZ_PIPE, words, n, NULL, 0);

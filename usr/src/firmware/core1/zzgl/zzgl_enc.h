@@ -31,6 +31,8 @@ void zzgl_effect(float time, float beat);
 void zzgl_flush(void);
 /* words of zz3660 commands; _read: and wait for its n bytes */
 void zzgl_pipe(const uint32_t *words, unsigned n);
+/* a frame sent: wait while core 1 is more than two behind */
+void zzgl_pipe_frame(void);
 void zzgl_pipe_read(const uint32_t *words, unsigned n, void *reply, size_t bytes);
 void zzgl_close(void);
 void *zzgl_GetProcAddress(const char *name);
