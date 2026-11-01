@@ -31,9 +31,10 @@ static const struct zzgl_dec_env *E;
 static OSMesaContext ctx;
 static uint8_t *fb;
 static int fb_w, fb_h;
-/* the zz3660 executor: softpipe, with nothing to present to yet */
+/* the zz3660 executor: softpipe */
 void zzp_exec(uint32_t *words, unsigned n, void *reply);
 void zz3660_exec_start(void);
+void zzp_present(const void *rgba, int w, int h);
 
 static uint32_t *buf;           /* the command being decoded */
 static size_t buf_cap;
@@ -417,6 +418,13 @@ command(uint32_t op, uint32_t n)
       blk_put(ZB_ERROR, op);
    }
    return 0;
+}
+
+void
+zzp_present(const void *rgba, int w, int h)
+{
+   E->present(rgba, w, h);
+   blk_put(ZB_FRAMES, blk_get(ZB_FRAMES) + 1);
 }
 
 /* the commands in the ring; once: until it is empty, else until ZZ_CLOSE */

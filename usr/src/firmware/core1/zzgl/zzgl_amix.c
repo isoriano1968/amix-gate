@@ -186,6 +186,8 @@ static int start_server(volatile unsigned long *blk)
 }
 
 static int server_only;
+static unsigned char *shared;
+int zzgl_platform_show(int x, int y, int w, int h);
 
 /* the server without the overlay: zz3660 for now shows frames through X */
 int zzgl_platform_server(void)
@@ -194,11 +196,37 @@ int zzgl_platform_server(void)
    return zzgl_platform_open(NULL, 0, 0, 0, 16, 16);
 }
 
+int zzgl_platform_show(int x, int y, int w, int h)
+{
+   /* the overlay over the window: as glshow (place before and after the
+      MPEG INIT: core 0 takes a new size only once the overlay is on) */
+   win_w = w;
+   win_h = h;
+   vs = info.width >= 1600 && !(c1ld[C1LD_W_MAGIC] == C1LD_MAGIC && (c1ld[C1LD_W_FEAT] & C1LD_FEAT_OVL_FETCH)) ? 2 : 1;
+   if (w > info.width || h * vs > info.height) {
+      fprintf(stderr, "zzgl: %dx%d does not fit the screen (%ux%u)\n", w, h, info.width, info.height);
+      return -1;
+   }
+   clamp_place(&x, &y);
+   clear_overlay(y / vs, h);
+   place_regs(x, y);
+   memset(shared, 0, 96);
+   reg32(REG_MPEG_PARAM0 + 0, info.base + SHARED_OFF);
+   reg32(REG_MPEG_PARAM0 + 4, info.base);
+   reg32(REG_MPEG_PARAM0 + 8, FIFO_SIZE);
+   reg32(REG_MPEG_PARAM0 + 12, FIFO_OFF);
+   reg32(REG_MPEG_CMD, CMD_INIT);
+   usleep(100000);
+   place_regs(x, y);
+   overlay_on = 1;
+   zzgl_overlay((unsigned long)info.width * 4, (uint32_t)(y / vs), (uint32_t)w, (uint32_t)h,
+                c1ld[C1LD_W_MAGIC] == C1LD_MAGIC && (c1ld[C1LD_W_FEAT] & C1LD_FEAT_OVL_FLIP));
+   return 0;
+}
+
 int zzgl_platform_open(void *dpy, unsigned long win, int x, int y, int w, int h)
 {
    volatile unsigned long *blk;
-   unsigned char *shared;
-
    (void)dpy;
    (void)win;
    if ((fd = open("/dev/zz9000", O_RDWR)) < 0 || ioctl(fd, ZZ9KIOC_GETINFO, &info) < 0) {
@@ -230,33 +258,7 @@ int zzgl_platform_open(void *dpy, unsigned long win, int x, int y, int w, int h)
       return -1;
    }
 
-   if (server_only)
-      return 0;
-
-   /* the overlay over the window: as glshow (place before and after the
-      MPEG INIT: core 0 takes a new size only once the overlay is on) */
-   win_w = w;
-   win_h = h;
-   vs = info.width >= 1600 && !(c1ld[C1LD_W_MAGIC] == C1LD_MAGIC && (c1ld[C1LD_W_FEAT] & C1LD_FEAT_OVL_FETCH)) ? 2 : 1;
-   if (w > info.width || h * vs > info.height) {
-      fprintf(stderr, "zzgl: %dx%d does not fit the screen (%ux%u)\n", w, h, info.width, info.height);
-      return -1;
-   }
-   clamp_place(&x, &y);
-   clear_overlay(y / vs, h);
-   place_regs(x, y);
-   memset(shared, 0, 96);
-   reg32(REG_MPEG_PARAM0 + 0, info.base + SHARED_OFF);
-   reg32(REG_MPEG_PARAM0 + 4, info.base);
-   reg32(REG_MPEG_PARAM0 + 8, FIFO_SIZE);
-   reg32(REG_MPEG_PARAM0 + 12, FIFO_OFF);
-   reg32(REG_MPEG_CMD, CMD_INIT);
-   usleep(100000);
-   place_regs(x, y);
-   overlay_on = 1;
-   zzgl_overlay((unsigned long)info.width * 4, (uint32_t)(y / vs), (uint32_t)w, (uint32_t)h,
-                c1ld[C1LD_W_MAGIC] == C1LD_MAGIC && (c1ld[C1LD_W_FEAT] & C1LD_FEAT_OVL_FLIP));
-   return 0;
+   return server_only ? 0 : zzgl_platform_show(x, y, w, h);
 }
 
 void zzgl_platform_frame(void)

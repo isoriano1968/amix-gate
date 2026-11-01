@@ -4582,17 +4582,27 @@ index 2c0bafa..ac99de1 100644
  
 diff --git a/src/gallium/drivers/zz3660/zz_board.c b/src/gallium/drivers/zz3660/zz_board.c
 new file mode 100644
-index 0000000..38b9ddf
+index 0000000..80e5958
 --- /dev/null
 +++ b/src/gallium/drivers/zz3660/zz_board.c
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,97 @@
 +/*
 + * zz_board.c -- the zz3660 stream over the Z3660's ring: zzgl's transport, with
 + * core 1's server underneath.
 + */
 +#include <stdio.h>
 +#include <stdlib.h>
++#include <sys/time.h>
++#include <X11/Xlib.h>
++#include <X11/Xutil.h>
 +#include "zz_proto.h"
++
++/* state_tracker/xlibsw_api.h's: the transport has none of Gallium's headers */
++struct xlib_drawable {
++   Visual *visual;
++   int depth;
++   Drawable drawable;
++};
 +#include "zzgl_enc.h"
 +#include "zzgl_platform.h"
 +
@@ -4625,12 +4635,60 @@ index 0000000..38b9ddf
 +   start();
 +   zzgl_pipe_read(w, n, reply, (size_t)w[9] * w[7]);
 +}
++
++/* all sent so far is done */
++void
++zzp_sync(void)
++{
++   start();
++   zzgl_pipe_read(NULL, 0, NULL, 0);
++}
++
++void *zz3660_display;           /* xlib.c's */
++
++/* the overlay over the window; where the window is, five times a second */
++int
++zzp_show(void *priv, uint32_t id, unsigned w, unsigned h)
++{
++   static unsigned cur_w, cur_h;
++   static double next;
++   static int cx, cy;
++   struct xlib_drawable *d = priv;
++   Display *dpy = zz3660_display;
++   struct timeval tv;
++   double t;
++   uint32_t c[2];
++
++   gettimeofday(&tv, NULL);
++   t = tv.tv_sec + tv.tv_usec * 1e-6;
++   if (w != cur_w || h != cur_h || t >= next) {
++      Window child;
++      int x = 0, y = 0;
++
++      XTranslateCoordinates(dpy, d->drawable, DefaultRootWindow(dpy), 0, 0, &x, &y, &child);
++      next = t + 0.2;
++      if (w != cur_w || h != cur_h) {
++         if (zzgl_platform_show(x, y, w, h) != 0)
++            return 0;
++         cur_w = w;
++         cur_h = h;
++      } else if (x != cx || y != cy)
++         zzgl_platform_place(x, y);
++      cx = x;
++      cy = y;
++   }
++   c[0] = ZP_PRESENT | 1 << 8;
++   c[1] = id;
++   zzgl_pipe(c, 2);
++   zzgl_flush();
++   return 1;
++}
 diff --git a/src/gallium/drivers/zz3660/zz_driver.c b/src/gallium/drivers/zz3660/zz_driver.c
 new file mode 100644
-index 0000000..55d865a
+index 0000000..7b68999
 --- /dev/null
 +++ b/src/gallium/drivers/zz3660/zz_driver.c
-@@ -0,0 +1,846 @@
+@@ -0,0 +1,855 @@
 +/*
 + * zz_driver.c -- zz3660, a Gallium driver that does no work: each pipe_context
 + * call goes to the GPU as a command (zz_proto.h, zz_exec.c).  Modelled on noop
@@ -4704,7 +4762,7 @@ index 0000000..55d865a
 +}
 +
 +/* the stream */
-+static uint32_t buf[1 << 16];
++static uint32_t buf[1 << 21];
 +static unsigned used;
 +
 +static void
@@ -4975,7 +5033,7 @@ index 0000000..55d865a
 +static void *
 +create_shader(enum zzp_kind kind, const struct pipe_shader_state *s)
 +{
-+   static char text[1 << 18];
++   static char text[1 << 22];
 +   unsigned bytes;
 +   uint32_t id = new_id(), *p;
 +
@@ -5302,7 +5360,7 @@ index 0000000..55d865a
 +   cmd(ZP_FLUSH, 0);
 +   flush_cmds();
 +   if (fence)
-+      *fence = NULL;
++      *fence = (struct pipe_fence_handle *)1;   /* one kind: everything sent */
 +}
 +
 +static void zz_flush_resource(struct pipe_context *c, struct pipe_resource *r) { }
@@ -5427,7 +5485,13 @@ index 0000000..55d865a
 +   return CAPS(s)->get_compute_param(CAPS(s), ir, p, r);
 +}
 +static void zz_fence_ref(struct pipe_screen *s, struct pipe_fence_handle **a, struct pipe_fence_handle *b) { *a = b; }
-+static boolean zz_fence_finish(struct pipe_screen *s, struct pipe_context *c, struct pipe_fence_handle *f, uint64_t t) { return TRUE; }
++static boolean
++zz_fence_finish(struct pipe_screen *s, struct pipe_context *c, struct pipe_fence_handle *f, uint64_t t)
++{
++   flush_cmds();
++   zzp_sync();
++   return TRUE;
++}
 +static uint64_t zz_timestamp(struct pipe_screen *s) { return 0; }
 +
 +static void
@@ -5440,6 +5504,9 @@ index 0000000..55d865a
 +   uint8_t *map;
 +   unsigned y;
 +
++   flush_cmds();
++   if (zzp_show(priv, r->id, res->width0, res->height0))
++      return;
 +   u_box_2d(0, 0, res->width0, res->height0, &all);
 +   fetch(r, level, &all);
 +   map = s->ws->displaytarget_map(s->ws, r->dt, PIPE_TRANSFER_WRITE);
@@ -5479,10 +5546,10 @@ index 0000000..55d865a
 +}
 diff --git a/src/gallium/drivers/zz3660/zz_exec.c b/src/gallium/drivers/zz3660/zz_exec.c
 new file mode 100644
-index 0000000..caac6f5
+index 0000000..a7abb60
 --- /dev/null
 +++ b/src/gallium/drivers/zz3660/zz_exec.c
-@@ -0,0 +1,559 @@
+@@ -0,0 +1,594 @@
 +/*
 + * zz_exec.c -- the zz3660 executor: the command stream into a pipe_context.
 + * Nothing here knows which driver is underneath.
@@ -5503,7 +5570,7 @@ index 0000000..caac6f5
 +static struct pipe_context *gp;
 +static void *obj[ZZP_MAX_OBJ];                  /* state objects, views, surfaces */
 +static struct pipe_resource *res[ZZP_MAX_OBJ];
-+static struct tgsi_token tokens[1 << 15];
++static struct tgsi_token tokens[1 << 18];
 +static int swapped;                             /* the sender is big-endian */
 +static const struct pipe_vertex_element *cur_ve;
 +static struct { unsigned n; struct pipe_vertex_element e[PIPE_MAX_ATTRIBS]; } *ves[ZZP_MAX_OBJ];
@@ -5699,6 +5766,36 @@ index 0000000..caac6f5
 +   }
 +   gp->transfer_unmap(gp, t);
 +}
++
++#ifdef __z3660core__
++/* the frame to the board's output, in the order it wants: bottom row first */
++static void
++present(uint32_t id)
++{
++   static uint8_t *rgba;
++   static unsigned size;
++   struct pipe_resource *r = res[id];
++   const unsigned w = r->width0, h = r->height0;
++   struct pipe_transfer *t;
++   struct pipe_box box;
++   const uint8_t *src;
++   unsigned y;
++
++   gp->flush(gp, NULL, 0);
++   if (w * h * 4 > size) {
++      FREE(rgba);
++      size = w * h * 4;
++      rgba = MALLOC(size);
++   }
++   u_box_2d(0, 0, w, h, &box);
++   src = gp->transfer_map(gp, r, 0, PIPE_TRANSFER_READ, &box, &t);
++   for (y = 0; y < h; y++)
++      util_format_read_4ub(r->format, rgba + (h - 1 - y) * w * 4, w * 4, src + y * t->stride, t->stride,
++                           0, 0, w, 1);
++   gp->transfer_unmap(gp, t);
++   zzp_present(rgba, w, h);
++}
++#endif
 +
 +#define GI(x) s.x = *w++;
 +#define GF(x) s.x = wf(*w++);
@@ -6016,6 +6113,11 @@ index 0000000..caac6f5
 +   case ZP_FLUSH:
 +      gp->flush(gp, NULL, 0);
 +      break;
++#ifdef __z3660core__
++   case ZP_PRESENT:
++      present(w[0]);
++      break;
++#endif
 +   }
 +}
 +
@@ -6063,10 +6165,10 @@ index 0000000..b7c004c
 +   I(wrap_s) I(wrap_t) I(wrap_r) I(min_img_filter) I(min_mip_filter) I(mag_img_filter) I(compare_mode) I(compare_func) I(normalized_coords) I(max_anisotropy) I(seamless_cube_map) F(lod_bias) F(min_lod) F(max_lod)
 diff --git a/src/gallium/drivers/zz3660/zz_loop.c b/src/gallium/drivers/zz3660/zz_loop.c
 new file mode 100644
-index 0000000..e746f2a
+index 0000000..96d1868
 --- /dev/null
 +++ b/src/gallium/drivers/zz3660/zz_loop.c
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,44 @@
 +/*
 + * zz_loop.c -- the stream straight into the executor in this process, on softpipe
 + * (GALLIUM_DRIVER=zz3660): the driver tested with no board.  ZZ_BE=1 turns the
@@ -6108,12 +6210,15 @@ index 0000000..e746f2a
 +      be(w, n);
 +   zzp_exec(w, n, reply);
 +}
++
++int zzp_show(void *priv, uint32_t id, unsigned w, unsigned h) { return 0; }
++void zzp_sync(void) { }
 diff --git a/src/gallium/drivers/zz3660/zz_proto.h b/src/gallium/drivers/zz3660/zz_proto.h
 new file mode 100644
-index 0000000..a2b1ec8
+index 0000000..0984555
 --- /dev/null
 +++ b/src/gallium/drivers/zz3660/zz_proto.h
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,46 @@
 +/*
 + * zz_proto.h -- the zz3660 command stream: pipe_context calls in 32-bit words,
 + * from the driver on the 060 to the executor on the GPU (for now core 1 of the
@@ -6132,7 +6237,7 @@ index 0000000..a2b1ec8
 +   ZP_FREE, ZP_BIND, ZP_BIND_SAMPLERS, ZP_SET_VIEWS, ZP_FRAMEBUFFER, ZP_VIEWPORT,
 +   ZP_SCISSOR, ZP_BLEND_COLOR, ZP_STENCIL_REF, ZP_SAMPLE_MASK, ZP_CLIP, ZP_STIPPLE,
 +   ZP_CONSTBUF, ZP_VBUFS, ZP_DRAW, ZP_CLEAR, ZP_CLEAR_RT, ZP_CLEAR_DS, ZP_COPY, ZP_BLIT,
-+   ZP_FLUSH, ZP_COUNT
++   ZP_FLUSH, ZP_PRESENT, ZP_COUNT
 +};
 +
 +/* what ZP_BIND and ZP_FREE name */
@@ -6152,6 +6257,12 @@ index 0000000..a2b1ec8
 +/* the driver's way to the executor: on the 060 the ring, in a test a call */
 +void zzp_send(uint32_t *words, unsigned n);
 +void zzp_read(uint32_t *words, unsigned n, void *reply);
++/* the resource in the window on the GPU's own output; 0: the transport has
++   none, the driver goes through the winsys.  priv: flush_frontbuffer's */
++void zzp_sync(void);
++int zzp_show(void *priv, uint32_t id, unsigned w, unsigned h);
++/* the board's: a frame ready, top row first, for its output */
++void zzp_present(const void *rgba, int w, int h);
 +
 +#endif
 diff --git a/src/gallium/drivers/zz3660/zz_public.h b/src/gallium/drivers/zz3660/zz_public.h
@@ -6256,6 +6367,24 @@ index e7e0ab1..4648f98 100644
        FREE(osmesa);
        return NULL;
     }
+diff --git a/src/gallium/targets/libgl-xlib/xlib.c b/src/gallium/targets/libgl-xlib/xlib.c
+index 1b62afb..88da61b 100644
+--- a/src/gallium/targets/libgl-xlib/xlib.c
++++ b/src/gallium/targets/libgl-xlib/xlib.c
+@@ -54,6 +54,13 @@ swrast_xlib_create_screen( Display *display )
+    /* Create the underlying winsys, which performs presents to Xlib
+     * drawables:
+     */
++#ifdef __amix__
++   {
++      extern void *zz3660_display;
++
++      zz3660_display = display;
++   }
++#endif
+    winsys = xlib_create_sw_winsys( display );
+    if (winsys == NULL)
+       return NULL;
 diff --git a/src/mapi/glapi/gen/glX_XML.py b/src/mapi/glapi/gen/glX_XML.py
 index ff0011b..f3ee7b2 100644
 --- a/src/mapi/glapi/gen/glX_XML.py

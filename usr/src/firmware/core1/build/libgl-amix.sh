@@ -18,7 +18,7 @@ m68k-elf-gcc -O2 -m68060 -fPIC -w -U__INT32_TYPE__ -D__INT32_TYPE__=int -U__UINT
 # zz3660's way to core 1: the ring of zzgl
 Z=$HERE/../zzgl
 M=$HERE/../src/mesa-18.3.6
-F="-O2 -m68060 -fPIC -w -D__amix__ -DSVR4 -I$Z -I$M/include -I$M/src/gallium/drivers/zz3660 -I$HERE/../compat/amix -I$HERE/../cores/h264bench -I$1/usr/x11r6/include"
+F="-O2 -m68060 -fPIC -w -D__amix__ -DSVR4 -I$Z -I$M/include -I$M/src/gallium/drivers/zz3660 -I$HERE/../compat/amix -I$HERE/../cores/h264bench -I$1/usr/x11r6/include -I$M/src -I$M/src/gallium/auxiliary -I$M/src/gallium/include"
 m68k-elf-gcc $F -c "$Z/zzgl_enc.c" -o zzgl_enc.o
 m68k-elf-gcc $F -c "$Z/zzgl_amix.c" -o zzgl_amix.o
 m68k-elf-gcc $F -c "$M/src/gallium/drivers/zz3660/zz_board.c" -o zz_board.o
