@@ -641,7 +641,7 @@ new file mode 100644
 index 0000000..d2f58f1
 --- /dev/null
 +++ b/src/gallium/drivers/softpipe/sp_fast.c
-@@ -0,0 +1,2490 @@
+@@ -0,0 +1,2494 @@
 +/*
 + * sp_fast.c -- see sp_fast.h.
 + *
@@ -1864,13 +1864,13 @@ index 0000000..d2f58f1
 +static inline void
 +tex_setup(const struct sp_fast_unit *un, const struct tgsi_interp_coef *tc,
 +          const struct tgsi_interp_coef *pos, float fx, float fy, int *level, int *linear,
-+          int32_t *u, int32_t *v, int32_t *du, int32_t *dv, boolean pick, float *rq_share)
++          int32_t *u, int32_t *v, int32_t *du, int32_t *dv, boolean pick, float *rq_share, float n)
 +{
 +   const struct sp_fast_tex *t = &un->tex;
 +   const int cs = un->coord_chan[0], ct = un->coord_chan[1];
 +   float S = tc->a0[cs] + tc->dadx[cs] * fx + tc->dady[cs] * fy;
 +   float T = tc->a0[ct] + tc->dadx[ct] * fx + tc->dady[ct] * fy;
-+   float Q = 1.0f, dQdx = 0.0f, dQdy = 0.0f, rq, s, tt, dsdx, dtdx, w, h, off;
++   float Q = 1.0f, dQdx = 0.0f, dQdy = 0.0f, rq, rqe, s, tt, dsdx, dtdx, w, h, off;
 +
 +   if (un->txp) {
 +      const int cq = un->coord_chan[2];
@@ -1893,8 +1893,11 @@ index 0000000..d2f58f1
 +   }
 +   s = S * rq;
 +   tt = T * rq;
-+   dsdx = (tc->dadx[cs] - s * dQdx) * rq;
-+   dtdx = (tc->dadx[ct] - tt * dQdx) * rq;
++   /* the step that lands on the next segment's start, n pixels on: the
++      slope here would leave a jump there on a steep surface */
++   rqe = n != 0.0f && dQdx != 0.0f ? 1.0f / (Q + dQdx * n) : rq;
++   dsdx = (tc->dadx[cs] - s * dQdx) * rqe;
++   dtdx = (tc->dadx[ct] - tt * dQdx) * rqe;
 +   if (pick) {
 +      float lambda = 0.0f;
 +
@@ -2182,18 +2185,19 @@ index 0000000..d2f58f1
 + * are chosen already (l, lin); out: u0 v0 u1 v1, du0 dv0 du1 dv1.
 + */
 +static inline __attribute__((always_inline)) void
-+tex_setup2(const struct sp_fast *f, float fx, float fy, int l0, int lin0, int l1, int lin1,
++tex_setup2(const struct sp_fast *f, float fx, float fy, float n, int l0, int lin0, int l1, int lin1,
 +           int32x4_t *uv, int32x4_t *duv)
 +{
 +   const struct sp_fast_tex *t0 = &f->u[0].tex, *t1 = &f->u[1].tex;
 +   const float32x4_t dx = vld1q_f32(f->vq_dx);
 +   const float32x4_t st = vmlaq_n_f32(vmlaq_n_f32(vld1q_f32(f->vq_a0), dx, fx), vld1q_f32(f->vq_dy), fy);
-+   const float rq = 1.0f / (f->vq_q[0] + f->vq_q[1] * fx + f->vq_q[2] * fy);
++   const float q = f->vq_q[0] + f->vq_q[1] * fx + f->vq_q[2] * fy;
++   const float rq = 1.0f / q, rqe = 1.0f / (q + f->vq_q[1] * n);     /* tex_setup() has why */
 +   const float32x4_t one = vdupq_n_f32(1.0f);
 +   float32x4_t s = vmulq_n_f32(st, rq), d, fl, size, off;
 +   const float32x2_t of0 = vdup_n_f32(lin0 ? 0.5f : 0.0f), of1 = vdup_n_f32(lin1 ? 0.5f : 0.0f);
 +
-+   d = vmulq_n_f32(vmlsq_n_f32(dx, s, f->vq_q[1]), rq);
++   d = vmulq_n_f32(vmlsq_n_f32(dx, s, f->vq_q[1]), rqe);
 +   /* repeat: s - floor(s); clamp: kept in -4..4 */
 +   fl = vcvtq_f32_s32(vcvtq_s32_f32(s));
 +   fl = vsubq_f32(fl, vreinterpretq_f32_u32(vandq_u32(vcgtq_f32(fl, s), vreinterpretq_u32_f32(one))));
@@ -2524,7 +2528,7 @@ index 0000000..d2f58f1
 +         if (NEON && share && !pick) {
 +            int32x4_t uv, duv;
 +
-+            tex_setup2(f, (float)x, fy, level0, linear0, level1, linear1, &uv, &duv);
++            tex_setup2(f, (float)x, fy, (float)(end - x), level0, linear0, level1, linear1, &uv, &duv);
 +            u0 = vgetq_lane_s32(uv, 0);
 +            v0 = vgetq_lane_s32(uv, 1);
 +            u1 = vgetq_lane_s32(uv, 2);
@@ -2538,10 +2542,10 @@ index 0000000..d2f58f1
 +         {
 +            if (tc0)
 +               tex_setup(&f->u[0], tc0, pos, (float)x, fy, &level0, &linear0, &u0, &v0, &du0, &dv0, pick,
-+                         share ? &rq : NULL);
++                         share ? &rq : NULL, (float)(end - x));
 +            if (tc1)
 +               tex_setup(&f->u[1], tc1, pos, (float)x, fy, &level1, &linear1, &u1, &v1, &du1, &dv1, pick,
-+                         share ? &rq : NULL);
++                         share ? &rq : NULL, (float)(end - x));
 +         }
 +         if (cc)
 +            col_setup(f, cc, pos, (float)x, fy, c, dc);
@@ -3039,7 +3043,7 @@ index 0000000..d2f58f1
 +
 +         if (un->in >= 0)
 +            tex_setup(un, &coef[un->in], pos, fx, fy, &un->aff_level, &un->aff_linear,
-+                      &a, &b, &d, &e, TRUE, NULL);
++                      &a, &b, &d, &e, TRUE, NULL, 0.0f);
 +      }
 +      f->tri_level = TRUE;
 +   }
