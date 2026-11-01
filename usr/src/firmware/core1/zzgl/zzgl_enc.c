@@ -216,7 +216,7 @@ zzgl_pipe_frame(void)
    static uint32_t sent;
 
    sent++;
-   while (sent - blk_get(ZB_FRAMES) > 2)
+   while ((int32_t)(sent - blk_get(ZB_FRAMES)) > 2)
       T->wait();
 }
 

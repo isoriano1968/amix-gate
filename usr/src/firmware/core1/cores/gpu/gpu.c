@@ -103,17 +103,36 @@ static void present(const void *rgba, int w, int h)
     const unsigned long long t0 = armgl_now_us();
     uint32_t back;
     volatile uint8_t *dst;
-    int x, y;
+    const int fh = h;
+    int x, y, sx = 0, sy = 0, fw = w, vh = h;
 
     publish_audio();
     publish_prof();
+    if (blk[ZB_OVL_ROW] == ZB_OVL_OFF)
+        ovl.pitch = 0;
+    else if (blk[ZB_OVL_ROW]) {
+        const uint32_t skip = __builtin_bswap32(blk[ZB_OVL_SKIP]);
+        const uint32_t clip = __builtin_bswap32(blk[ZB_OVL_CLIP]);
+
+        ovl.row0 = __builtin_bswap32(blk[ZB_OVL_ROW]) - 1;
+        blk[ZB_OVL + 1] = __builtin_bswap32(ovl.row0);
+        sx = skip >> 16;
+        sy = skip & 0xffff;
+        fw = w;
+        if (w > (int)(clip >> 16) + sx)
+            w = (int)(clip >> 16) + sx;
+        if (h > (int)(clip & 0xffff) + sy)
+            vh = (int)(clip & 0xffff) + sy;
+    }
     if (!ovl.pitch)
         return;
     if (w > (int)ovl.maxw)
         w = (int)ovl.maxw;
-    if (h > (int)ovl.maxh)
-        h = (int)ovl.maxh;
-    if (w <= 0 || h <= 0 || w > 2048 || (uint32_t)w * 4 > ovl.pitch)
+    if (vh > (int)ovl.maxh)
+        vh = (int)ovl.maxh;
+    w -= sx;
+    vh -= sy;
+    if (w <= 0 || vh <= 0 || w > 2048 || (uint32_t)w * 4 > ovl.pitch)
         return;
     /* the last flip not taken yet: wait for it (at most 50 ms) */
     {
@@ -125,8 +144,8 @@ static void present(const void *rgba, int w, int h)
     }
     back = !ovl.dbuf || __builtin_bswap32(c1ld[C1LD_W_FRONT]) == 2 ? ZZAV_OVL_OFF : ZZAV_OVL_OFF1;
     dst = pl_board + back + ovl.row0 * ovl.pitch;
-    for (y = 0; y < h; y++) {
-        const uint32_t *src = (const uint32_t *)rgba + (size_t)(h - 1 - y) * (size_t)w;
+    for (y = 0; y < vh; y++) {
+        const uint32_t *src = (const uint32_t *)rgba + (size_t)(fh - 1 - y - sy) * (size_t)fw + sx;
 
         for (x = 0; x < w; x++) {
             const uint32_t p = src[x];  /* r, g, b, a bytes */

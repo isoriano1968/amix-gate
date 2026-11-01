@@ -48,6 +48,9 @@ enum {
    ZB_AUDIO_SEQ,        /* core 1: counts the updates of ZB_AUDIO_POS */
    ZB_STATS_US,         /* core 1: time of the last frame, us (swap to swap) */
    ZB_OWNER = 10,       /* 060: the process using the server, 0: unknown */
+   ZB_OVL_ROW,          /* 060: the overlay's row0 + 1 since ZZ_OVERLAY, 0: as ZZ_OVERLAY said, ZB_OVL_OFF: no more */
+   ZB_OVL_SKIP,         /* 060, with ZB_OVL_ROW: columns << 16 | rows of the frame off the screen left and top */
+   ZB_OVL_CLIP,         /* 060, with ZB_OVL_ROW: width << 16 | height of what is on the screen */
    ZB_PROF = 16,        /* core 1: sp_fast_prof[0..7] of the last frame (k cycles / counts) */
    ZB_PROF_PATH = 28,   /* core 1: pixels drawn affine (NEON), perspective (NEON), */
    ZB_PROF_EVT = 30,    /* core 1: L1 data cache refills in the spans, last frame */
@@ -64,6 +67,7 @@ enum {
    ZB_REPLY = 64,       /* replies: words 64..1023 */
    ZB_NWORDS = 1024
 };
+#define ZB_OVL_OFF       0xFFFFFFFFu
 #define ZB_REPLY_WORDS      (ZB_NWORDS - ZB_REPLY)
 
 /*

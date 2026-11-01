@@ -4594,10 +4594,10 @@ index 2c0bafa..ac99de1 100644
  
 diff --git a/src/gallium/drivers/zz3660/zz_board.c b/src/gallium/drivers/zz3660/zz_board.c
 new file mode 100644
-index 0000000..75adf44
+index 0000000..30c75c9
 --- /dev/null
 +++ b/src/gallium/drivers/zz3660/zz_board.c
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,201 @@
 +/*
 + * zz_board.c -- the zz3660 stream over the Z3660's ring: zzgl's transport, with
 + * core 1's server underneath.
@@ -4606,6 +4606,8 @@ index 0000000..75adf44
 +#include <stdlib.h>
 +#include <signal.h>
 +#include <unistd.h>
++#include <sys/types.h>
++#include <sys/wait.h>
 +#include <sys/time.h>
 +#include <X11/Xlib.h>
 +#include <X11/Xutil.h>
@@ -4621,12 +4623,24 @@ index 0000000..75adf44
 +#include "zzgl_platform.h"
 +
 +static int up;
++static pid_t watcher;
++
++static void
++leave(void)
++{
++   if (watcher > 0) {
++      kill(watcher, SIGTERM);
++      waitpid(watcher, NULL, 0);
++      watcher = 0;
++   }
++   zzgl_platform_close();
++}
 +
 +/* killed: the overlay and core 1's server must not stay behind */
 +static void
 +on_signal(int s)
 +{
-+   zzgl_platform_close();
++   leave();
 +   signal(s, SIG_DFL);
 +   kill(getpid(), s);
 +}
@@ -4635,11 +4649,15 @@ index 0000000..75adf44
 +zzp_start(void)
 +{
 +   if (!up && zzgl_platform_server() == 0) {
-+      atexit(zzgl_platform_close);
++      atexit(leave);
 +      if (signal(SIGTERM, on_signal) == SIG_IGN)
 +         signal(SIGTERM, SIG_IGN);
 +      if (signal(SIGINT, on_signal) == SIG_IGN)
 +         signal(SIGINT, SIG_IGN);
++      if (signal(SIGHUP, on_signal) == SIG_IGN)
++         signal(SIGHUP, SIG_IGN);
++      if (signal(SIGPIPE, on_signal) == SIG_IGN)
++         signal(SIGPIPE, SIG_IGN);
 +      up = 1;
 +   }
 +   return up;
@@ -4679,13 +4697,71 @@ index 0000000..75adf44
 +
 +void *zz3660_display;           /* xlib.c's */
 +
-+/* the overlay over the window; where the window is, five times a second */
++static int gone;
++
++static int
++window_gone(Display *dpy, XErrorEvent *e)
++{
++   gone = 1;
++   return 0;
++}
++
++static int
++server_gone(Display *dpy)
++{
++   zzgl_platform_hide();
++   _exit(0);
++   return 0;
++}
++
++/* A program waiting for events draws nothing and looks at nothing: a process of
++   its own keeps the overlay over the window, and ends it however the program ends */
++static void
++watch(Display *dpy, Window win, int x, int y)
++{
++   const pid_t parent = getpid();
++   Display *own;
++
++   watcher = fork();
++   if (watcher < 0)
++      watcher = 0;
++   if (watcher)
++      return;
++   signal(SIGTERM, SIG_DFL);
++   signal(SIGINT, SIG_IGN);
++   signal(SIGHUP, SIG_IGN);
++   signal(SIGPIPE, SIG_DFL);
++   own = XOpenDisplay(DisplayString(dpy));
++   close(ConnectionNumber(dpy));
++   if (!own)
++      _exit(0);
++   XSetErrorHandler(window_gone);
++   XSetIOErrorHandler(server_gone);
++   while (getppid() == parent) {
++      Window child;
++      int nx = x, ny = y;
++
++      usleep(100000);
++      XTranslateCoordinates(own, win, DefaultRootWindow(own), 0, 0, &nx, &ny, &child);
++      XSync(own, False);
++      if (gone)
++         _exit(0);
++      if (nx != x || ny != y)
++         zzgl_platform_place(nx, ny);
++      x = nx;
++      y = ny;
++   }
++   zzgl_platform_hide();
++   _exit(0);
++}
++
++/* the overlay over the window */
 +int
 +zzp_show(void *priv, uint32_t id, unsigned w, unsigned h)
 +{
 +   static unsigned cur_w, cur_h;
++   static Drawable cur;
 +   static double next;
-+   static int cx, cy;
 +   struct xlib_drawable *d = priv;
 +   Display *dpy = zz3660_display;
 +   struct timeval tv;
@@ -4694,21 +4770,27 @@ index 0000000..75adf44
 +
 +   gettimeofday(&tv, NULL);
 +   t = tv.tv_sec + tv.tv_usec * 1e-6;
-+   if (w != cur_w || h != cur_h || t >= next) {
++   if (w != cur_w || h != cur_h || d->drawable != cur || (!watcher && t >= next)) {
 +      Window child;
 +      int x = 0, y = 0;
 +
 +      XTranslateCoordinates(dpy, d->drawable, DefaultRootWindow(dpy), 0, 0, &x, &y, &child);
++      XSync(dpy, False);
 +      next = t + 0.2;
++      if (watcher > 0) {
++         kill(watcher, SIGTERM);
++         waitpid(watcher, NULL, 0);
++         watcher = 0;
++      }
 +      if (w != cur_w || h != cur_h) {
 +         if (zzgl_platform_show(x, y, w, h) != 0)
 +            return 0;
 +         cur_w = w;
 +         cur_h = h;
-+      } else if (x != cx || y != cy)
-+         zzgl_platform_place(x, y);
-+      cx = x;
-+      cy = y;
++      }
++      zzgl_platform_place(x, y);
++      cur = d->drawable;
++      watch(dpy, cur, x, y);
 +   }
 +   c[0] = ZP_PRESENT | 1 << 8;
 +   c[1] = id;
@@ -4719,10 +4801,10 @@ index 0000000..75adf44
 +}
 diff --git a/src/gallium/drivers/zz3660/zz_driver.c b/src/gallium/drivers/zz3660/zz_driver.c
 new file mode 100644
-index 0000000..6a2d152
+index 0000000..55b35f0
 --- /dev/null
 +++ b/src/gallium/drivers/zz3660/zz_driver.c
-@@ -0,0 +1,862 @@
+@@ -0,0 +1,898 @@
 +/*
 + * zz_driver.c -- zz3660, a Gallium driver that does no work: each pipe_context
 + * call goes to the GPU as a command (zz_proto.h, zz_exec.c).  Modelled on noop
@@ -5422,6 +5504,32 @@ index 0000000..6a2d152
 +}
 +static void zz_query_state(struct pipe_context *c, boolean e) { }
 +
++/* GL 3.0 needs transform feedback: accepted, nothing is captured yet */
++static struct pipe_stream_output_target *
++zz_so_create(struct pipe_context *c, struct pipe_resource *r, unsigned offset, unsigned size)
++{
++   struct pipe_stream_output_target *t = CALLOC_STRUCT(pipe_stream_output_target);
++
++   pipe_reference_init(&t->reference, 1);
++   pipe_resource_reference(&t->buffer, r);
++   t->context = c;
++   t->buffer_offset = offset;
++   t->buffer_size = size;
++   return t;
++}
++static void
++zz_so_destroy(struct pipe_context *c, struct pipe_stream_output_target *t)
++{
++   pipe_resource_reference(&t->buffer, NULL);
++   FREE(t);
++}
++static void
++zz_so_set(struct pipe_context *c, unsigned n, struct pipe_stream_output_target **t, const unsigned *offsets)
++{
++}
++static void zz_texture_barrier(struct pipe_context *c, unsigned flags) { }
++static void zz_memory_barrier(struct pipe_context *c, unsigned flags) { }
++
 +static void
 +zz_destroy(struct pipe_context *c)
 +{
@@ -5440,6 +5548,11 @@ index 0000000..6a2d152
 +   c->const_uploader = c->stream_uploader;
 +   cmd(ZP_OPEN, 0);
 +   c->destroy = zz_destroy;
++   c->create_stream_output_target = zz_so_create;
++   c->stream_output_target_destroy = zz_so_destroy;
++   c->set_stream_output_targets = zz_so_set;
++   c->texture_barrier = zz_texture_barrier;
++   c->memory_barrier = zz_memory_barrier;
 +   c->flush = zz_flush;
 +   c->flush_resource = zz_flush_resource;
 +   c->set_context_param = zz_set_param;
@@ -5514,6 +5627,11 @@ index 0000000..6a2d152
 +static float zz_paramf(struct pipe_screen *s, enum pipe_capf p) { return CAPS(s)->get_paramf(CAPS(s), p); }
 +static int zz_shader_param(struct pipe_screen *s, enum pipe_shader_type t, enum pipe_shader_cap p)
 +{
++   /* softpipe's, less what the stream does not carry */
++   if (t == PIPE_SHADER_COMPUTE || p == PIPE_SHADER_CAP_MAX_SHADER_IMAGES ||
++       p == PIPE_SHADER_CAP_MAX_SHADER_BUFFERS || p == PIPE_SHADER_CAP_MAX_HW_ATOMIC_COUNTERS ||
++       p == PIPE_SHADER_CAP_MAX_HW_ATOMIC_COUNTER_BUFFERS)
++      return 0;
 +   return CAPS(s)->get_shader_param(CAPS(s), t, p);
 +}
 +static boolean zz_format(struct pipe_screen *s, enum pipe_format f, enum pipe_texture_target t, unsigned sc,
@@ -5587,10 +5705,10 @@ index 0000000..6a2d152
 +}
 diff --git a/src/gallium/drivers/zz3660/zz_exec.c b/src/gallium/drivers/zz3660/zz_exec.c
 new file mode 100644
-index 0000000..e25a494
+index 0000000..e7421d5
 --- /dev/null
 +++ b/src/gallium/drivers/zz3660/zz_exec.c
-@@ -0,0 +1,620 @@
+@@ -0,0 +1,649 @@
 +/*
 + * zz_exec.c -- the zz3660 executor: the command stream into a pipe_context.
 + * Nothing here knows which driver is underneath.
@@ -5813,9 +5931,12 @@ index 0000000..e25a494
 +}
 +
 +#ifdef __z3660core__
-+/* the frame to the board's output, in the order it wants: bottom row first */
++/* the frame to the board's output, in the order it wants: bottom row first.
++   again: the same frame, no new one to count */
++static uint32_t shown;
++
 +static void
-+present(uint32_t id)
++present(uint32_t id, int again)
 +{
 +   static uint8_t *rgba;
 +   static unsigned size;
@@ -5838,7 +5959,30 @@ index 0000000..e25a494
 +      util_format_read_4ub(r->format, rgba + (h - 1 - y) * w * 4, w * 4, src + y * t->stride, t->stride,
 +                           0, 0, w, 1);
 +   gp->transfer_unmap(gp, t);
-+   zzp_present(rgba, w, h);
++   shown = id;
++   zzp_present(rgba, w, h, again);
++}
++
++/* a new client, of either kind: its screen is no longer ours to refresh */
++void
++zz3660_forget(void)
++{
++   shown = 0;
++}
++
++/* the ring is empty: the display keeps being fed, as a real one scans out.  One
++   frame alone does not reach the screen; a program that draws once has no more */
++void
++zz3660_idle(void)
++{
++   extern unsigned long long armgl_now_us(void);
++   static unsigned long long next;
++   const unsigned long long t = armgl_now_us();
++
++   if (t < next || !gp || !shown || !res[shown])
++      return;
++   next = t + 200000;
++   present(shown, 1);
 +}
 +#endif
 +
@@ -5853,6 +5997,9 @@ index 0000000..e25a494
 +   switch (op) {
 +   case ZP_OPEN:
 +      /* a new client: nothing of the last one stays behind */
++#ifdef __z3660core__
++      shown = 0;
++#endif
 +      if (gp) {
 +         for (i = 0; i < ZZP_MAX_OBJ; i++) {
 +            pipe_resource_reference(&res[i], NULL);
@@ -6182,7 +6329,7 @@ index 0000000..e25a494
 +      break;
 +#ifdef __z3660core__
 +   case ZP_PRESENT:
-+      present(w[0]);
++      present(w[0], 0);
 +      break;
 +#endif
 +   }
@@ -6283,7 +6430,7 @@ index 0000000..6fd76ba
 +int zzp_start(void) { return 1; }
 diff --git a/src/gallium/drivers/zz3660/zz_proto.h b/src/gallium/drivers/zz3660/zz_proto.h
 new file mode 100644
-index 0000000..1120f34
+index 0000000..4e27c35
 --- /dev/null
 +++ b/src/gallium/drivers/zz3660/zz_proto.h
 @@ -0,0 +1,48 @@
@@ -6332,7 +6479,7 @@ index 0000000..1120f34
 +int zzp_start(void);
 +int zzp_show(void *priv, uint32_t id, unsigned w, unsigned h);
 +/* the board's: a frame ready, top row first, for its output */
-+void zzp_present(const void *rgba, int w, int h);
++void zzp_present(const void *rgba, int w, int h, int again);
 +
 +#endif
 diff --git a/src/gallium/drivers/zz3660/zz_public.h b/src/gallium/drivers/zz3660/zz_public.h

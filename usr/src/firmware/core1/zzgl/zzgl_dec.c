@@ -34,7 +34,9 @@ static int fb_w, fb_h;
 /* the zz3660 executor: softpipe */
 void zzp_exec(uint32_t *words, unsigned n, void *reply);
 void zz3660_exec_start(void);
-void zzp_present(const void *rgba, int w, int h);
+void zzp_present(const void *rgba, int w, int h, int again);
+void zz3660_idle(void);
+void zz3660_forget(void);
 
 static uint32_t *buf;           /* the command being decoded */
 static size_t buf_cap;
@@ -336,6 +338,8 @@ command(uint32_t op, uint32_t n)
    trace(op, n);
    switch (op) {
    case ZZ_OPEN:
+      zz3660_forget();
+      blk_put(ZB_OVL_ROW, 0);
       open_ctx((int)W(0), (int)W(1), (int)W(2), (int)W(3));
       break;
    case ZZ_CLOSE:
@@ -421,10 +425,11 @@ command(uint32_t op, uint32_t n)
 }
 
 void
-zzp_present(const void *rgba, int w, int h)
+zzp_present(const void *rgba, int w, int h, int again)
 {
    E->present(rgba, w, h);
-   blk_put(ZB_FRAMES, blk_get(ZB_FRAMES) + 1);
+   if (!again)
+      blk_put(ZB_FRAMES, blk_get(ZB_FRAMES) + 1);
 }
 
 /* the commands in the ring; once: until it is empty, else until ZZ_CLOSE */
@@ -446,6 +451,7 @@ zzgl_dec_run(const struct zzgl_dec_env *env, int once)
             return 0;
          if (env->idle)
             env->idle();
+         zz3660_idle();
          continue;
       }
       if (rd + 8 > ZZGL_RING_SIZE) {         /* the very end: wrap */

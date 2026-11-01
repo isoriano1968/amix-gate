@@ -17,6 +17,7 @@ int zzgl_platform_show(int x, int y, int w, int h);
 void zzgl_platform_frame(void);
 /* the window moved: its top left on the screen */
 void zzgl_platform_place(int x, int y);
+void zzgl_platform_hide(void);
 void zzgl_platform_close(void);
 
 /*

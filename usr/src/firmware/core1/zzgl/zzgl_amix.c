@@ -49,7 +49,7 @@ struct zz9k_reg { unsigned short offset, value; };
 #define FIFO_SIZE           0x00010000UL
 #define SHARED_OFF          0x07B00000UL
 
-static int fd = -1, vs = 1, win_w, win_h, overlay_on, snd_div;
+static int fd = -1, vs = 1, win_w, win_h, vis_w, vis_h, overlay_on, snd_div;
 static volatile unsigned long *zblk;
 static unsigned char *snd_stream;
 static struct zz9k_info info;
@@ -124,8 +124,8 @@ static void place_regs(int x, int y)
 {
    reg32(REG_OVL_XSTART, (unsigned long)x);
    reg32(REG_OVL_YSTART, (unsigned long)y);
-   reg32(REG_OVL_WIDTH, (unsigned long)win_w);
-   reg32(REG_OVL_HEIGHT, (unsigned long)(win_h * vs));
+   reg32(REG_OVL_WIDTH, (unsigned long)vis_w);
+   reg32(REG_OVL_HEIGHT, (unsigned long)(vis_h * vs));
 }
 
 /* x, y of the window kept on the screen */
@@ -215,13 +215,14 @@ int zzgl_platform_show(int x, int y, int w, int h)
 {
    /* the overlay over the window: as glshow (place before and after the
       MPEG INIT: core 0 takes a new size only once the overlay is on) */
-   win_w = w;
-   win_h = h;
+   win_w = vis_w = w;
+   win_h = vis_h = h;
    vs = info.width >= 1600 && !(c1ld[C1LD_W_MAGIC] == C1LD_MAGIC && (c1ld[C1LD_W_FEAT] & C1LD_FEAT_OVL_FETCH)) ? 2 : 1;
    if (w > info.width || h * vs > info.height) {
       fprintf(stderr, "zzgl: %dx%d does not fit the screen (%ux%u)\n", w, h, info.width, info.height);
       return -1;
    }
+   zblk[ZB_OVL_ROW] = 0;
    clamp_place(&x, &y);
    clear_overlay(y / vs, h);
    place_regs(x, y);
@@ -281,15 +282,35 @@ void zzgl_platform_frame(void)
 {
 }
 
+/* the window may hang over the screen's edges; the overlay cannot */
 void zzgl_platform_place(int x, int y)
+{
+   const int cx = x < 0 ? 0 : x, cy = y < 0 ? 0 : y;
+   int w = (x + win_w > info.width ? info.width : x + win_w) - cx;
+   int h = (y + win_h * vs > info.height ? info.height : y + win_h * vs) - cy;
+
+   if (!overlay_on)
+      return;
+   if (w < 1 || h < vs)
+      return;              /* all of it off the screen: stays where it was */
+   vis_w = w;
+   vis_h = h / vs;
+   clear_overlay(cy / vs, vis_h);
+   place_regs(cx, cy);
+   zblk[ZB_OVL_SKIP] = (unsigned long)(cx - x) << 16 | (unsigned long)((cy - y) / vs);
+   zblk[ZB_OVL_CLIP] = (unsigned long)vis_w << 16 | (unsigned long)vis_h;
+   zblk[ZB_OVL_ROW] = (unsigned long)(cy / vs) + 1;     /* not the ring: zz3660's watcher moves it too */
+}
+
+/* the overlay off, for one who is not the ring's writer */
+void zzgl_platform_hide(void)
 {
    if (!overlay_on)
       return;
-   clamp_place(&x, &y);
-   clear_overlay(y / vs, win_h);
-   place_regs(x, y);
-   zzgl_overlay((unsigned long)info.width * 4, (uint32_t)(y / vs), (uint32_t)win_w, (uint32_t)win_h,
-                c1ld[C1LD_W_MAGIC] == C1LD_MAGIC && (c1ld[C1LD_W_FEAT] & C1LD_FEAT_OVL_FLIP));
+   zblk[ZB_OVL_ROW] = ZB_OVL_OFF;      /* core 1 still feeds it: a flip would bring it back */
+   usleep(300000);
+   reg32(REG_MPEG_CMD, CMD_CLOSE);
+   overlay_on = 0;
 }
 
 void zzgl_platform_close(void)
