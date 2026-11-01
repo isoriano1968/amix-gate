@@ -7,6 +7,10 @@ build in src/host-osmesa (compile_commands.json); host-only defines are
 dropped and the target's own are added.
 
     python3 -I build/xbuild.py amix|arm [--clean] [-j N]
+    python3 -I build/xbuild.py amix-glx [--clean] [-j N]
+
+amix-glx is the real libGL: GLX on plain X (gallium's xlib target, src/host-xlib)
+as -fPIC objects for a shared library.
 """
 import json, os, re, shlex, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor
@@ -85,6 +89,19 @@ def entries():
     return [e for e in cc if e["output"].startswith(dirs) and not e["file"].endswith(EXCLUDE)]
 
 
+def glx_entries():
+    """everything host-xlib's libGL is made of"""
+    cc = json.load(open(os.path.join(HOST, "compile_commands.json")))
+    dirs = ("src/compiler/glsl/glcpp/libglcpp.a", "src/compiler/glsl/libglsl.a", "src/compiler/libcompiler.a",
+            "src/compiler/nir/libnir.a", "src/gallium/auxiliary/libgallium.a",
+            "src/gallium/drivers/softpipe/libsoftpipe.a", "src/gallium/state_trackers/glx/xlib/libxlib.a",
+            "src/gallium/winsys/sw/xlib/libws_xlib.a", "src/mapi/glapi/libglapi_static.a",
+            "src/mesa/libmesa_gallium.a", "src/util/libmesa_util.a",
+            "src/gallium/targets/libgl-xlib/libGL.so.1.5.0")
+    dirs = tuple(l + ".p/" for l in dirs)
+    return [e for e in cc if e["output"].startswith(dirs) and not e["file"].endswith(EXCLUDE)]
+
+
 def command(t, e, out):
     args = shlex.split(e["command"])
     cxx = e["file"].endswith((".cpp", ".cc"))
@@ -102,16 +119,25 @@ def command(t, e, out):
 
 
 def main():
+    global HOST
     target = sys.argv[1]
-    t = TARGETS[target]
+    glx = target == "amix-glx"
+    if glx:
+        HOST = os.path.join(TOP, "src", "host-xlib")
+        target = "amix"
+    t = dict(TARGETS[target])
     t["name"] = target
+    if glx:
+        t["flags"] = t["flags"] + ["-fPIC", "-I" + os.path.expanduser(
+            "~/Sources/usr-amix/private/shared-build/stage/usr/x11r6/include")]
+        target = "amix-glx"
     jobs = int(sys.argv[sys.argv.index("-j") + 1]) if "-j" in sys.argv else os.cpu_count()
     out = os.path.join(TOP, "build", target)
     if "--clean" in sys.argv:
         subprocess.run(["rm", "-rf", out])
     os.makedirs(os.path.join(out, "obj"), exist_ok=True)
     log = os.path.join(out, "errors.log")
-    es = entries()
+    es = glx_entries() if glx else entries()
 
     def stale(o, src):
         """the object is older than its source or any header it was built
@@ -143,7 +169,7 @@ def main():
         print("  ", os.path.basename(o))
     if bad:
         sys.exit(1)
-    lib = os.path.join(out, "libOSMesa.a")
+    lib = os.path.join(out, "libGL-objs.a" if glx else "libOSMesa.a")
     if os.path.exists(lib):
         os.remove(lib)
     subprocess.run([t["ar"], "rcs", lib] + [o for o, _ in res], check=True)

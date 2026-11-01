@@ -638,7 +638,7 @@ index 6363701..3ae99a6 100644
     for (i = 0; i < sp->num_vertex_buffers; i++) {
 diff --git a/src/gallium/drivers/softpipe/sp_fast.c b/src/gallium/drivers/softpipe/sp_fast.c
 new file mode 100644
-index 0000000..d2f58f1
+index 0000000..5455343
 --- /dev/null
 +++ b/src/gallium/drivers/softpipe/sp_fast.c
 @@ -0,0 +1,2494 @@
@@ -2211,7 +2211,6 @@ index 0000000..d2f58f1
 +}
 +#endif
 +
-+#ifdef __ARM_NEON
 +/* the fog factor of an 8.16 plane value */
 +static inline unsigned
 +fog8(int32_t v)
@@ -2221,6 +2220,7 @@ index 0000000..d2f58f1
 +   return i < 0 ? 0 : i > 255 ? 255 : (unsigned)i;
 +}
 +
++#ifdef __ARM_NEON
 +/* two pixels to the fog colour by factors a and b; alpha stays (fogc has
 +   alpha 0, the weight is 255) */
 +static inline __attribute__((always_inline)) uint8x8_t
@@ -4553,6 +4553,22 @@ index 3fa43ed..f7fc395 100644
  #if defined(__APPLE__)
  #define PIPE_OS_APPLE
  #define PIPE_OS_UNIX
+diff --git a/src/gallium/state_trackers/glx/xlib/xm_api.c b/src/gallium/state_trackers/glx/xlib/xm_api.c
+index 86d27c4..677cb1d 100644
+--- a/src/gallium/state_trackers/glx/xlib/xm_api.c
++++ b/src/gallium/state_trackers/glx/xlib/xm_api.c
+@@ -944,6 +944,11 @@ xmesa_get_name(void)
+ int
+ xmesa_init( Display *display )
+ {
++#ifdef __amix__
++   extern void amix_so_ctors(void);
++
++   amix_so_ctors();
++#endif
+    return xmesa_init_display(display) ? 0 : 1;
+ }
+ 
 diff --git a/src/gallium/state_trackers/osmesa/osmesa.c b/src/gallium/state_trackers/osmesa/osmesa.c
 index e7e0ab1..4648f98 100644
 --- a/src/gallium/state_trackers/osmesa/osmesa.c
