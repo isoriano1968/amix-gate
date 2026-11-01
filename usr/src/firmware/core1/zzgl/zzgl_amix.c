@@ -185,6 +185,15 @@ static int start_server(volatile unsigned long *blk)
    return 0;
 }
 
+static int server_only;
+
+/* the server without the overlay: zz3660 for now shows frames through X */
+int zzgl_platform_server(void)
+{
+   server_only = 1;
+   return zzgl_platform_open(NULL, 0, 0, 0, 16, 16);
+}
+
 int zzgl_platform_open(void *dpy, unsigned long win, int x, int y, int w, int h)
 {
    volatile unsigned long *blk;
@@ -220,6 +229,9 @@ int zzgl_platform_open(void *dpy, unsigned long win, int x, int y, int w, int h)
       fprintf(stderr, "zzgl: core 1 could not make the context (%08lx)\n", blk[ZB_ERROR]);
       return -1;
    }
+
+   if (server_only)
+      return 0;
 
    /* the overlay over the window: as glshow (place before and after the
       MPEG INIT: core 0 takes a new size only once the overlay is on) */

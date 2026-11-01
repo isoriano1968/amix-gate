@@ -204,6 +204,20 @@ sync_call(uint32_t what, const uint32_t *args, unsigned nargs)
 
 #include "gen/zzgl_gen_enc.h"
 
+void
+zzgl_pipe(const uint32_t *words, unsigned n)
+{
+   cmd_big(ZZ_PIPE, words, n, NULL, 0);
+}
+
+void
+zzgl_pipe_read(const uint32_t *words, unsigned n, void *reply, size_t bytes)
+{
+   cmd_big(ZZ_PIPE, words, n, NULL, 0);
+   sync_call(ZQ_NONE, NULL, 0);
+   memcpy(reply, T->reply, bytes);
+}
+
 /*
  * Client arrays: the encoder keeps them; their used part goes with a draw.
  */

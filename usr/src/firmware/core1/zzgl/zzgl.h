@@ -125,6 +125,7 @@ enum {
    ZQ_ISENABLED
 };
 
+#define ZZ_PIPE 1001             /* zz3660: Gallium commands, words (drivers/zz3660/zz_proto.h) */
 #define ZZ_EFFECT 1000           /* time, beat (floats): core 1 draws a frame itself (spook.c) and shows it */
 
 /* ZZ_DRAW's arrays: a word of flags, then per array in this order

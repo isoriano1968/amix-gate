@@ -31,6 +31,10 @@ static const struct zzgl_dec_env *E;
 static OSMesaContext ctx;
 static uint8_t *fb;
 static int fb_w, fb_h;
+/* the zz3660 executor: softpipe, with nothing to present to yet */
+void zzp_exec(uint32_t *words, unsigned n, void *reply);
+void zz3660_exec_start(void);
+
 static uint32_t *buf;           /* the command being decoded */
 static size_t buf_cap;
 static int client_unit;
@@ -352,6 +356,9 @@ command(uint32_t op, uint32_t n)
       }
       blk_put(ZB_FRAMES, blk_get(ZB_FRAMES) + 1);
       break;
+   case ZZ_PIPE:
+      zzp_exec(buf, n / 4, E->reply);
+      break;
    case ZZ_OVERLAY:
       if (E->overlay)
          E->overlay(W(0), W(1), W(2), W(3), (int)W(4));
@@ -419,6 +426,7 @@ zzgl_dec_run(const struct zzgl_dec_env *env, int once)
    uint32_t rd;
 
    E = env;
+   zz3660_exec_start();
    rd = blk_get(ZB_RD);
    (void)ticks;
    for (;;) {

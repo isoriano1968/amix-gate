@@ -86,7 +86,14 @@ TARGETS = {
 def entries():
     cc = json.load(open(os.path.join(HOST, "compile_commands.json")))
     dirs = tuple(l + ".p/" for l in LIBS)
-    return [e for e in cc if e["output"].startswith(dirs) and not e["file"].endswith(EXCLUDE)]
+    es = [e for e in cc if e["output"].startswith(dirs) and not e["file"].endswith(EXCLUDE)]
+    # zz3660, if host-osmesa was configured before it: as a file of softpipe
+    if not any("zz_exec.c" in e["file"] for e in es):
+        sp = next(e for e in es if e["file"].endswith("softpipe/sp_screen.c"))
+        for f in ("zz_driver.c", "zz_exec.c", "zz_loop.c"):
+            es.append({"file": sp["file"].replace("softpipe/sp_screen.c", "zz3660/" + f),
+                       "command": sp["command"], "output": sp["output"].replace("sp_screen.c", f)})
+    return es
 
 
 def glx_entries():
@@ -99,7 +106,7 @@ def glx_entries():
             "src/mesa/libmesa_gallium.a", "src/util/libmesa_util.a",
             "src/gallium/targets/libgl-xlib/libGL.so.1.5.0")
     dirs = tuple(l + ".p/" for l in dirs)
-    return [e for e in cc if e["output"].startswith(dirs) and not e["file"].endswith(EXCLUDE)]
+    return [e for e in cc if e["output"].startswith(dirs) and not e["file"].endswith(EXCLUDE + ("zz_loop.c",))]
 
 
 def command(t, e, out):

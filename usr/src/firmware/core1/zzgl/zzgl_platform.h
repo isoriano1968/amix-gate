@@ -10,6 +10,7 @@
 /* the context for an X window (display, window) of w x h at x, y on the
    screen; 0, or -1 with the reason printed */
 int zzgl_platform_open(void *dpy, unsigned long win, int x, int y, int w, int h);
+int zzgl_platform_server(void);
 /* after the frame's zzgl_swap() */
 void zzgl_platform_frame(void);
 /* the window moved: its top left on the screen */

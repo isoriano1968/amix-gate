@@ -481,6 +481,40 @@ index e149799..1d0f21b 100644
    'draw/draw_vs.h',
    'draw/draw_vs_variant.c',
    'driver_ddebug/dd_context.c',
+diff --git a/src/gallium/auxiliary/target-helpers/inline_sw_helper.h b/src/gallium/auxiliary/target-helpers/inline_sw_helper.h
+index 5bb77a5..c1e789f 100644
+--- a/src/gallium/auxiliary/target-helpers/inline_sw_helper.h
++++ b/src/gallium/auxiliary/target-helpers/inline_sw_helper.h
+@@ -2,6 +2,7 @@
+ #ifndef INLINE_SW_HELPER_H
+ #define INLINE_SW_HELPER_H
+ 
++#include <stdlib.h>
+ #include "pipe/p_compiler.h"
+ #include "util/u_debug.h"
+ #include "state_tracker/sw_winsys.h"
+@@ -16,6 +17,8 @@
+ 
+ #ifdef GALLIUM_SOFTPIPE
+ #include "softpipe/sp_public.h"
++#include "zz3660/zz_public.h"
++#include "zz3660/zz_proto.h"
+ #endif
+ 
+ #ifdef GALLIUM_LLVMPIPE
+@@ -48,6 +51,12 @@ sw_screen_create_named(struct sw_winsys *winsys, const char *driver)
+ #if defined(GALLIUM_SOFTPIPE)
+    if (screen == NULL && strcmp(driver, "softpipe") == 0)
+       screen = softpipe_create_screen(winsys);
++   if (screen == NULL && strcmp(driver, "zz3660") == 0) {
++      struct pipe_screen *caps = softpipe_create_screen(winsys);
++
++      zzp_exec_init(caps, getenv("ZZ_BE") != NULL);
++      screen = zz3660_create_screen(caps, winsys);
++   }
+ #endif
+ 
+ #if defined(GALLIUM_SWR)
 diff --git a/src/gallium/auxiliary/tgsi/tgsi_exec.c b/src/gallium/auxiliary/tgsi/tgsi_exec.c
 index 5db515a..1cea615 100644
 --- a/src/gallium/auxiliary/tgsi/tgsi_exec.c
@@ -568,10 +602,20 @@ index e405ef2..2986d26 100644
  	sp_setup.h \
  	sp_state_blend.c \
 diff --git a/src/gallium/drivers/softpipe/meson.build b/src/gallium/drivers/softpipe/meson.build
-index a345ff6..bf337fc 100644
+index a345ff6..fd96f10 100644
 --- a/src/gallium/drivers/softpipe/meson.build
 +++ b/src/gallium/drivers/softpipe/meson.build
-@@ -32,6 +32,8 @@ files_softpipe = files(
+@@ -19,6 +19,9 @@
+ # SOFTWARE.
+ 
+ files_softpipe = files(
++  '../zz3660/zz_driver.c',
++  '../zz3660/zz_exec.c',
++  '../zz3660/zz_loop.c',
+   'sp_buffer.c',
+   'sp_buffer.h',
+   'sp_clear.c',
+@@ -32,6 +35,8 @@ files_softpipe = files(
    'sp_flush.c',
    'sp_flush.h',
    'sp_fs_exec.c',
@@ -580,7 +624,7 @@ index a345ff6..bf337fc 100644
    'sp_fs.h',
    'sp_image.c',
    'sp_image.h',
-@@ -51,6 +53,8 @@ files_softpipe = files(
+@@ -51,6 +56,8 @@ files_softpipe = files(
    'sp_query.h',
    'sp_screen.c',
    'sp_screen.h',
@@ -4536,6 +4580,1593 @@ index 2c0bafa..ac99de1 100644
  };
  
  
+diff --git a/src/gallium/drivers/zz3660/zz_board.c b/src/gallium/drivers/zz3660/zz_board.c
+new file mode 100644
+index 0000000..38b9ddf
+--- /dev/null
++++ b/src/gallium/drivers/zz3660/zz_board.c
+@@ -0,0 +1,39 @@
++/*
++ * zz_board.c -- the zz3660 stream over the Z3660's ring: zzgl's transport, with
++ * core 1's server underneath.
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include "zz_proto.h"
++#include "zzgl_enc.h"
++#include "zzgl_platform.h"
++
++static void
++start(void)
++{
++   static int up;
++
++   if (!up) {
++      if (zzgl_platform_server() != 0) {
++         fprintf(stderr, "zz3660: no GPU on core 1\n");
++         exit(1);
++      }
++      atexit(zzgl_platform_close);
++      up = 1;
++   }
++}
++
++void
++zzp_send(uint32_t *w, unsigned n)
++{
++   start();
++   zzgl_pipe(w, n);
++   zzgl_flush();
++}
++
++void
++zzp_read(uint32_t *w, unsigned n, void *reply)
++{
++   start();
++   zzgl_pipe_read(w, n, reply, (size_t)w[9] * w[7]);
++}
+diff --git a/src/gallium/drivers/zz3660/zz_driver.c b/src/gallium/drivers/zz3660/zz_driver.c
+new file mode 100644
+index 0000000..55d865a
+--- /dev/null
++++ b/src/gallium/drivers/zz3660/zz_driver.c
+@@ -0,0 +1,846 @@
++/*
++ * zz_driver.c -- zz3660, a Gallium driver that does no work: each pipe_context
++ * call goes to the GPU as a command (zz_proto.h, zz_exec.c).  Modelled on noop
++ * and virgl.  Today's GPU is core 1 of the Z3660 running softpipe; a real one
++ * needs another executor, and this driver and Mesa above stay.
++ *
++ * Each resource has a copy here that transfers use; a write goes out at unmap,
++ * and a read of something the GPU may have drawn comes back first.
++ */
++#include <stdio.h>
++#include <string.h>
++#include "pipe/p_context.h"
++#include "pipe/p_defines.h"
++#include "pipe/p_screen.h"
++#include "pipe/p_state.h"
++#include "state_tracker/sw_winsys.h"
++#include "tgsi/tgsi_dump.h"
++#include "util/u_box.h"
++#include "util/u_format.h"
++#include "util/u_inlines.h"
++#include "util/u_memory.h"
++#include "util/u_transfer.h"
++#include "util/u_upload_mgr.h"
++#include "util/u_math.h"
++#include "zz_proto.h"
++#include "zz_fields.h"
++#include "zz_public.h"
++
++struct zz_screen {
++   struct pipe_screen base;
++   struct pipe_screen *caps;
++   struct sw_winsys *ws;
++};
++
++struct zz_resource {
++   struct pipe_resource base;
++   uint32_t id;
++   uint8_t *data;
++   unsigned stride[PIPE_MAX_TEXTURE_LEVELS], offset[PIPE_MAX_TEXTURE_LEVELS], layer[PIPE_MAX_TEXTURE_LEVELS];
++   unsigned size;
++   boolean gpu_wrote;           /* the copy here may be old */
++   struct sw_displaytarget *dt;
++   unsigned dt_stride;
++};
++
++struct zz_view { struct pipe_sampler_view base; uint32_t id; };
++struct zz_surface { struct pipe_surface base; uint32_t id; };
++
++static inline struct zz_resource *zr(struct pipe_resource *r) { return (struct zz_resource *)r; }
++
++/* ids: 0 is none */
++static uint32_t free_ids[ZZP_MAX_OBJ];
++static unsigned nfree, next_id = 1;
++
++static uint32_t
++new_id(void)
++{
++   if (nfree)
++      return free_ids[--nfree];
++   if (next_id == ZZP_MAX_OBJ) {
++      fprintf(stderr, "zz3660: out of object ids\n");
++      abort();
++   }
++   return next_id++;
++}
++
++static void
++drop_id(uint32_t id)
++{
++   free_ids[nfree++] = id;
++}
++
++/* the stream */
++static uint32_t buf[1 << 16];
++static unsigned used;
++
++static void
++flush_cmds(void)
++{
++   if (used)
++      zzp_send(buf, used);
++   used = 0;
++}
++
++static uint32_t *
++cmd(unsigned op, unsigned words)
++{
++   uint32_t *p;
++
++   if (used + words + 1 > ARRAY_SIZE(buf))
++      flush_cmds();
++   if (words + 1 > ARRAY_SIZE(buf)) {
++      fprintf(stderr, "zz3660: command of %u words\n", words);
++      abort();
++   }
++   p = &buf[used];
++   p[0] = op | words << 8;
++   used += words + 1;
++   return p + 1;
++}
++
++static inline uint32_t fw(float f) { union { uint32_t u; float f; } c; c.f = f; return c.u; }
++
++/*
++ * Resources
++ */
++static struct pipe_resource *
++zz_resource_create(struct pipe_screen *screen, const struct pipe_resource *t)
++{
++   struct zz_screen *s = (struct zz_screen *)screen;
++   struct zz_resource *r = CALLOC_STRUCT(zz_resource);
++   unsigned l, w = t->width0, h = t->height0, d = t->depth0, off = 0;
++   uint32_t *p;
++
++   r->base = *t;
++   r->base.screen = screen;
++   pipe_reference_init(&r->base.reference, 1);
++   for (l = 0; l <= t->last_level; l++) {
++      r->stride[l] = util_format_get_stride(t->format, w);
++      r->layer[l] = r->stride[l] * util_format_get_nblocksy(t->format, h);
++      r->offset[l] = off;
++      off += r->layer[l] * (t->target == PIPE_TEXTURE_3D ? d : t->array_size);
++      w = u_minify(w, 1);
++      h = u_minify(h, 1);
++      d = u_minify(d, 1);
++   }
++   r->size = off;
++   r->data = align_malloc(MAX2(off, 16), 16);
++   if (t->bind & PIPE_BIND_DISPLAY_TARGET) {
++      r->dt = s->ws->displaytarget_create(s->ws, t->bind, t->format, t->width0, t->height0, 64, NULL,
++                                          &r->dt_stride);
++   }
++   r->id = new_id();
++   p = cmd(ZP_RES_CREATE, 12);
++   p[0] = r->id; p[1] = t->target; p[2] = t->format; p[3] = t->width0; p[4] = t->height0;
++   p[5] = t->depth0; p[6] = t->array_size; p[7] = t->last_level; p[8] = t->nr_samples;
++   p[9] = t->usage; p[10] = t->bind; p[11] = t->flags;
++   return &r->base;
++}
++
++static void
++zz_resource_destroy(struct pipe_screen *screen, struct pipe_resource *res)
++{
++   struct zz_screen *s = (struct zz_screen *)screen;
++   struct zz_resource *r = zr(res);
++
++   cmd(ZP_RES_DESTROY, 1)[0] = r->id;
++   drop_id(r->id);
++   if (r->dt)
++      s->ws->displaytarget_destroy(s->ws, r->dt);
++   align_free(r->data);
++   FREE(r);
++}
++
++/* the box of a level from the GPU into the copy here */
++static void
++fetch(struct zz_resource *r, unsigned level, const struct pipe_box *b)
++{
++   const unsigned stride = util_format_get_stride(r->base.format, b->width);
++   const unsigned rows = util_format_get_nblocksy(r->base.format, b->height);
++   uint8_t *dst = r->data + r->offset[level] + b->z * r->layer[level] +
++                  util_format_get_nblocksy(r->base.format, b->y) * r->stride[level] +
++                  util_format_get_stride(r->base.format, b->x);
++   uint8_t *tmp = MALLOC(stride * rows);
++   uint32_t w[11];
++   unsigned y;
++
++   flush_cmds();
++   w[0] = ZP_RES_READ | 10 << 8;
++   w[1] = r->id; w[2] = level; w[3] = b->x; w[4] = b->y; w[5] = b->z;
++   w[6] = b->width; w[7] = b->height; w[8] = 1; w[9] = stride; w[10] = 0;
++   zzp_read(w, 11, tmp);
++   for (y = 0; y < rows; y++)
++      memcpy(dst + y * r->stride[level], tmp + y * stride, stride);
++   FREE(tmp);
++}
++
++static void *
++zz_transfer_map(struct pipe_context *pipe, struct pipe_resource *res, unsigned level, unsigned usage,
++                const struct pipe_box *box, struct pipe_transfer **out)
++{
++   struct zz_resource *r = zr(res);
++   struct pipe_transfer *t = CALLOC_STRUCT(pipe_transfer);
++   unsigned off = r->offset[level] + box->z * r->layer[level] +
++                  util_format_get_nblocksy(res->format, box->y) * r->stride[level] +
++                  util_format_get_stride(res->format, box->x);
++
++   pipe_resource_reference(&t->resource, res);
++   t->level = level;
++   t->usage = usage;
++   t->box = *box;
++   t->stride = r->stride[level];
++   t->layer_stride = r->layer[level];
++   *out = t;
++   if ((usage & PIPE_TRANSFER_READ) && r->gpu_wrote && res->target != PIPE_BUFFER)
++      fetch(r, level, box);
++   return r->data + off;
++}
++
++static void
++send_box(struct zz_resource *r, unsigned level, const struct pipe_box *b)
++{
++   const unsigned stride = util_format_get_stride(r->base.format, b->width);
++   const unsigned rows = util_format_get_nblocksy(r->base.format, b->height);
++   const unsigned sent = stride * rows * b->depth;
++   const unsigned words = 10 + (sent + 3) / 4;
++   uint8_t *src = r->data + r->offset[level] + b->z * r->layer[level] +
++                  util_format_get_nblocksy(r->base.format, b->y) * r->stride[level] +
++                  util_format_get_stride(r->base.format, b->x);
++   uint32_t *p;
++   uint8_t *d;
++   unsigned y;
++
++   /* a big one in pieces of rows, or of bytes for a buffer */
++   if (words + 1 > ARRAY_SIZE(buf)) {
++      struct pipe_box part = *b;
++
++      if (r->base.target == PIPE_BUFFER) {
++         part.width = b->width / 2;
++         send_box(r, level, &part);
++         part.x += part.width;
++         part.width = b->width - part.width;
++      } else {
++         part.height = util_format_get_blockheight(r->base.format) * (rows / 2);
++         send_box(r, level, &part);
++         part.y += part.height;
++         part.height = b->height - part.height;
++      }
++      send_box(r, level, &part);
++      return;
++   }
++   p = cmd(ZP_RES_WRITE, words);
++   p[0] = r->id; p[1] = level; p[2] = b->x; p[3] = b->y; p[4] = b->z;
++   p[5] = b->width; p[6] = b->height; p[7] = b->depth; p[8] = stride; p[9] = stride * rows;
++   d = (uint8_t *)&p[10];
++   for (y = 0; y < rows * b->depth; y++)
++      memcpy(d + y * stride, src + y * r->stride[level], stride);
++}
++
++static void
++zz_transfer_unmap(struct pipe_context *pipe, struct pipe_transfer *t)
++{
++   if ((t->usage & PIPE_TRANSFER_WRITE) && !(t->usage & PIPE_TRANSFER_FLUSH_EXPLICIT))
++      send_box(zr(t->resource), t->level, &t->box);
++   pipe_resource_reference(&t->resource, NULL);
++   FREE(t);
++}
++
++static void
++zz_transfer_flush_region(struct pipe_context *pipe, struct pipe_transfer *t, const struct pipe_box *box)
++{
++   struct pipe_box b = *box;
++
++   b.x += t->box.x;
++   b.y += t->box.y;
++   b.z += t->box.z;
++   send_box(zr(t->resource), t->level, &b);
++}
++
++/*
++ * State objects
++ */
++#define PI(x) *p++ = s->x;
++#define PF(x) *p++ = fw(s->x);
++
++static void *
++zz_create_blend(struct pipe_context *pipe, const struct pipe_blend_state *b)
++{
++   uint32_t id = new_id(), *p = cmd(ZP_BLEND, 7 + 8 * PIPE_MAX_COLOR_BUFS);
++   unsigned i;
++
++   *p++ = id;
++   *p++ = b->independent_blend_enable; *p++ = b->logicop_enable; *p++ = b->logicop_func;
++   *p++ = b->dither; *p++ = b->alpha_to_coverage; *p++ = b->alpha_to_one;
++   for (i = 0; i < PIPE_MAX_COLOR_BUFS; i++) {
++#define PR(x) *p++ = b->rt[i].x;
++      ZZP_RTBLEND(PR, PR)
++   }
++   return (void *)(uintptr_t)id;
++}
++
++static void *
++zz_create_dsa(struct pipe_context *pipe, const struct pipe_depth_stencil_alpha_state *d)
++{
++   uint32_t id = new_id(), *p = cmd(ZP_DSA, 1 + 6 + 14 + 3);
++
++   *p++ = id;
++#define PD(x) *p++ = d->depth.x;
++#define PDF(x) *p++ = fw(d->depth.x);
++   ZZP_DEPTH(PD, PDF)
++#define PS0(x) *p++ = d->stencil[0].x;
++#define PS1(x) *p++ = d->stencil[1].x;
++   ZZP_STENCIL(PS0, PS0)
++   ZZP_STENCIL(PS1, PS1)
++#define PA(x) *p++ = d->alpha.x;
++#define PAF(x) *p++ = fw(d->alpha.x);
++   ZZP_ALPHA(PA, PAF)
++   return (void *)(uintptr_t)id;
++}
++
++static void *
++zz_create_rast(struct pipe_context *pipe, const struct pipe_rasterizer_state *s)
++{
++#define ONE(x) + 1
++   uint32_t id = new_id(), *p = cmd(ZP_RAST, 1 ZZP_RAST(ONE, ONE));
++
++   *p++ = id;
++   ZZP_RAST(PI, PF)
++   return (void *)(uintptr_t)id;
++}
++
++static void *
++zz_create_sampler(struct pipe_context *pipe, const struct pipe_sampler_state *s)
++{
++   uint32_t id = new_id(), *p = cmd(ZP_SAMPLER, 5 ZZP_SAMPLER(ONE, ONE));
++   unsigned i;
++
++   *p++ = id;
++   ZZP_SAMPLER(PI, PF)
++   for (i = 0; i < 4; i++)
++      *p++ = s->border_color.ui[i];
++   return (void *)(uintptr_t)id;
++}
++
++static void *
++zz_create_velems(struct pipe_context *pipe, unsigned n, const struct pipe_vertex_element *e)
++{
++   uint32_t id = new_id(), *p = cmd(ZP_VELEMS, 2 + n * 4);
++   unsigned i;
++
++   *p++ = id;
++   *p++ = n;
++   for (i = 0; i < n; i++) {
++      *p++ = e[i].src_offset; *p++ = e[i].vertex_buffer_index;
++      *p++ = e[i].src_format; *p++ = e[i].instance_divisor;
++   }
++   return (void *)(uintptr_t)id;
++}
++
++/* as text, as virgl: TGSI tokens are bitfields and do not survive a change of
++   byte order */
++static void *
++create_shader(enum zzp_kind kind, const struct pipe_shader_state *s)
++{
++   static char text[1 << 18];
++   unsigned bytes;
++   uint32_t id = new_id(), *p;
++
++   if (!tgsi_dump_str(s->tokens, TGSI_DUMP_FLOAT_AS_HEX, text, sizeof(text))) {
++      fprintf(stderr, "zz3660: shader too long\n");
++      abort();
++   }
++   bytes = strlen(text) + 1;
++   p = cmd(ZP_SHADER, 3 + (bytes + 3) / 4);
++   p[0] = id;
++   p[1] = kind;
++   p[2] = bytes;
++   memcpy(&p[3], text, bytes);
++   return (void *)(uintptr_t)id;
++}
++
++static void *zz_create_vs(struct pipe_context *c, const struct pipe_shader_state *s) { return create_shader(ZK_VS, s); }
++static void *zz_create_fs(struct pipe_context *c, const struct pipe_shader_state *s) { return create_shader(ZK_FS, s); }
++static void *zz_create_gs(struct pipe_context *c, const struct pipe_shader_state *s) { return create_shader(ZK_GS, s); }
++
++static void
++bind(enum zzp_kind kind, void *o)
++{
++   uint32_t *p = cmd(ZP_BIND, 2);
++
++   p[0] = kind;
++   p[1] = (uint32_t)(uintptr_t)o;
++}
++
++static void
++del(enum zzp_kind kind, void *o)
++{
++   uint32_t *p = cmd(ZP_FREE, 2);
++
++   p[0] = (uint32_t)(uintptr_t)o;
++   p[1] = kind;
++   drop_id((uint32_t)(uintptr_t)o);
++}
++
++#define BD(name, kind) \
++   static void zz_bind_##name(struct pipe_context *c, void *o) { bind(kind, o); } \
++   static void zz_del_##name(struct pipe_context *c, void *o) { del(kind, o); }
++BD(blend, ZK_BLEND) BD(dsa, ZK_DSA) BD(rast, ZK_RAST) BD(velems, ZK_VELEMS)
++BD(vs, ZK_VS) BD(fs, ZK_FS) BD(gs, ZK_GS)
++
++static void zz_del_sampler(struct pipe_context *c, void *o) { del(ZK_SAMPLER, o); }
++
++static void
++zz_bind_samplers(struct pipe_context *c, enum pipe_shader_type sh, unsigned start, unsigned n, void **s)
++{
++   uint32_t *p = cmd(ZP_BIND_SAMPLERS, 3 + n);
++   unsigned i;
++
++   p[0] = sh; p[1] = start; p[2] = n;
++   for (i = 0; i < n; i++)
++      p[3 + i] = s ? (uint32_t)(uintptr_t)s[i] : 0;
++}
++
++static struct pipe_sampler_view *
++zz_create_view(struct pipe_context *c, struct pipe_resource *r, const struct pipe_sampler_view *t)
++{
++   struct zz_view *v = CALLOC_STRUCT(zz_view);
++   uint32_t *p;
++
++   v->base = *t;
++   pipe_reference_init(&v->base.reference, 1);
++   v->base.texture = NULL;
++   pipe_resource_reference(&v->base.texture, r);
++   v->base.context = c;
++   v->id = new_id();
++   p = cmd(ZP_VIEW, 12);
++   p[0] = v->id; p[1] = zr(r)->id; p[2] = t->format; p[3] = t->u.tex.first_layer;
++   p[4] = t->u.tex.last_layer; p[5] = t->u.tex.first_level; p[6] = t->u.tex.last_level;
++   p[7] = t->swizzle_r; p[8] = t->swizzle_g; p[9] = t->swizzle_b; p[10] = t->swizzle_a; p[11] = t->target;
++   return &v->base;
++}
++
++static void
++zz_view_destroy(struct pipe_context *c, struct pipe_sampler_view *v)
++{
++   del(ZK_VIEW, (void *)(uintptr_t)((struct zz_view *)v)->id);
++   pipe_resource_reference(&v->texture, NULL);
++   FREE(v);
++}
++
++static void
++zz_set_views(struct pipe_context *c, enum pipe_shader_type sh, unsigned start, unsigned n,
++             struct pipe_sampler_view **v)
++{
++   uint32_t *p = cmd(ZP_SET_VIEWS, 3 + n);
++   unsigned i;
++
++   p[0] = sh; p[1] = start; p[2] = n;
++   for (i = 0; i < n; i++)
++      p[3 + i] = v && v[i] ? ((struct zz_view *)v[i])->id : 0;
++}
++
++static struct pipe_surface *
++zz_create_surface(struct pipe_context *c, struct pipe_resource *r, const struct pipe_surface *t)
++{
++   struct zz_surface *s = CALLOC_STRUCT(zz_surface);
++   uint32_t *p;
++
++   s->base = *t;
++   pipe_reference_init(&s->base.reference, 1);
++   s->base.texture = NULL;
++   pipe_resource_reference(&s->base.texture, r);
++   s->base.context = c;
++   s->base.width = u_minify(r->width0, t->u.tex.level);
++   s->base.height = u_minify(r->height0, t->u.tex.level);
++   s->id = new_id();
++   p = cmd(ZP_SURFACE, 6);
++   p[0] = s->id; p[1] = zr(r)->id; p[2] = t->format; p[3] = t->u.tex.level;
++   p[4] = t->u.tex.first_layer; p[5] = t->u.tex.last_layer;
++   return &s->base;
++}
++
++static void
++zz_surface_destroy(struct pipe_context *c, struct pipe_surface *s)
++{
++   del(ZK_SURFACE, (void *)(uintptr_t)((struct zz_surface *)s)->id);
++   pipe_resource_reference(&s->texture, NULL);
++   FREE(s);
++}
++
++static struct pipe_framebuffer_state fb;
++
++static void
++zz_set_framebuffer(struct pipe_context *c, const struct pipe_framebuffer_state *f)
++{
++   uint32_t *p = cmd(ZP_FRAMEBUFFER, 6 + f->nr_cbufs);
++   unsigned i;
++
++   p[0] = f->width; p[1] = f->height; p[2] = f->nr_cbufs; p[3] = f->layers; p[4] = f->samples;
++   p[5] = f->zsbuf ? ((struct zz_surface *)f->zsbuf)->id : 0;
++   for (i = 0; i < f->nr_cbufs; i++)
++      p[6 + i] = f->cbufs[i] ? ((struct zz_surface *)f->cbufs[i])->id : 0;
++   for (i = 0; i < PIPE_MAX_COLOR_BUFS; i++)
++      fb.cbufs[i] = i < f->nr_cbufs ? f->cbufs[i] : NULL;
++   fb.nr_cbufs = f->nr_cbufs;
++}
++
++/* what is bound to draw on: its copy here is old after a draw */
++static void
++drew(void)
++{
++   unsigned i;
++
++   for (i = 0; i < fb.nr_cbufs; i++)
++      if (fb.cbufs[i] && fb.cbufs[i]->texture)
++         zr(fb.cbufs[i]->texture)->gpu_wrote = TRUE;
++}
++
++static void
++zz_set_viewports(struct pipe_context *c, unsigned start, unsigned n, const struct pipe_viewport_state *v)
++{
++   uint32_t *p = cmd(ZP_VIEWPORT, 6);
++   unsigned i;
++
++   for (i = 0; i < 3; i++) {
++      p[i] = fw(v->scale[i]);
++      p[3 + i] = fw(v->translate[i]);
++   }
++}
++
++static void
++zz_set_scissors(struct pipe_context *c, unsigned start, unsigned n, const struct pipe_scissor_state *s)
++{
++   uint32_t *p = cmd(ZP_SCISSOR, 4);
++
++   p[0] = s->minx; p[1] = s->miny; p[2] = s->maxx; p[3] = s->maxy;
++}
++
++static void
++zz_set_blend_color(struct pipe_context *c, const struct pipe_blend_color *b)
++{
++   uint32_t *p = cmd(ZP_BLEND_COLOR, 4);
++   unsigned i;
++
++   for (i = 0; i < 4; i++)
++      p[i] = fw(b->color[i]);
++}
++
++static void
++zz_set_stencil_ref(struct pipe_context *c, const struct pipe_stencil_ref *r)
++{
++   uint32_t *p = cmd(ZP_STENCIL_REF, 2);
++
++   p[0] = r->ref_value[0];
++   p[1] = r->ref_value[1];
++}
++
++static void zz_set_sample_mask(struct pipe_context *c, unsigned m) { cmd(ZP_SAMPLE_MASK, 1)[0] = m; }
++
++static void
++zz_set_clip(struct pipe_context *c, const struct pipe_clip_state *s)
++{
++   memcpy(cmd(ZP_CLIP, sizeof(s->ucp) / 4), s->ucp, sizeof(s->ucp));
++}
++
++static void
++zz_set_stipple(struct pipe_context *c, const struct pipe_poly_stipple *s)
++{
++   memcpy(cmd(ZP_STIPPLE, sizeof(s->stipple) / 4), s->stipple, sizeof(s->stipple));
++}
++
++static void
++zz_set_constant_buffer(struct pipe_context *c, enum pipe_shader_type sh, unsigned index,
++                       const struct pipe_constant_buffer *cb)
++{
++   const unsigned size = cb ? cb->buffer_size : 0;
++   const void *data = NULL;
++   uint32_t *p;
++
++   if (cb)
++      data = cb->user_buffer ? cb->user_buffer :
++             cb->buffer ? zr(cb->buffer)->data + cb->buffer_offset : NULL;
++   p = cmd(ZP_CONSTBUF, 3 + (size + 3) / 4);
++   p[0] = sh; p[1] = index; p[2] = data ? size : 0;
++   if (data)
++      memcpy(&p[3], data, size);
++}
++
++static void
++zz_set_vertex_buffers(struct pipe_context *c, unsigned start, unsigned n, const struct pipe_vertex_buffer *b)
++{
++   uint32_t *p = cmd(ZP_VBUFS, 1 + n * 3);
++   unsigned i;
++
++   p[0] = n;
++   for (i = 0; i < n; i++) {
++      p[1 + i * 3] = b ? b[i].stride : 0;
++      p[2 + i * 3] = b ? b[i].buffer_offset : 0;
++      p[3 + i * 3] = b && b[i].buffer.resource ? zr(b[i].buffer.resource)->id : 0;
++   }
++}
++
++static void
++zz_draw_vbo(struct pipe_context *c, const struct pipe_draw_info *d)
++{
++   const unsigned bytes = d->index_size * d->count;
++   const uint8_t *idx = NULL;
++   uint32_t *p;
++
++   if (d->index_size)
++      idx = (d->has_user_indices ? (const uint8_t *)d->index.user : zr(d->index.resource)->data) +
++            (d->has_user_indices ? 0 : d->start * d->index_size);
++   p = cmd(ZP_DRAW, 11 + (bytes + 3) / 4);
++   p[0] = d->mode; p[1] = d->index_size;
++   p[2] = d->index_size ? 0 : d->start;
++   p[3] = d->count; p[4] = d->start_instance; p[5] = d->instance_count;
++   p[6] = d->index_bias; p[7] = d->min_index; p[8] = d->max_index;
++   p[9] = d->primitive_restart; p[10] = d->restart_index;
++   if (bytes)
++      memcpy(&p[11], idx, bytes);
++   drew();
++}
++
++static void
++zz_clear(struct pipe_context *c, unsigned buffers, const union pipe_color_union *col, double depth,
++         unsigned stencil)
++{
++   uint32_t *p = cmd(ZP_CLEAR, 7);
++
++   p[0] = buffers;
++   memcpy(&p[1], col, 16);
++   p[5] = fw(depth);
++   p[6] = stencil;
++   drew();
++}
++
++static void
++zz_clear_rt(struct pipe_context *c, struct pipe_surface *d, const union pipe_color_union *col,
++            unsigned x, unsigned y, unsigned w, unsigned h, bool cond)
++{
++   uint32_t *p = cmd(ZP_CLEAR_RT, 9);
++
++   p[0] = ((struct zz_surface *)d)->id;
++   memcpy(&p[1], col, 16);
++   p[5] = x; p[6] = y; p[7] = w; p[8] = h;
++   zr(d->texture)->gpu_wrote = TRUE;
++}
++
++static void
++zz_clear_ds(struct pipe_context *c, struct pipe_surface *d, unsigned flags, double depth, unsigned stencil,
++            unsigned x, unsigned y, unsigned w, unsigned h, bool cond)
++{
++   uint32_t *p = cmd(ZP_CLEAR_DS, 8);
++
++   p[0] = ((struct zz_surface *)d)->id; p[1] = flags; p[2] = fw(depth); p[3] = stencil;
++   p[4] = x; p[5] = y; p[6] = w; p[7] = h;
++}
++
++static void
++zz_copy_region(struct pipe_context *c, struct pipe_resource *dst, unsigned dl, unsigned x, unsigned y,
++               unsigned z, struct pipe_resource *src, unsigned sl, const struct pipe_box *b)
++{
++   uint32_t *p = cmd(ZP_COPY, 13);
++
++   p[0] = zr(dst)->id; p[1] = dl; p[2] = x; p[3] = y; p[4] = z; p[5] = sl;
++   p[6] = b->x; p[7] = b->y; p[8] = b->z; p[9] = b->width; p[10] = b->height; p[11] = b->depth;
++   p[12] = zr(src)->id;
++   zr(dst)->gpu_wrote = TRUE;
++}
++
++static void
++zz_blit(struct pipe_context *c, const struct pipe_blit_info *b)
++{
++   uint32_t *p = cmd(ZP_BLIT, 20);
++
++   p[0] = zr(b->dst.resource)->id; p[1] = b->dst.level; p[2] = b->dst.format;
++   p[3] = b->dst.box.x; p[4] = b->dst.box.y; p[5] = b->dst.box.z;
++   p[6] = b->dst.box.width; p[7] = b->dst.box.height; p[8] = b->dst.box.depth;
++   p[9] = zr(b->src.resource)->id; p[10] = b->src.level; p[11] = b->src.format;
++   p[12] = b->src.box.x; p[13] = b->src.box.y; p[14] = b->src.box.z;
++   p[15] = b->src.box.width; p[16] = b->src.box.height; p[17] = b->src.box.depth;
++   p[18] = b->mask; p[19] = b->filter;
++   zr(b->dst.resource)->gpu_wrote = TRUE;
++}
++
++static void
++zz_flush(struct pipe_context *c, struct pipe_fence_handle **fence, unsigned flags)
++{
++   cmd(ZP_FLUSH, 0);
++   flush_cmds();
++   if (fence)
++      *fence = NULL;
++}
++
++static void zz_flush_resource(struct pipe_context *c, struct pipe_resource *r) { }
++static void zz_set_param(struct pipe_context *c, enum pipe_context_param p, unsigned v) { }
++static void zz_invalidate(struct pipe_context *c, struct pipe_resource *r) { }
++static boolean zz_generate_mipmap(struct pipe_context *c, struct pipe_resource *r, enum pipe_format f,
++                                  unsigned b, unsigned l, unsigned fl, unsigned ll) { return false; }
++
++/* queries: nothing is counted yet */
++static struct pipe_query *zz_create_query(struct pipe_context *c, unsigned t, unsigned i) { return (struct pipe_query *)CALLOC(1, 8); }
++static void zz_destroy_query(struct pipe_context *c, struct pipe_query *q) { FREE(q); }
++static boolean zz_begin_query(struct pipe_context *c, struct pipe_query *q) { return true; }
++static bool zz_end_query(struct pipe_context *c, struct pipe_query *q) { return true; }
++static boolean zz_query_result(struct pipe_context *c, struct pipe_query *q, boolean wait, union pipe_query_result *r)
++{
++   memset(r, 0, sizeof(*r));
++   return TRUE;
++}
++static void zz_query_state(struct pipe_context *c, boolean e) { }
++
++static void
++zz_destroy(struct pipe_context *c)
++{
++   u_upload_destroy(c->stream_uploader);
++   FREE(c);
++}
++
++static struct pipe_context *
++zz_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
++{
++   struct pipe_context *c = CALLOC_STRUCT(pipe_context);
++
++   c->screen = screen;
++   c->priv = priv;
++   c->stream_uploader = u_upload_create_default(c);
++   c->const_uploader = c->stream_uploader;
++   cmd(ZP_OPEN, 0);
++   c->destroy = zz_destroy;
++   c->flush = zz_flush;
++   c->flush_resource = zz_flush_resource;
++   c->set_context_param = zz_set_param;
++   c->invalidate_resource = zz_invalidate;
++   c->generate_mipmap = zz_generate_mipmap;
++   c->transfer_map = zz_transfer_map;
++   c->transfer_unmap = zz_transfer_unmap;
++   c->transfer_flush_region = zz_transfer_flush_region;
++   c->buffer_subdata = u_default_buffer_subdata;
++   c->texture_subdata = u_default_texture_subdata;
++   c->create_blend_state = zz_create_blend;
++   c->create_depth_stencil_alpha_state = zz_create_dsa;
++   c->create_rasterizer_state = zz_create_rast;
++   c->create_sampler_state = zz_create_sampler;
++   c->create_vertex_elements_state = zz_create_velems;
++   c->create_vs_state = zz_create_vs;
++   c->create_fs_state = zz_create_fs;
++   c->create_gs_state = zz_create_gs;
++   c->bind_blend_state = zz_bind_blend;
++   c->bind_depth_stencil_alpha_state = zz_bind_dsa;
++   c->bind_rasterizer_state = zz_bind_rast;
++   c->bind_vertex_elements_state = zz_bind_velems;
++   c->bind_vs_state = zz_bind_vs;
++   c->bind_fs_state = zz_bind_fs;
++   c->bind_gs_state = zz_bind_gs;
++   c->delete_blend_state = zz_del_blend;
++   c->delete_depth_stencil_alpha_state = zz_del_dsa;
++   c->delete_rasterizer_state = zz_del_rast;
++   c->delete_vertex_elements_state = zz_del_velems;
++   c->delete_vs_state = zz_del_vs;
++   c->delete_fs_state = zz_del_fs;
++   c->delete_gs_state = zz_del_gs;
++   c->delete_sampler_state = zz_del_sampler;
++   c->bind_sampler_states = zz_bind_samplers;
++   c->create_sampler_view = zz_create_view;
++   c->sampler_view_destroy = zz_view_destroy;
++   c->set_sampler_views = zz_set_views;
++   c->create_surface = zz_create_surface;
++   c->surface_destroy = zz_surface_destroy;
++   c->set_framebuffer_state = zz_set_framebuffer;
++   c->set_viewport_states = zz_set_viewports;
++   c->set_scissor_states = zz_set_scissors;
++   c->set_blend_color = zz_set_blend_color;
++   c->set_stencil_ref = zz_set_stencil_ref;
++   c->set_sample_mask = zz_set_sample_mask;
++   c->set_clip_state = zz_set_clip;
++   c->set_polygon_stipple = zz_set_stipple;
++   c->set_constant_buffer = zz_set_constant_buffer;
++   c->set_vertex_buffers = zz_set_vertex_buffers;
++   c->draw_vbo = zz_draw_vbo;
++   c->clear = zz_clear;
++   c->clear_render_target = zz_clear_rt;
++   c->clear_depth_stencil = zz_clear_ds;
++   c->resource_copy_region = zz_copy_region;
++   c->blit = zz_blit;
++   c->create_query = zz_create_query;
++   c->destroy_query = zz_destroy_query;
++   c->begin_query = zz_begin_query;
++   c->end_query = zz_end_query;
++   c->get_query_result = zz_query_result;
++   c->set_active_query_state = zz_query_state;
++   return c;
++}
++
++/*
++ * Screen: the caps are the GPU's, so its driver answers them
++ */
++static const char *zz_vendor(struct pipe_screen *s) { return "AMIX"; }
++static const char *zz_name(struct pipe_screen *s) { return "zz3660 (Z3660 core 1)"; }
++#define CAPS(s) (((struct zz_screen *)(s))->caps)
++static int zz_param(struct pipe_screen *s, enum pipe_cap p) { return CAPS(s)->get_param(CAPS(s), p); }
++static float zz_paramf(struct pipe_screen *s, enum pipe_capf p) { return CAPS(s)->get_paramf(CAPS(s), p); }
++static int zz_shader_param(struct pipe_screen *s, enum pipe_shader_type t, enum pipe_shader_cap p)
++{
++   return CAPS(s)->get_shader_param(CAPS(s), t, p);
++}
++static boolean zz_format(struct pipe_screen *s, enum pipe_format f, enum pipe_texture_target t, unsigned sc,
++                         unsigned ssc, unsigned b)
++{
++   return CAPS(s)->is_format_supported(CAPS(s), f, t, sc, ssc, b);
++}
++static int zz_compute_param(struct pipe_screen *s, enum pipe_shader_ir ir, enum pipe_compute_cap p, void *r)
++{
++   return CAPS(s)->get_compute_param(CAPS(s), ir, p, r);
++}
++static void zz_fence_ref(struct pipe_screen *s, struct pipe_fence_handle **a, struct pipe_fence_handle *b) { *a = b; }
++static boolean zz_fence_finish(struct pipe_screen *s, struct pipe_context *c, struct pipe_fence_handle *f, uint64_t t) { return TRUE; }
++static uint64_t zz_timestamp(struct pipe_screen *s) { return 0; }
++
++static void
++zz_flush_frontbuffer(struct pipe_screen *screen, struct pipe_resource *res, unsigned level, unsigned layer,
++                     void *priv, struct pipe_box *box)
++{
++   struct zz_screen *s = (struct zz_screen *)screen;
++   struct zz_resource *r = zr(res);
++   struct pipe_box all;
++   uint8_t *map;
++   unsigned y;
++
++   u_box_2d(0, 0, res->width0, res->height0, &all);
++   fetch(r, level, &all);
++   map = s->ws->displaytarget_map(s->ws, r->dt, PIPE_TRANSFER_WRITE);
++   for (y = 0; y < res->height0; y++)
++      memcpy(map + y * r->dt_stride, r->data + r->offset[level] + y * r->stride[level], r->stride[level]);
++   s->ws->displaytarget_unmap(s->ws, r->dt);
++   s->ws->displaytarget_display(s->ws, r->dt, priv, box);
++}
++
++static void zz_screen_destroy(struct pipe_screen *s) { FREE(s); }
++
++struct pipe_screen *
++zz3660_create_screen(struct pipe_screen *caps, struct sw_winsys *ws)
++{
++   struct zz_screen *s = CALLOC_STRUCT(zz_screen);
++   struct pipe_screen *b = &s->base;
++
++   s->caps = caps;
++   s->ws = ws;
++   b->destroy = zz_screen_destroy;
++   b->get_name = zz_name;
++   b->get_vendor = zz_vendor;
++   b->get_device_vendor = zz_vendor;
++   b->get_param = zz_param;
++   b->get_paramf = zz_paramf;
++   b->get_shader_param = zz_shader_param;
++   b->is_format_supported = zz_format;
++   b->get_compute_param = zz_compute_param;
++   b->context_create = zz_context_create;
++   b->resource_create = zz_resource_create;
++   b->resource_destroy = zz_resource_destroy;
++   b->flush_frontbuffer = zz_flush_frontbuffer;
++   b->fence_reference = zz_fence_ref;
++   b->fence_finish = zz_fence_finish;
++   b->get_timestamp = zz_timestamp;
++   return b;
++}
+diff --git a/src/gallium/drivers/zz3660/zz_exec.c b/src/gallium/drivers/zz3660/zz_exec.c
+new file mode 100644
+index 0000000..caac6f5
+--- /dev/null
++++ b/src/gallium/drivers/zz3660/zz_exec.c
+@@ -0,0 +1,559 @@
++/*
++ * zz_exec.c -- the zz3660 executor: the command stream into a pipe_context.
++ * Nothing here knows which driver is underneath.
++ */
++#include <string.h>
++#include "pipe/p_context.h"
++#include "pipe/p_screen.h"
++#include "pipe/p_state.h"
++#include "util/u_memory.h"
++#include "util/u_format.h"
++#include "util/u_inlines.h"
++#include "util/u_box.h"
++#include "tgsi/tgsi_text.h"
++#include "zz_proto.h"
++#include "zz_fields.h"
++
++static struct pipe_screen *screen;
++static struct pipe_context *gp;
++static void *obj[ZZP_MAX_OBJ];                  /* state objects, views, surfaces */
++static struct pipe_resource *res[ZZP_MAX_OBJ];
++static struct tgsi_token tokens[1 << 15];
++static int swapped;                             /* the sender is big-endian */
++static const struct pipe_vertex_element *cur_ve;
++static struct { unsigned n; struct pipe_vertex_element e[PIPE_MAX_ATTRIBS]; } *ves[ZZP_MAX_OBJ];
++static struct pipe_vertex_buffer vbs[PIPE_MAX_ATTRIBS];
++static unsigned nvbs, cur_nve;
++static void *scratch[PIPE_MAX_ATTRIBS];
++static unsigned scratch_size[PIPE_MAX_ATTRIBS];
++
++static inline uint32_t sw32(uint32_t v) { return __builtin_bswap32(v); }
++static inline float wf(uint32_t w) { union { uint32_t u; float f; } c; c.u = w; return c.f; }
++
++void
++zzp_exec_init(struct pipe_screen *s, int sw)
++{
++   screen = s;
++   swapped = sw;
++}
++
++#ifdef __z3660core__
++/* on the board: the stream is the 060's, big-endian */
++struct sw_winsys *null_sw_create(void);
++struct pipe_screen *softpipe_create_screen(struct sw_winsys *winsys);
++
++void
++zz3660_exec_start(void)
++{
++   if (!screen)
++      zzp_exec_init(softpipe_create_screen(null_sw_create()), 1);
++}
++#endif
++
++/* whole elements of the format in place: bytes stay, 16 and 32 bits turn */
++static void
++swap_element(uint8_t *p, enum pipe_format format)
++{
++   const struct util_format_description *d = util_format_description(format);
++   const unsigned bytes = d->block.bits / 8, size = d->channel[0].size;
++   /* by channel; a packed format (10-10-10-2) as a whole */
++   const unsigned step = size == 8 || size == 16 || size == 32 ? size / 8 : bytes;
++   unsigned i;
++
++   if (step == 2)
++      for (i = 0; i + 2 <= bytes; i += 2) {
++         uint8_t t = p[i]; p[i] = p[i + 1]; p[i + 1] = t;
++      }
++   else if (step == 4)
++      for (i = 0; i + 4 <= bytes; i += 4) {
++         uint32_t v;
++         memcpy(&v, p + i, 4);
++         v = sw32(v);
++         memcpy(p + i, &v, 4);
++      }
++}
++
++/* pixels of the format differ between the byte orders: over a byte each and not
++   an array of bytes */
++static boolean
++pixels_turn(enum pipe_format format)
++{
++   const struct util_format_description *d = util_format_description(format);
++
++   return swapped && d->block.bits > 8 && d->channel[0].size != 8;
++}
++
++/* the vertex buffers of a draw, in this CPU's order, for vertices first..last */
++static void
++vertices(unsigned first, unsigned last)
++{
++   struct pipe_vertex_buffer vb[PIPE_MAX_ATTRIBS];
++   unsigned b, e, v;
++
++   for (b = 0; b < nvbs; b++) {
++      const unsigned stride = vbs[b].stride;
++      const unsigned off = vbs[b].buffer_offset + first * stride;
++      const unsigned size = (last - first + 1) * MAX2(stride, 64);
++      struct pipe_transfer *t;
++      struct pipe_box box;
++      const uint8_t *src;
++      unsigned have;
++
++      vb[b] = vbs[b];
++      if (!vbs[b].buffer.resource)
++         continue;
++      have = vbs[b].buffer.resource->width0 - MIN2(off, vbs[b].buffer.resource->width0);
++      if (size > scratch_size[b]) {
++         FREE(scratch[b]);
++         scratch[b] = MALLOC(size);
++         scratch_size[b] = size;
++      }
++      u_box_1d(off, MIN2(size, have), &box);
++      src = gp->transfer_map(gp, vbs[b].buffer.resource, 0, PIPE_TRANSFER_READ, &box, &t);
++      memcpy(scratch[b], src, box.width);
++      gp->transfer_unmap(gp, t);
++      for (e = 0; e < cur_nve; e++)
++         if (cur_ve[e].vertex_buffer_index == b)
++            for (v = 0; v <= last - first; v++)
++               swap_element((uint8_t *)scratch[b] + v * stride + cur_ve[e].src_offset, cur_ve[e].src_format);
++      vb[b].is_user_buffer = true;
++      vb[b].buffer.user = (const uint8_t *)scratch[b] - first * stride;
++      vb[b].buffer_offset = 0;
++   }
++   gp->set_vertex_buffers(gp, 0, nvbs, vb);
++}
++
++static void
++draw(const uint32_t *w, unsigned n)
++{
++   struct pipe_draw_info d;
++   void *indices = NULL;
++
++   memset(&d, 0, sizeof(d));
++   d.mode = w[0];
++   d.index_size = w[1];
++   d.start = w[2];
++   d.count = w[3];
++   d.start_instance = w[4];
++   d.instance_count = w[5];
++   d.index_bias = (int)w[6];
++   d.min_index = w[7];
++   d.max_index = w[8];
++   d.primitive_restart = w[9];
++   d.restart_index = w[10];
++   if (d.index_size) {
++      const unsigned bytes = d.count * d.index_size;
++      unsigned i;
++
++      /* the indices came with the command, words of the sender */
++      indices = MALLOC(bytes + 4);
++      memcpy(indices, &w[11], bytes);
++      if (swapped) {
++         if (d.index_size == 2)
++            for (i = 0; i < d.count; i++)
++               ((uint16_t *)indices)[i] = __builtin_bswap16(((uint16_t *)indices)[i]);
++         else if (d.index_size == 4)
++            for (i = 0; i < d.count; i++)
++               ((uint32_t *)indices)[i] = sw32(((uint32_t *)indices)[i]);
++      }
++      d.has_user_indices = true;
++      d.index.user = indices;
++   }
++   if (swapped) {
++      if (d.index_size)
++         vertices(d.min_index + d.index_bias, d.max_index + d.index_bias);
++      else
++         vertices(d.start, d.start + d.count - 1);
++   }
++   gp->draw_vbo(gp, &d);
++   FREE(indices);
++}
++
++static void
++res_write(const uint32_t *w)
++{
++   struct pipe_box box;
++
++   u_box_3d(w[2], w[3], w[4], w[5], w[6], w[7], &box);
++   if (res[w[0]]->target == PIPE_BUFFER)
++      gp->buffer_subdata(gp, res[w[0]], PIPE_TRANSFER_WRITE, box.x, box.width, &w[10]);
++   else {
++      if (pixels_turn(res[w[0]]->format)) {
++         const unsigned bytes = util_format_get_blocksize(res[w[0]]->format);
++         unsigned i;
++
++         for (i = 0; i + bytes <= w[8] * box.height * box.depth; i += bytes)
++            swap_element((uint8_t *)&w[10] + i, res[w[0]]->format);
++      }
++      gp->texture_subdata(gp, res[w[0]], w[1], PIPE_TRANSFER_WRITE, &box, &w[10], w[8], w[9]);
++   }
++}
++
++static void
++res_read(const uint32_t *w, void *reply)
++{
++   struct pipe_transfer *t;
++   struct pipe_box box;
++   const uint8_t *src;
++   unsigned y;
++
++   gp->flush(gp, NULL, 0);
++   u_box_3d(w[2], w[3], w[4], w[5], w[6], w[7], &box);
++   src = gp->transfer_map(gp, res[w[0]], w[1], PIPE_TRANSFER_READ, &box, &t);
++   for (y = 0; y < box.height; y++) {
++      uint8_t *row = (uint8_t *)reply + y * w[8];
++
++      memcpy(row, src + y * t->stride, w[8]);
++      if (pixels_turn(res[w[0]]->format)) {
++         const unsigned bytes = util_format_get_blocksize(res[w[0]]->format);
++         unsigned i;
++
++         for (i = 0; i + bytes <= w[8]; i += bytes)
++            swap_element(row + i, res[w[0]]->format);
++      }
++   }
++   gp->transfer_unmap(gp, t);
++}
++
++#define GI(x) s.x = *w++;
++#define GF(x) s.x = wf(*w++);
++
++static void
++command(unsigned op, const uint32_t *w, unsigned n, void *reply)
++{
++   unsigned i;
++
++   switch (op) {
++   case ZP_OPEN:
++      if (!gp)
++         gp = screen->context_create(screen, NULL, 0);
++      break;
++   case ZP_RES_CREATE: {
++      struct pipe_resource t;
++
++      memset(&t, 0, sizeof(t));
++      t.target = w[1]; t.format = w[2]; t.width0 = w[3]; t.height0 = w[4]; t.depth0 = w[5];
++      t.array_size = w[6]; t.last_level = w[7]; t.nr_samples = w[8]; t.usage = w[9];
++      t.bind = w[10] & ~(PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SCANOUT | PIPE_BIND_SHARED);
++      t.flags = w[11];
++      res[w[0]] = screen->resource_create(screen, &t);
++      break;
++   }
++   case ZP_RES_DESTROY:
++      pipe_resource_reference(&res[w[0]], NULL);
++      break;
++   case ZP_RES_WRITE:
++      res_write(w);
++      break;
++   case ZP_RES_READ:
++      res_read(w, reply);
++      break;
++   case ZP_BLEND: {
++      struct pipe_blend_state b;
++      const uint32_t id = *w++;
++
++      memset(&b, 0, sizeof(b));
++      b.independent_blend_enable = *w++; b.logicop_enable = *w++; b.logicop_func = *w++;
++      b.dither = *w++; b.alpha_to_coverage = *w++; b.alpha_to_one = *w++;
++      for (i = 0; i < PIPE_MAX_COLOR_BUFS; i++) {
++#define GR(x) b.rt[i].x = *w++;
++         ZZP_RTBLEND(GR, GR)
++      }
++      obj[id] = gp->create_blend_state(gp, &b);
++      break;
++   }
++   case ZP_DSA: {
++      struct pipe_depth_stencil_alpha_state d;
++      const uint32_t id = *w++;
++
++      memset(&d, 0, sizeof(d));
++#define GD(x) d.depth.x = *w++;
++#define GDF(x) d.depth.x = wf(*w++);
++      ZZP_DEPTH(GD, GDF)
++#define GS0(x) d.stencil[0].x = *w++;
++#define GS1(x) d.stencil[1].x = *w++;
++      ZZP_STENCIL(GS0, GS0)
++      ZZP_STENCIL(GS1, GS1)
++#define GA(x) d.alpha.x = *w++;
++#define GAF(x) d.alpha.x = wf(*w++);
++      ZZP_ALPHA(GA, GAF)
++      obj[id] = gp->create_depth_stencil_alpha_state(gp, &d);
++      break;
++   }
++   case ZP_RAST: {
++      struct pipe_rasterizer_state s;
++      const uint32_t id = *w++;
++
++      memset(&s, 0, sizeof(s));
++      ZZP_RAST(GI, GF)
++      obj[id] = gp->create_rasterizer_state(gp, &s);
++      break;
++   }
++   case ZP_SAMPLER: {
++      struct pipe_sampler_state s;
++      const uint32_t id = *w++;
++
++      memset(&s, 0, sizeof(s));
++      ZZP_SAMPLER(GI, GF)
++      for (i = 0; i < 4; i++)
++         s.border_color.ui[i] = *w++;
++      obj[id] = gp->create_sampler_state(gp, &s);
++      break;
++   }
++   case ZP_VELEMS: {
++      const uint32_t id = *w++, c = *w++;
++
++      if (!ves[id])
++         ves[id] = MALLOC(sizeof(*ves[id]));
++      ves[id]->n = c;
++      for (i = 0; i < c; i++) {
++         struct pipe_vertex_element *e = &ves[id]->e[i];
++
++         memset(e, 0, sizeof(*e));
++         e->src_offset = *w++; e->vertex_buffer_index = *w++;
++         e->src_format = *w++; e->instance_divisor = *w++;
++      }
++      obj[id] = gp->create_vertex_elements_state(gp, c, ves[id]->e);
++      break;
++   }
++   case ZP_SHADER: {
++      struct pipe_shader_state s;
++      const uint32_t id = w[0], kind = w[1];
++
++      memset(&s, 0, sizeof(s));
++      s.type = PIPE_SHADER_IR_TGSI;
++      if (!tgsi_text_translate((const char *)&w[3], tokens, ARRAY_SIZE(tokens)))
++         break;
++      s.tokens = tokens;
++      obj[id] = kind == ZK_VS ? gp->create_vs_state(gp, &s) :
++                kind == ZK_FS ? gp->create_fs_state(gp, &s) : gp->create_gs_state(gp, &s);
++      break;
++   }
++   case ZP_VIEW: {
++      struct pipe_sampler_view t;
++
++      memset(&t, 0, sizeof(t));
++      t.format = w[2]; t.u.tex.first_layer = w[3]; t.u.tex.last_layer = w[4];
++      t.u.tex.first_level = w[5]; t.u.tex.last_level = w[6];
++      t.swizzle_r = w[7]; t.swizzle_g = w[8]; t.swizzle_b = w[9]; t.swizzle_a = w[10];
++      t.target = w[11];
++      obj[w[0]] = gp->create_sampler_view(gp, res[w[1]], &t);
++      break;
++   }
++   case ZP_SURFACE: {
++      struct pipe_surface t;
++
++      memset(&t, 0, sizeof(t));
++      t.format = w[2]; t.u.tex.level = w[3]; t.u.tex.first_layer = w[4]; t.u.tex.last_layer = w[5];
++      obj[w[0]] = gp->create_surface(gp, res[w[1]], &t);
++      break;
++   }
++   case ZP_FREE:
++      switch (w[1]) {
++      case ZK_BLEND: gp->delete_blend_state(gp, obj[w[0]]); break;
++      case ZK_DSA: gp->delete_depth_stencil_alpha_state(gp, obj[w[0]]); break;
++      case ZK_RAST: gp->delete_rasterizer_state(gp, obj[w[0]]); break;
++      case ZK_SAMPLER: gp->delete_sampler_state(gp, obj[w[0]]); break;
++      case ZK_VELEMS: gp->delete_vertex_elements_state(gp, obj[w[0]]); break;
++      case ZK_VS: gp->delete_vs_state(gp, obj[w[0]]); break;
++      case ZK_FS: gp->delete_fs_state(gp, obj[w[0]]); break;
++      case ZK_GS: gp->delete_gs_state(gp, obj[w[0]]); break;
++      case ZK_VIEW: {
++         struct pipe_sampler_view *v = obj[w[0]];
++         pipe_sampler_view_reference(&v, NULL);
++         break;
++      }
++      case ZK_SURFACE: {
++         struct pipe_surface *v = obj[w[0]];
++         pipe_surface_reference(&v, NULL);
++         break;
++      }
++      }
++      obj[w[0]] = NULL;
++      break;
++   case ZP_BIND: {
++      void *o = w[1] ? obj[w[1]] : NULL;
++
++      switch (w[0]) {
++      case ZK_BLEND: gp->bind_blend_state(gp, o); break;
++      case ZK_DSA: gp->bind_depth_stencil_alpha_state(gp, o); break;
++      case ZK_RAST: gp->bind_rasterizer_state(gp, o); break;
++      case ZK_VELEMS:
++         gp->bind_vertex_elements_state(gp, o);
++         cur_ve = w[1] ? ves[w[1]]->e : NULL;
++         cur_nve = w[1] ? ves[w[1]]->n : 0;
++         break;
++      case ZK_VS: gp->bind_vs_state(gp, o); break;
++      case ZK_FS: gp->bind_fs_state(gp, o); break;
++      case ZK_GS: gp->bind_gs_state(gp, o); break;
++      }
++      break;
++   }
++   case ZP_BIND_SAMPLERS: {
++      void *s[PIPE_MAX_SAMPLERS];
++
++      for (i = 0; i < w[2]; i++)
++         s[i] = w[3 + i] ? obj[w[3 + i]] : NULL;
++      gp->bind_sampler_states(gp, w[0], w[1], w[2], s);
++      break;
++   }
++   case ZP_SET_VIEWS: {
++      struct pipe_sampler_view *v[PIPE_MAX_SHADER_SAMPLER_VIEWS];
++
++      for (i = 0; i < w[2]; i++)
++         v[i] = w[3 + i] ? obj[w[3 + i]] : NULL;
++      gp->set_sampler_views(gp, w[0], w[1], w[2], v);
++      break;
++   }
++   case ZP_FRAMEBUFFER: {
++      struct pipe_framebuffer_state f;
++
++      memset(&f, 0, sizeof(f));
++      f.width = w[0]; f.height = w[1]; f.nr_cbufs = w[2];
++      f.layers = w[3]; f.samples = w[4];
++      f.zsbuf = w[5] ? obj[w[5]] : NULL;
++      for (i = 0; i < f.nr_cbufs; i++)
++         f.cbufs[i] = w[6 + i] ? obj[w[6 + i]] : NULL;
++      gp->set_framebuffer_state(gp, &f);
++      break;
++   }
++   case ZP_VIEWPORT: {
++      struct pipe_viewport_state v;
++
++      for (i = 0; i < 3; i++) {
++         v.scale[i] = wf(w[i]);
++         v.translate[i] = wf(w[3 + i]);
++      }
++      gp->set_viewport_states(gp, 0, 1, &v);
++      break;
++   }
++   case ZP_SCISSOR: {
++      struct pipe_scissor_state s;
++
++      s.minx = w[0]; s.miny = w[1]; s.maxx = w[2]; s.maxy = w[3];
++      gp->set_scissor_states(gp, 0, 1, &s);
++      break;
++   }
++   case ZP_BLEND_COLOR: {
++      struct pipe_blend_color c;
++
++      for (i = 0; i < 4; i++)
++         c.color[i] = wf(w[i]);
++      gp->set_blend_color(gp, &c);
++      break;
++   }
++   case ZP_STENCIL_REF: {
++      struct pipe_stencil_ref r;
++
++      r.ref_value[0] = w[0]; r.ref_value[1] = w[1];
++      gp->set_stencil_ref(gp, &r);
++      break;
++   }
++   case ZP_SAMPLE_MASK:
++      gp->set_sample_mask(gp, w[0]);
++      break;
++   case ZP_CLIP: {
++      struct pipe_clip_state c;
++
++      memcpy(c.ucp, w, sizeof(c.ucp));
++      gp->set_clip_state(gp, &c);
++      break;
++   }
++   case ZP_STIPPLE: {
++      struct pipe_poly_stipple p;
++
++      memcpy(p.stipple, w, sizeof(p.stipple));
++      gp->set_polygon_stipple(gp, &p);
++      break;
++   }
++   case ZP_CONSTBUF: {
++      /* shader, index, bytes, words: always inline, whole words */
++      struct pipe_constant_buffer c;
++
++      memset(&c, 0, sizeof(c));
++      c.buffer_size = w[2];
++      c.user_buffer = c.buffer_size ? &w[3] : NULL;
++      gp->set_constant_buffer(gp, w[0], w[1], c.buffer_size ? &c : NULL);
++      break;
++   }
++   case ZP_VBUFS:
++      nvbs = w[0];
++      for (i = 0; i < nvbs; i++) {
++         memset(&vbs[i], 0, sizeof(vbs[i]));
++         vbs[i].stride = w[1 + i * 3];
++         vbs[i].buffer_offset = w[2 + i * 3];
++         vbs[i].buffer.resource = w[3 + i * 3] ? res[w[3 + i * 3]] : NULL;
++      }
++      if (!swapped)
++         gp->set_vertex_buffers(gp, 0, nvbs, vbs);
++      break;
++   case ZP_DRAW:
++      draw(w, n);
++      break;
++   case ZP_CLEAR: {
++      union pipe_color_union c;
++      double d;
++
++      memcpy(&c, &w[1], sizeof(c));
++      d = wf(w[5]);
++      gp->clear(gp, w[0], &c, d, w[6]);
++      break;
++   }
++   case ZP_CLEAR_RT: {
++      union pipe_color_union c;
++
++      memcpy(&c, &w[1], sizeof(c));
++      gp->clear_render_target(gp, obj[w[0]], &c, w[5], w[6], w[7], w[8], false);
++      break;
++   }
++   case ZP_CLEAR_DS:
++      gp->clear_depth_stencil(gp, obj[w[0]], w[1], wf(w[2]), w[3], w[4], w[5], w[6], w[7], false);
++      break;
++   case ZP_COPY: {
++      struct pipe_box b;
++
++      u_box_3d(w[6], w[7], w[8], w[9], w[10], w[11], &b);
++      gp->resource_copy_region(gp, res[w[0]], w[1], w[2], w[3], w[4], res[w[12]], w[5], &b);
++      break;
++   }
++   case ZP_BLIT: {
++      struct pipe_blit_info b;
++
++      memset(&b, 0, sizeof(b));
++      b.dst.resource = res[w[0]]; b.dst.level = w[1]; b.dst.format = w[2];
++      u_box_3d(w[3], w[4], w[5], w[6], w[7], w[8], &b.dst.box);
++      b.src.resource = res[w[9]]; b.src.level = w[10]; b.src.format = w[11];
++      u_box_3d(w[12], w[13], w[14], w[15], w[16], w[17], &b.src.box);
++      b.mask = w[18]; b.filter = w[19]; b.scissor_enable = 0;
++      gp->blit(gp, &b);
++      break;
++   }
++   case ZP_FLUSH:
++      gp->flush(gp, NULL, 0);
++      break;
++   }
++}
++
++/* whole commands; payloads (ZP_RES_WRITE, ZP_DRAW, ZP_SHADER) keep their byte order */
++void
++zzp_exec(uint32_t *words, unsigned n, void *reply)
++{
++   unsigned i = 0, k;
++
++   while (i < n) {
++      unsigned head = words[i], len, op, turn;
++
++      if (swapped)
++         head = sw32(head);
++      op = head & 255;
++      len = head >> 8;
++      if (swapped) {
++         turn = op == ZP_RES_WRITE ? MIN2(len, 10) : op == ZP_DRAW ? MIN2(len, 11) :
++                op == ZP_SHADER ? MIN2(len, 3) : len;
++         for (k = 0; k < turn; k++)
++            words[i + 1 + k] = sw32(words[i + 1 + k]);
++      }
++      command(op, &words[i + 1], len, reply);
++      i += 1 + len;
++   }
++}
+diff --git a/src/gallium/drivers/zz3660/zz_fields.h b/src/gallium/drivers/zz3660/zz_fields.h
+new file mode 100644
+index 0000000..b7c004c
+--- /dev/null
++++ b/src/gallium/drivers/zz3660/zz_fields.h
+@@ -0,0 +1,13 @@
++/* zz_fields.h -- generated from p_state.h: every scalar of the state objects */
++#define ZZP_RAST(I, F) \
++   I(flatshade) I(light_twoside) I(clamp_vertex_color) I(clamp_fragment_color) I(front_ccw) I(cull_face) I(fill_front) I(fill_back) I(offset_point) I(offset_line) I(offset_tri) I(scissor) I(poly_smooth) I(poly_stipple_enable) I(point_smooth) I(sprite_coord_mode) I(point_quad_rasterization) I(point_tri_clip) I(point_size_per_vertex) I(multisample) I(force_persample_interp) I(line_smooth) I(line_stipple_enable) I(line_last_pixel) I(conservative_raster_mode) I(flatshade_first) I(half_pixel_center) I(bottom_edge_rule) I(subpixel_precision_x) I(subpixel_precision_y) I(rasterizer_discard) I(tile_raster_order_fixed) I(tile_raster_order_increasing_x) I(tile_raster_order_increasing_y) I(depth_clip_near) I(depth_clip_far) I(clip_halfz) I(offset_units_unscaled) I(clip_plane_enable) I(line_stipple_factor) I(line_stipple_pattern) I(sprite_coord_enable) F(line_width) F(point_size) F(offset_units) F(offset_scale) F(offset_clamp) F(conservative_raster_dilate)
++#define ZZP_RTBLEND(I, F) \
++   I(blend_enable) I(rgb_func) I(rgb_src_factor) I(rgb_dst_factor) I(alpha_func) I(alpha_src_factor) I(alpha_dst_factor) I(colormask) 
++#define ZZP_DEPTH(I, F) \
++   I(enabled) I(writemask) I(func) I(bounds_test) F(bounds_min) F(bounds_max)
++#define ZZP_STENCIL(I, F) \
++   I(enabled) I(func) I(fail_op) I(zpass_op) I(zfail_op) I(valuemask) I(writemask) 
++#define ZZP_ALPHA(I, F) \
++   I(enabled) I(func) F(ref_value)
++#define ZZP_SAMPLER(I, F) \
++   I(wrap_s) I(wrap_t) I(wrap_r) I(min_img_filter) I(min_mip_filter) I(mag_img_filter) I(compare_mode) I(compare_func) I(normalized_coords) I(max_anisotropy) I(seamless_cube_map) F(lod_bias) F(min_lod) F(max_lod)
+diff --git a/src/gallium/drivers/zz3660/zz_loop.c b/src/gallium/drivers/zz3660/zz_loop.c
+new file mode 100644
+index 0000000..e746f2a
+--- /dev/null
++++ b/src/gallium/drivers/zz3660/zz_loop.c
+@@ -0,0 +1,41 @@
++/*
++ * zz_loop.c -- the stream straight into the executor in this process, on softpipe
++ * (GALLIUM_DRIVER=zz3660): the driver tested with no board.  ZZ_BE=1 turns the
++ * stream into what a big-endian sender writes, for the executor's other path;
++ * buffers are taken for 32-bit data, as the test's are.
++ */
++#include <stdlib.h>
++#include "zz_proto.h"
++
++static void
++be(uint32_t *w, unsigned n)
++{
++   unsigned i = 0, k;
++
++   while (i < n) {
++      const unsigned head = w[i], op = head & 255, len = head >> 8;
++      /* a buffer's payload turns too: the executor turns it back */
++      const unsigned keep = op == ZP_SHADER ? 3 : len;
++
++      for (k = 0; k < len && k < keep; k++)
++         w[i + 1 + k] = __builtin_bswap32(w[i + 1 + k]);
++      w[i] = __builtin_bswap32(head);
++      i += 1 + len;
++   }
++}
++
++void
++zzp_send(uint32_t *w, unsigned n)
++{
++   if (getenv("ZZ_BE"))
++      be(w, n);
++   zzp_exec(w, n, 0);
++}
++
++void
++zzp_read(uint32_t *w, unsigned n, void *reply)
++{
++   if (getenv("ZZ_BE"))
++      be(w, n);
++   zzp_exec(w, n, reply);
++}
+diff --git a/src/gallium/drivers/zz3660/zz_proto.h b/src/gallium/drivers/zz3660/zz_proto.h
+new file mode 100644
+index 0000000..a2b1ec8
+--- /dev/null
++++ b/src/gallium/drivers/zz3660/zz_proto.h
+@@ -0,0 +1,40 @@
++/*
++ * zz_proto.h -- the zz3660 command stream: pipe_context calls in 32-bit words,
++ * from the driver on the 060 to the executor on the GPU (for now core 1 of the
++ * Z3660, softpipe).  A command: op | words << 8, then its words, all in the
++ * sender's byte order.  Payload bytes (buffers, textures, indices) stay in that
++ * order; the executor turns them where it knows their format: vertex data at
++ * the draw.  Constants always come as words in the command.
++ */
++#ifndef ZZ_PROTO_H
++#define ZZ_PROTO_H
++#include <stdint.h>
++
++enum zzp_op {
++   ZP_NONE, ZP_OPEN, ZP_RES_CREATE, ZP_RES_DESTROY, ZP_RES_WRITE, ZP_RES_READ,
++   ZP_BLEND, ZP_DSA, ZP_RAST, ZP_SAMPLER, ZP_VELEMS, ZP_SHADER, ZP_VIEW, ZP_SURFACE,
++   ZP_FREE, ZP_BIND, ZP_BIND_SAMPLERS, ZP_SET_VIEWS, ZP_FRAMEBUFFER, ZP_VIEWPORT,
++   ZP_SCISSOR, ZP_BLEND_COLOR, ZP_STENCIL_REF, ZP_SAMPLE_MASK, ZP_CLIP, ZP_STIPPLE,
++   ZP_CONSTBUF, ZP_VBUFS, ZP_DRAW, ZP_CLEAR, ZP_CLEAR_RT, ZP_CLEAR_DS, ZP_COPY, ZP_BLIT,
++   ZP_FLUSH, ZP_COUNT
++};
++
++/* what ZP_BIND and ZP_FREE name */
++enum zzp_kind {
++   ZK_BLEND, ZK_DSA, ZK_RAST, ZK_SAMPLER, ZK_VELEMS, ZK_VS, ZK_FS, ZK_GS, ZK_VIEW, ZK_SURFACE
++};
++
++#define ZZP_MAX_OBJ 8192
++
++/* the executor, fed whole commands; reply: where ZP_RES_READ puts its bytes.
++   swapped: the sender has the other byte order: the words are turned here
++   in place, payloads not */
++struct pipe_screen;
++void zzp_exec_init(struct pipe_screen *screen, int swapped);
++void zzp_exec(uint32_t *words, unsigned n, void *reply);
++
++/* the driver's way to the executor: on the 060 the ring, in a test a call */
++void zzp_send(uint32_t *words, unsigned n);
++void zzp_read(uint32_t *words, unsigned n, void *reply);
++
++#endif
+diff --git a/src/gallium/drivers/zz3660/zz_public.h b/src/gallium/drivers/zz3660/zz_public.h
+new file mode 100644
+index 0000000..7e443bb
+--- /dev/null
++++ b/src/gallium/drivers/zz3660/zz_public.h
+@@ -0,0 +1,7 @@
++#ifndef ZZ_PUBLIC_H
++#define ZZ_PUBLIC_H
++struct pipe_screen;
++struct sw_winsys;
++/* over a screen with the GPU's caps (softpipe's: it runs them for now) */
++struct pipe_screen *zz3660_create_screen(struct pipe_screen *caps, struct sw_winsys *ws);
++#endif
 diff --git a/src/gallium/include/pipe/p_config.h b/src/gallium/include/pipe/p_config.h
 index 3fa43ed..f7fc395 100644
 --- a/src/gallium/include/pipe/p_config.h
