@@ -305,6 +305,7 @@ static void idle(void)
 
 extern char __rodata_start[], _stack[];
 extern void _vector_table(void);
+extern void reload_posted(void);
 extern void samp_vectors(void);
 
 __asm__(".text\n"
@@ -336,6 +337,7 @@ __asm__(".text\n"
 __attribute__((used, target("general-regs-only"))) void samp_tick(uint32_t pc, uint32_t lr, uint32_t sp)
 {
     const uint32_t id = ICCIAR;
+    int id_done = 0;
 
     if ((id & 0x3ff) == PT_IRQ) {
         const uint32_t *w = (const uint32_t *)(sp & ~3u);
@@ -352,8 +354,15 @@ __attribute__((used, target("general-regs-only"))) void samp_tick(uint32_t pc, u
         while (k < ZB_REPLY)
             blk[k++] = 0;
         blk[ZB_SAMPLE] = __builtin_bswap32(__builtin_bswap32(blk[ZB_SAMPLE]) + 1);
+        /* armbench -reload -force: a hung core still gets here.  The new image
+           finds the interrupt off and answered, and this stack is not needed */
+        PT_CTRL = 0;
+        ICCEOIR = id;
+        reload_posted();
+        id_done = 1;
+        PT_CTRL = PT_PRESCALE << 8 | 1 << 2 | 1 << 1 | 1;
     }
-    if ((id & 0x3ff) < 1020)
+    if ((id & 0x3ff) < 1020 && !id_done)
         ICCEOIR = id;
 }
 

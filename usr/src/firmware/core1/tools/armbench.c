@@ -7,8 +7,9 @@
  *   armbench -dump        (the control block's words, raw)
  *   armbench -load z3660ARM_Core_h264bench.bin    (core 0 starts core 1 with this image:
  *                                                once per power cycle)
- *   armbench -reload z3660ARM_Core_xxx.bin       (the running image replaces itself:
- *                                                any number of times, no power cycle)
+ *   armbench -reload [-force] z3660ARM_Core_xxx.bin (the running image replaces itself:
+ *                                                any number of times, no power cycle;
+ *                                                -force for a hung gpu core)
  *   armbench -probe       (core 1 samples the audio formatter's DMA position)
  *   armbench -audioon     (core 0 starts the HDMI sound DMA on ZZAV_AUDIO_OFF, as the
  *                         AHI driver does; AMIX has none, so it is off after boot)
@@ -80,7 +81,7 @@ static int c1ld_command(volatile unsigned long *ld, unsigned long cmd)
 }
 
 /* -reload: the running h264bench copies the new image over itself and starts it */
-static int reload(int fd, const char *file)
+static int reload(int fd, const char *file, int force)
 {
     volatile unsigned long *ctl = (volatile unsigned long *)map(fd, HB_CTL_OFF, PAGE);
     unsigned char *data;
@@ -89,9 +90,10 @@ static int reload(int fd, const char *file)
     double t0;
     int f, gone = 0;
 
-    /* a finished job (done/error) leaves core 1 waiting as well */
+    /* a finished job (done/error) leaves core 1 waiting as well; -force for a
+       hung gpu core: its timer takes the reload within a second */
     if (!ctl || ctl[W_MAGIC] != HB_MAGIC_READY ||
-        (ctl[W_STATE] != HB_IDLE && ctl[W_STATE] != HB_DONE && ctl[W_STATE] != HB_ERROR)) {
+        (!force && ctl[W_STATE] != HB_IDLE && ctl[W_STATE] != HB_DONE && ctl[W_STATE] != HB_ERROR)) {
         fprintf(stderr, "core 1 is not an idle h264bench (mark %08lx, state %lu): -load it first\n",
                 ctl ? ctl[W_MAGIC] : 0, ctl ? ctl[W_STATE] : 0);
         return 1;
@@ -272,7 +274,7 @@ int main(int argc, char **argv)
     unsigned long flags = 0, size, seq, last = (unsigned long)-1;
     double t0, t1, wall;
     struct stat st;
-    int fd, f, i, dump = 0, load = 0, rel = 0, prb = 0, aon = 0;
+    int fd, f, i, dump = 0, load = 0, rel = 0, prb = 0, aon = 0, force = 0;
 
     for (i = 1; i < argc; i++)
         if (!strcmp(argv[i], "-nodeblock"))
@@ -285,6 +287,8 @@ int main(int argc, char **argv)
             load = 2;
         else if (!strcmp(argv[i], "-reload"))
             rel = 1;
+        else if (!strcmp(argv[i], "-force"))
+            force = 1;
         else if (!strcmp(argv[i], "-probe"))
             prb = 1;
         else if (!strcmp(argv[i], "-audioon"))
@@ -299,10 +303,10 @@ int main(int argc, char **argv)
         if (aon)
             return audio_on(fd);
         if (rel && !file) {
-            fprintf(stderr, "usage: armbench -reload z3660ARM_Core_xxx.bin\n");
+            fprintf(stderr, "usage: armbench -reload [-force] z3660ARM_Core_xxx.bin\n");
             return 2;
         }
-        return rel ? reload(fd, file) : probe(fd);
+        return rel ? reload(fd, file, force) : probe(fd);
     }
     if (load) {
         if (load == 1 && !file) {

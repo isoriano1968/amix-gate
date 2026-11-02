@@ -4804,10 +4804,10 @@ index 0000000..ea2645a
 +}
 diff --git a/src/gallium/drivers/zz3660/zz_driver.c b/src/gallium/drivers/zz3660/zz_driver.c
 new file mode 100644
-index 0000000..cc79f23
+index 0000000..a5c6cdd
 --- /dev/null
 +++ b/src/gallium/drivers/zz3660/zz_driver.c
-@@ -0,0 +1,920 @@
+@@ -0,0 +1,927 @@
 +/*
 + * zz_driver.c -- zz3660, a Gallium driver that does no work: each pipe_context
 + * call goes to the GPU as a command (zz_proto.h, zz_exec.c).  Modelled on noop
@@ -5648,7 +5648,14 @@ index 0000000..cc79f23
 +static const char *zz_vendor(struct pipe_screen *s) { return "AMIX"; }
 +static const char *zz_name(struct pipe_screen *s) { return "zz3660 (Z3660 core 1)"; }
 +#define CAPS(s) (((struct zz_screen *)(s))->caps)
-+static int zz_param(struct pipe_screen *s, enum pipe_cap p) { return CAPS(s)->get_param(CAPS(s), p); }
++/* softpipe's, less what the stream does not carry */
++static int
++zz_param(struct pipe_screen *s, enum pipe_cap p)
++{
++   if (p == PIPE_CAP_USER_VERTEX_BUFFERS)
++      return 0;         /* a pointer into this process means nothing on core 1 */
++   return CAPS(s)->get_param(CAPS(s), p);
++}
 +static float zz_paramf(struct pipe_screen *s, enum pipe_capf p) { return CAPS(s)->get_paramf(CAPS(s), p); }
 +static int zz_shader_param(struct pipe_screen *s, enum pipe_shader_type t, enum pipe_shader_cap p)
 +{
@@ -5730,10 +5737,10 @@ index 0000000..cc79f23
 +}
 diff --git a/src/gallium/drivers/zz3660/zz_exec.c b/src/gallium/drivers/zz3660/zz_exec.c
 new file mode 100644
-index 0000000..6475cba
+index 0000000..48d9165
 --- /dev/null
 +++ b/src/gallium/drivers/zz3660/zz_exec.c
-@@ -0,0 +1,721 @@
+@@ -0,0 +1,753 @@
 +/*
 + * zz_exec.c -- the zz3660 executor: the command stream into a pipe_context.
 + * Nothing here knows which driver is underneath.
@@ -5841,16 +5848,17 @@ index 0000000..6475cba
 +   for (b = 0; b < nvbs; b++) {
 +      const unsigned stride = vbs[b].stride;
 +      const unsigned off = vbs[b].buffer_offset + first * stride;
-+      const unsigned size = (last - first + 1) * MAX2(stride, 64);
++      const uint64_t want = ((uint64_t)(last - first) + 1) * MAX2(stride, 64);
 +      struct pipe_transfer *t;
 +      struct pipe_box box;
 +      const uint8_t *src;
-+      unsigned have;
++      unsigned have, size;
 +
 +      vb[b] = vbs[b];
 +      if (!vbs[b].buffer.resource)
 +         continue;
 +      have = vbs[b].buffer.resource->width0 - MIN2(off, vbs[b].buffer.resource->width0);
++      size = MAX2(MIN2(want, have), 64);
 +      if (size > scratch_size[b]) {
 +         FREE(scratch[b]);
 +         scratch[b] = MALLOC(size);
@@ -5861,15 +5869,42 @@ index 0000000..6475cba
 +      memcpy(scratch[b], src, box.width);
 +      gp->transfer_unmap(gp, t);
 +      for (e = 0; e < cur_nve; e++)
-+         if (cur_ve[e].vertex_buffer_index == b)
-+            /* stride 0: one value for all, to turn once */
-+            for (v = 0; v <= (stride ? last - first : 0); v++)
-+               swap_element((uint8_t *)scratch[b] + v * stride + cur_ve[e].src_offset, cur_ve[e].src_format);
++         if (cur_ve[e].vertex_buffer_index == b) {
++            const unsigned bytes = util_format_get_blocksize(cur_ve[e].src_format);
++
++            /* stride 0: one value for all, to turn once; never past what came */
++            for (v = 0; v <= (stride ? last - first : 0); v++) {
++               const uint64_t at = (uint64_t)v * stride + cur_ve[e].src_offset;
++
++               if (at + bytes > box.width)
++                  break;
++               swap_element((uint8_t *)scratch[b] + at, cur_ve[e].src_format);
++            }
++         }
 +      vb[b].is_user_buffer = true;
 +      vb[b].buffer.user = (const uint8_t *)scratch[b] - (ptrdiff_t)first * stride;
 +      vb[b].buffer_offset = 0;
 +   }
 +   gp->set_vertex_buffers(gp, 0, nvbs, vb);
++}
++
++/* glDrawElements with all arrays in buffers: the state tracker has no need of
++   the bounds and sends ~0; vertices() does */
++static void
++index_bounds(struct pipe_draw_info *d, const void *indices)
++{
++   unsigned lo = ~0u, hi = 0, i, k;
++
++   for (i = 0; i < d->count; i++) {
++      k = d->index_size == 1 ? ((const uint8_t *)indices)[i] :
++          d->index_size == 2 ? ((const uint16_t *)indices)[i] : ((const uint32_t *)indices)[i];
++      if (d->primitive_restart && k == d->restart_index)
++         continue;
++      lo = MIN2(lo, k);
++      hi = MAX2(hi, k);
++   }
++   d->min_index = lo > hi ? 0 : lo;
++   d->max_index = hi;
 +}
 +
 +static void
@@ -5907,6 +5942,8 @@ index 0000000..6475cba
 +      }
 +      d.has_user_indices = true;
 +      d.index.user = indices;
++      if (d.max_index == ~0u)
++         index_bounds(&d, indices);
 +   }
 +   if (swapped) {
 +      if (d.index_size)
@@ -6118,8 +6155,10 @@ index 0000000..6475cba
 +      t.bind = w[10] & ~(PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SCANOUT | PIPE_BIND_SHARED);
 +      t.flags = w[11];
 +      res[w[0]] = screen->resource_create(screen, &t);
++#ifdef __z3660core__
 +      if (!res[w[0]])
 +         zzp_refused(t.format << 16 | t.target, w[3] << 16 | w[4]);
++#endif
 +      break;
 +   }
 +   case ZP_RES_DESTROY:

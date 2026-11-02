@@ -263,6 +263,21 @@ static void reload(uint32_t src, uint32_t size, uint32_t entry)
     tramp(C1LD_LOAD_ADDR, RTG_BASE + src, (size + 3) & ~3UL, entry);
 }
 
+/* the same for a core whose main loop no longer looks: gpu.c's timer calls it.
+   Returns if nothing is posted, or not an image */
+void reload_posted(void)
+{
+    const uint32_t src = get(W_DATA_OFF), size = get(W_DATA_SIZE), entry = get(W_FLAGS);
+    const volatile uint32_t *img = (const volatile uint32_t *)(RTG_BASE + src);
+
+    if (get(W_STATE) == HB_RELOAD && src == HB_DATA_OFF && size >= 8 && size <= HB_DATA_MAX &&
+        img[0] == 0x48323634 && entry >= C1LD_LOAD_ADDR && entry < C1LD_LOAD_ADDR + size &&
+        !(entry & 3) && C1LD_LOAD_ADDR + size <= RELOAD_TRAMP) {
+        put(W_STATE, HB_IDLE);
+        reload(src, size, entry);       /* does not return */
+    }
+}
+
 int main(void)
 {
     struct hb_result r;
