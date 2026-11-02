@@ -437,6 +437,7 @@ zzp_refused(uint32_t what, uint32_t size)
 {
    blk_put(ZB_ERROR, what | 0x80000000u);
    blk_put(ZB_MARK, size);
+   blk_put(ZB_HEAP_KB, (uint32_t)mallinfo().uordblks >> 10);
 }
 
 void
