@@ -6651,10 +6651,24 @@ index 3fa43ed..f7fc395 100644
  #define PIPE_OS_APPLE
  #define PIPE_OS_UNIX
 diff --git a/src/gallium/state_trackers/glx/xlib/xm_api.c b/src/gallium/state_trackers/glx/xlib/xm_api.c
-index 86d27c4..677cb1d 100644
+index 86d27c4..8e9dca6 100644
 --- a/src/gallium/state_trackers/glx/xlib/xm_api.c
 +++ b/src/gallium/state_trackers/glx/xlib/xm_api.c
-@@ -944,6 +944,11 @@ xmesa_get_name(void)
+@@ -204,6 +204,13 @@ xmesa_init_display( Display *display )
+    XMesaDisplay xmdpy;
+    XMesaExtDisplayInfo *info;
+ 
++#ifdef __amix__
++   /* the constructors (they set driver) before any GLX call needs them:
++      glXGetConfig and others get here without xmesa_init */
++   extern void amix_so_ctors(void);
++
++   amix_so_ctors();
++#endif
+    if (display == NULL) {
+       return NULL;
+    }
+@@ -944,6 +951,11 @@ xmesa_get_name(void)
  int
  xmesa_init( Display *display )
  {
