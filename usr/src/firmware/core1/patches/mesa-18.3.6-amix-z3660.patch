@@ -4812,10 +4812,10 @@ index 0000000..f581342
 +}
 diff --git a/src/gallium/drivers/zz3660/zz_driver.c b/src/gallium/drivers/zz3660/zz_driver.c
 new file mode 100644
-index 0000000..0657963
+index 0000000..529a758
 --- /dev/null
 +++ b/src/gallium/drivers/zz3660/zz_driver.c
-@@ -0,0 +1,939 @@
+@@ -0,0 +1,941 @@
 +/*
 + * zz_driver.c -- zz3660, a Gallium driver that does no work: each pipe_context
 + * call goes to the GPU as a command (zz_proto.h, zz_exec.c).  Modelled on noop
@@ -5674,6 +5674,8 @@ index 0000000..0657963
 +{
 +   if (p == PIPE_CAP_USER_VERTEX_BUFFERS)
 +      return 0;         /* a pointer into this process means nothing on core 1 */
++   if (p == PIPE_CAP_CONDITIONAL_RENDER || p == PIPE_CAP_CONDITIONAL_RENDER_INVERTED)
++      return 0;         /* no render_condition: queries count nothing yet */
 +   return CAPS(s)->get_param(CAPS(s), p);
 +}
 +static float zz_paramf(struct pipe_screen *s, enum pipe_capf p) { return CAPS(s)->get_paramf(CAPS(s), p); }
