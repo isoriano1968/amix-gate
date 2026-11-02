@@ -5759,10 +5759,10 @@ index 0000000..529a758
 +}
 diff --git a/src/gallium/drivers/zz3660/zz_exec.c b/src/gallium/drivers/zz3660/zz_exec.c
 new file mode 100644
-index 0000000..01201f9
+index 0000000..5b7dde3
 --- /dev/null
 +++ b/src/gallium/drivers/zz3660/zz_exec.c
-@@ -0,0 +1,812 @@
+@@ -0,0 +1,810 @@
 +/*
 + * zz_exec.c -- the zz3660 executor: the command stream into a pipe_context.
 + * Nothing here knows which driver is underneath.
@@ -5831,16 +5831,14 @@ index 0000000..01201f9
 +/* Room left on the heap: the part never taken from it and the free blocks inside.
 +   softpipe and Mesa do not look at every allocation, so resources may not take
 +   the last of it: shaders and state still need some. */
-+#include <malloc.h>
 +#define ZZ_RESERVE (16u << 20)
 +#define ZZ_SMALL (256u << 10)     /* a texture this size may still use it */
-+extern char _heap_end[];
-+void *_sbrk(int incr);          /* malloc's break; the BSP's sbrk keeps another */
++size_t hb_heap_free(void);      /* arm_main.c's: both heap regions and the free blocks */
 +
 +static size_t
 +heap_left(void)
 +{
-+   return (size_t)(_heap_end - (char *)_sbrk(0)) + mallinfo().fordblks;
++   return hb_heap_free();
 +}
 +#endif
 +

@@ -26,6 +26,15 @@ the running firmware, without a new boot image.
 | `cores/h264bench` | H.264 and AAC player: picture in the RTG overlay, sound on HDMI. Also holds the harness all cores share (`arm_main.c`, `lscript.ld`) |
 | `cores/gpu` | OpenGL server: Mesa 18.3 (softpipe with NEON fast paths), fed by zzgl's GL calls or zz3660's Gallium stream from the 060, frames in the overlay, sound on HDMI |
 | `cores/glbench` | Timed GL scenes, with PMU profiling |
+| `cores/amix` | gpu and h264bench in one image (`z3660ARM_Core_amix.bin`, 8.9 MB): GL server, H.264 player and decoder; a posted job is GL when it carries `ZZGL_JOB_MAGIC`. zzgl, libGL and the launchers take it for gpu |
+
+The heap: gpu and amix (`-DHB_HEAP_LOW`) start it below the image, in core 1's
+DDR from `0x30000000`, and go on above the image: about 245 MiB for gpu,
+242 MiB for amix, against 104 MiB before (`arm_main.c` `_sbrk`). Core images
+may be up to 9 MiB (`HB_IMAGE_MAX`): the reload window plus the megabyte of
+core 0's MPEG sound after it, unused while core 1 is idle. A core still
+running an older harness takes images of 8 MiB only: reload gpu first, then
+amix.
 
 Measured with the ARM at 866 MHz: H.264 640x360 decoded in about 9 ms a frame;
 timedemo demo1 of GLQuake at 640x480 7.9 fps and at 320x240 15.4 fps on zzgl, 2.4 fps
@@ -66,6 +75,7 @@ firmware for its BSP, by default in `../Z3660` (`make Z3660=<dir>` otherwise).
     python3 -I build/xbuild.py arm
     make -C cores/gpu
     make -C cores/glbench
+    make -C cores/amix
 
     # libGL.so.18 for AMIX; STAGE has the shared X libraries
     python3 -I build/xbuild.py amix-glx

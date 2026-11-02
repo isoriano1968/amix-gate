@@ -103,10 +103,10 @@ static int reload(int fd, const char *file, int force)
         return 1;
     }
     size = (unsigned long)st.st_size;
-    data = size >= 8 && size <= HB_DATA_MAX ?
+    data = size >= 8 && size <= HB_IMAGE_MAX ?
            (unsigned char *)map(fd, HB_DATA_OFF, (size + PAGE - 1) & ~(PAGE - 1)) : NULL;
     if (!data || read(f, data, (size_t)size) != (ssize_t)size || le32(data) != 0x48323634) {
-        fprintf(stderr, "%s: not a core 1 image (no \"H264\" mark, or over %lu bytes)\n", file, HB_DATA_MAX);
+        fprintf(stderr, "%s: not a core 1 image (no \"H264\" mark, or over %lu bytes)\n", file, HB_IMAGE_MAX);
         return 1;
     }
     close(f);
@@ -229,8 +229,8 @@ static int loader(int fd, const char *file)
         return 1;
     }
     size = (unsigned long)st.st_size;
-    if (size < 8 || size > HB_DATA_MAX) {
-        fprintf(stderr, "%s: %lu bytes, at most %lu\n", file, size, HB_DATA_MAX);
+    if (size < 8 || size > HB_IMAGE_MAX) {
+        fprintf(stderr, "%s: %lu bytes, at most %lu\n", file, size, HB_IMAGE_MAX);
         return 1;
     }
     data = (unsigned char *)map(fd, HB_DATA_OFF, (size + PAGE - 1) & ~(PAGE - 1));

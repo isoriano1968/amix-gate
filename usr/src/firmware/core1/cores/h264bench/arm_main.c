@@ -13,6 +13,9 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stddef.h>
+#include <errno.h>
+#include <malloc.h>
 #include <sys/time.h>
 #include "xil_mmu.h"
 #include "xil_cache.h"
@@ -48,6 +51,65 @@ static volatile uint32_t *ctl = (volatile uint32_t *)(RTG_BASE + HB_CTL_OFF);
 
 /* the name ztop shows; another program built on this file defines its own */
 __attribute__((weak)) const char hb_core_name[16] = "h264bench";
+
+/*
+ * The heap.  Built with HB_HEAP_LOW it starts below the image, in core 1's
+ * own DDR from 0x30000000 (the Z3660's memory map gives core 1
+ * 0x30000000-0x40000000; the image must stay at C1LD_LOAD_ADDR, where core
+ * 0's loader puts it), and goes on above the image (the linker's heap) when
+ * that is full: about 245 MiB in all.  newlib's malloc takes the second
+ * region as a new piece above the first; it would refuse one below.  Under
+ * AmigaOS the SMUSH codecs use 0x30000000 too: no such core then.
+ * Without HB_HEAP_LOW, only the linker's heap, as before.
+ */
+extern char _heap_start[], _heap_end[];
+#define HEAP_LOW_START      0x30000000UL
+#define HEAP_LOW_END        C1LD_LOAD_ADDR
+
+static char *brk_cur, *brk_end;
+
+void *_sbrk(ptrdiff_t incr);
+void *_sbrk(ptrdiff_t incr)
+{
+    char *p;
+
+    if (!brk_cur) {
+#ifdef HB_HEAP_LOW
+        brk_cur = (char *)HEAP_LOW_START;
+        brk_end = (char *)HEAP_LOW_END;
+#else
+        brk_cur = _heap_start;
+        brk_end = _heap_end;
+#endif
+    }
+    if (incr > brk_end - brk_cur) {
+        if (brk_end != _heap_end && incr <= _heap_end - _heap_start) {
+            brk_cur = _heap_start;      /* the low region is full: the one above the image */
+            brk_end = _heap_end;
+        } else {
+            errno = ENOMEM;
+            return (void *)-1;
+        }
+    }
+    p = brk_cur;
+    brk_cur += incr;
+    return p;
+}
+
+/* what malloc can still get: the region in use, the one above if not yet
+   taken, and the free blocks inside the arena (zz_exec.c's reserve) */
+size_t hb_heap_free(void);
+size_t hb_heap_free(void)
+{
+    size_t n;
+
+    if (!brk_cur)
+        _sbrk(0);
+    n = (size_t)(brk_end - brk_cur) + mallinfo().fordblks;
+    if (brk_end != _heap_end)
+        n += (size_t)(_heap_end - _heap_start);
+    return n;
+}
 
 static uint32_t be(uint32_t v) { return __builtin_bswap32(v); }
 static void put(int w, uint32_t v) { ctl[w] = be(v); }
@@ -126,7 +188,7 @@ static void fault(void *kind)
             const uint32_t src = get(W_DATA_OFF), size = get(W_DATA_SIZE), entry = get(W_FLAGS);
             const volatile uint32_t *img = (const volatile uint32_t *)(RTG_BASE + src);
 
-            if (src == HB_DATA_OFF && size >= 8 && size <= HB_DATA_MAX && img[0] == 0x48323634 &&
+            if (src == HB_DATA_OFF && size >= 8 && size <= HB_IMAGE_MAX && img[0] == 0x48323634 &&
                 entry >= C1LD_LOAD_ADDR && entry < C1LD_LOAD_ADDR + size && !(entry & 3) &&
                 C1LD_LOAD_ADDR + size <= RELOAD_TRAMP) {
                 put(W_FAULT, 0);
@@ -270,7 +332,7 @@ void reload_posted(void)
     const uint32_t src = get(W_DATA_OFF), size = get(W_DATA_SIZE), entry = get(W_FLAGS);
     const volatile uint32_t *img = (const volatile uint32_t *)(RTG_BASE + src);
 
-    if (get(W_STATE) == HB_RELOAD && src == HB_DATA_OFF && size >= 8 && size <= HB_DATA_MAX &&
+    if (get(W_STATE) == HB_RELOAD && src == HB_DATA_OFF && size >= 8 && size <= HB_IMAGE_MAX &&
         img[0] == 0x48323634 && entry >= C1LD_LOAD_ADDR && entry < C1LD_LOAD_ADDR + size &&
         !(entry & 3) && C1LD_LOAD_ADDR + size <= RELOAD_TRAMP) {
         put(W_STATE, HB_IDLE);
@@ -308,7 +370,7 @@ int main(void)
         set_section(i * 0x100000UL, RTG_POLICY);
     /* but what the 68k shares with us uncached: our cache would keep a stale copy */
     set_section(RTG_BASE + HB_CTL_OFF, NORM_NONCACHE);
-    for (i = 0; i < (int)(HB_DATA_MAX >> 20); i++)
+    for (i = 0; i < (int)(HB_IMAGE_MAX >> 20); i++)   /* a reload reads the image from it */
         set_section(RTG_BASE + HB_DATA_OFF + i * 0x100000UL, NORM_NONCACHE);
     for (i = 0; i < (int)(ZZAV_AREA_SIZE >> 20); i++)    /* the player's packet ring */
         set_section(RTG_BASE + ZZAV_RING_OFF + i * 0x100000UL, NORM_NONCACHE);
@@ -377,7 +439,7 @@ int main(void)
             uint32_t src = get(W_DATA_OFF), size = get(W_DATA_SIZE), entry = get(W_FLAGS);
             const volatile uint32_t *img = (const volatile uint32_t *)(RTG_BASE + src);
 
-            if (src == HB_DATA_OFF && size >= 8 && size <= HB_DATA_MAX && img[0] == 0x48323634 &&
+            if (src == HB_DATA_OFF && size >= 8 && size <= HB_IMAGE_MAX && img[0] == 0x48323634 &&
                 entry >= C1LD_LOAD_ADDR && entry < C1LD_LOAD_ADDR + size && !(entry & 3) &&
                 C1LD_LOAD_ADDR + size <= RELOAD_TRAMP) {
                 put(W_STATE, HB_IDLE);

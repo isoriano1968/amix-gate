@@ -158,9 +158,10 @@ static int start_server(volatile unsigned long *blk)
       name[i * 4 + 3] = (char)w;
    }
    name[16] = 0;
-   if (ctl[W_MAGIC] != HB_MAGIC_READY || strcmp(name, "gpu")) {
+   /* the GL server: the gpu core, or the amix core, which has it too */
+   if (ctl[W_MAGIC] != HB_MAGIC_READY || (strcmp(name, "gpu") && strcmp(name, "amix"))) {
       fprintf(stderr, "zzgl: core 1 does not run the GPU program (runs \"%s\"): "
-              "armbench -reload z3660ARM_Core_gpu.bin\n", name);
+              "armbench -reload z3660ARM_Core_gpu.bin (or _amix.bin)\n", name);
       return -1;
    }
    if (blk[ZB_MAGIC] == ZZGL_MAGIC && ctl[W_STATE] == HB_RUNNING) {

@@ -25,6 +25,17 @@
 /* ztop shows this name for core 1 */
 const char hb_core_name[16] = "glbench";
 
+/* zz_exec.c (in libOSMesa.a) reports to zzgl's server, which this program
+   does not have: nothing to report to */
+__attribute__((weak)) void zzp_present(const void *rgba, int w, int h, int again)
+{
+    (void)rgba; (void)w; (void)h; (void)again;
+}
+__attribute__((weak)) void zzp_refused(uint32_t what, uint32_t size)
+{
+    (void)what; (void)size;
+}
+
 /*
  * Start-up trace before main() (arm_main.c's W_STAGE starts there): the first
  * static constructor writes 0x11 into word 30 of the control block and pushes

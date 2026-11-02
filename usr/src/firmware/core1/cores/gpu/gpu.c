@@ -18,7 +18,9 @@
 #include "zzgl_dec.h"
 
 /* ztop shows this name for core 1 */
+#ifndef HB_COMBINED
 const char hb_core_name[16] = "gpu";
+#endif
 
 #define AUDIO_POS_REG   0x7FC00128UL    /* the formatter's position in the HDMI ring (vplay) */
 
@@ -434,7 +436,9 @@ int hb_decode(const uint8_t *data, size_t size, int flags, hb_clock clock,
     return ret < 0 ? -1 : 0;
 }
 
-/* what arm_main.c also calls: no video player and no FFmpeg in this image */
+#ifndef HB_COMBINED
+/* what arm_main.c also calls: no video player and no FFmpeg in this image
+   (the amix core has both) */
 int player_run(void)
 {
     volatile uint32_t *zz = (volatile uint32_t *)(pl_board + ZZAV_OFF);
@@ -449,3 +453,4 @@ void av_log_set_level(int level)
 {
     (void)level;
 }
+#endif
