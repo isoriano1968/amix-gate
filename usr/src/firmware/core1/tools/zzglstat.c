@@ -2,7 +2,8 @@
  * zzglstat.c -- zzgl's block once a second (AMIX): frames shown, the ring's
  * write and read positions, errors, the sound position.
  *   zzglstat [seconds]
- *   zzglstat -close        (ends a server whose program died: a ZZ_CLOSE into the ring)
+ *   zzglstat -close        (ends a server whose program died: a ZZ_CLOSE into the ring,
+ *                           and the overlay it left on goes off, as ovloff does it)
  *   zzglstat -grab FILE    (the overlay buffer shown now: P6 PPM)
  */
 #include <stdio.h>
@@ -12,10 +13,64 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
 #include "zzgl.h"
+
+extern int munmap();
 
 #define FB_PHYS 0x00200000UL
 #define PAGE    4096UL
+
+/* the overlay off: ovloff.c's register sequence (CLOSE needs INIT first) */
+#define ZZ9KIOC_GETINFO     (('Z' << 8) | 1)
+#define ZZ9KIOC_SETREG      (('Z' << 8) | 7)
+#define REG_MPEG_CMD        0x2C0
+#define REG_MPEG_PARAM0     0x2C8
+#define CMD_INIT            1
+#define CMD_CLOSE           5
+#define FIFO_OFF            0x07A00000UL
+#define FIFO_SIZE           0x00100000UL
+#define SHARED_OFF          0x07B00000UL
+struct zz9k_info {
+    unsigned long base, board_size, fb_offset, fb_size;
+    unsigned short hw_version, fw_version, product, zorro;
+    unsigned short width, height, color_mode, mode;
+};
+struct zz9k_reg { unsigned short offset, value; };
+
+static void reg32(int fd, unsigned off, unsigned long v)
+{
+    struct zz9k_reg r;
+
+    r.offset = off;
+    r.value = (unsigned short)(v >> 16);
+    ioctl(fd, ZZ9KIOC_SETREG, &r);
+    r.offset = off + 2;
+    r.value = (unsigned short)v;
+    ioctl(fd, ZZ9KIOC_SETREG, &r);
+}
+
+static void overlay_off(int fd)
+{
+    struct zz9k_info info;
+    unsigned char *shared;
+    int i;
+
+    if (ioctl(fd, ZZ9KIOC_GETINFO, &info) < 0)
+        return;
+    shared = (unsigned char *)mmap(0, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)(SHARED_OFF - FB_PHYS));
+    if (shared == (unsigned char *)-1)
+        return;
+    for (i = 0; i < 96; i++)
+        shared[i] = 0;
+    reg32(fd, REG_MPEG_PARAM0 + 0, info.base + SHARED_OFF);
+    reg32(fd, REG_MPEG_PARAM0 + 4, info.base);
+    reg32(fd, REG_MPEG_PARAM0 + 8, FIFO_SIZE);
+    reg32(fd, REG_MPEG_PARAM0 + 12, FIFO_OFF);
+    reg32(fd, REG_MPEG_CMD, CMD_INIT);
+    reg32(fd, REG_MPEG_CMD, CMD_CLOSE);
+    munmap((caddr_t)shared, PAGE);
+}
 
 int main(int argc, char **argv)
 {
@@ -39,6 +94,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "zzglstat: no server\n");
             return 1;
         }
+        w[ZB_OVL_ROW] = ZB_OVL_OFF;     /* a last frame must not bring it back */
         wr = w[ZB_WR];
         if (wr + 16 > ZZGL_RING_SIZE) {
             if (wr + 8 <= ZZGL_RING_SIZE)
@@ -49,6 +105,8 @@ int main(int argc, char **argv)
         ring[wr / 4 + 1] = 0;
         w[ZB_WR] = wr + 8;
         sleep(1);
+        if (w[ZB_MAGIC] != ZZGL_MAGIC)
+            overlay_off(fd);
         printf("zzglstat: server %s\n", w[ZB_MAGIC] == ZZGL_MAGIC ? "still runs" : "ended");
         return 0;
     }
