@@ -18,6 +18,9 @@ CPU     := -mcpu=cortex-a9 -marm -mfpu=neon -mfloat-abi=hard
 CFLAGS  := $(CPU) -O2 -Wall -ffunction-sections -fdata-sections -fno-short-enums \
            -I$(BSP)/include -I$(HB) -I$(V)/ffmpeg-4.4.8 -I$(FF) \
            -I$(G)/zzgl -I$(G)/src/mesa-18.3.6/include
+# FFmpeg (build-arm) has the ABI's short enums, Mesa and OpenSSL do not:
+# what uses FFmpeg's structures is built as FFmpeg, or reads AVFrame wrongly
+HBFLAGS := $(filter-out -fno-short-enums,$(CFLAGS))
 LDFLAGS := $(CPU) -T $(HB)/lscript.ld -specs=$(HB)/Xilinx.spec \
            -Wl,--gc-sections,-build-id=none,-Map=build/amix.map,--no-enum-size-warning,--defsym=_HEAP_SIZE=0x07280000 -L$(BSP)/lib
 LIBS    := $(G)/build/arm/libOSMesa.a $(FF)/libavcodec/libavcodec.a $(FF)/libavutil/libavutil.a \
@@ -39,7 +42,7 @@ build/xil-crt0.o: $(BSP)/libsrc/standalone_v9_0/src/xil-crt0.S
 
 build/arm_main.o: $(HB)/arm_main.c
 	@mkdir -p build
-	$(CC) $(CFLAGS) -DHB_HEAP_LOW -c $< -o $@
+	$(CC) $(HBFLAGS) -DHB_HEAP_LOW -c $< -o $@
 
 build/amix.o: amix.c
 	@mkdir -p build
@@ -52,11 +55,11 @@ build/gpu.o: $(GPU)/gpu.c
 
 build/decode.o: $(HB)/decode.c
 	@mkdir -p build
-	$(CC) $(CFLAGS) -Dhb_decode=h264_hb_decode -c $< -o $@
+	$(CC) $(HBFLAGS) -Dhb_decode=h264_hb_decode -c $< -o $@
 
 build/player.o: $(HB)/player.c
 	@mkdir -p build
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(HBFLAGS) -c $< -o $@
 
 build/zzgl_dec.o: $(G)/zzgl/zzgl_dec.c $(G)/zzgl/zzgl.h $(G)/zzgl/gen/zzgl_gen_dec.h
 	@mkdir -p build
