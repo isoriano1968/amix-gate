@@ -263,8 +263,11 @@ static void load_report(uint64_t t)
     load_wait = 0;
 }
 
+void hb_service(void);
+
 static void tick(void)
 {
+    hb_service();
     publish_audio();
     snd_service();
     load_report(pl_ticks());
@@ -279,6 +282,7 @@ static void idle(void)
     if (t - idle_last < pl_tick_hz / 1000)
         load_wait += t - idle_last;
     idle_last = t;
+    hb_service();
     load_report(t);
     snd_service();
     if (++n % 64 == 0)

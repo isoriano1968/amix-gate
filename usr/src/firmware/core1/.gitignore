@@ -1,5 +1,6 @@
 # fetched or built locally
 /ffmpeg-4.4.8
+/openssl-3.5.4/
 /build-arm/
 /src/
 /dl/

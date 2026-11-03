@@ -1,6 +1,7 @@
 # amix: one core 1 image for AMIX -- gpu's GL server (Mesa 18.3 OSMesa +
-# softpipe) and h264bench's H.264 player and decoder (FFmpeg 4.4.8), in
-# h264bench's harness, with the heap from 0x30000000 (about 242 MiB).
+# softpipe), h264bench's H.264 player and decoder (FFmpeg 4.4.8) and
+# zzcrypto's public-key jobs (OpenSSL 3.5.4's libcrypto, configure-openssl-arm.sh),
+# in h264bench's harness, with the heap from 0x30000000.
 # The single cores (gpu, h264bench, glbench) stay buildable on their own.
 CROSS_COMPILE ?= arm-none-eabi-
 CC      := $(CROSS_COMPILE)gcc
@@ -17,17 +18,18 @@ FF      := $(V)/build-arm
 CPU     := -mcpu=cortex-a9 -marm -mfpu=neon -mfloat-abi=hard
 CFLAGS  := $(CPU) -O2 -Wall -ffunction-sections -fdata-sections -fno-short-enums \
            -I$(BSP)/include -I$(HB) -I$(V)/ffmpeg-4.4.8 -I$(FF) \
-           -I$(G)/zzgl -I$(G)/src/mesa-18.3.6/include
+           -I$(G)/zzgl -I$(G)/src/mesa-18.3.6/include -I$(G)/zzcrypto
 # FFmpeg (build-arm) has the ABI's short enums, Mesa and OpenSSL do not:
 # what uses FFmpeg's structures is built as FFmpeg, or reads AVFrame wrongly
 HBFLAGS := $(filter-out -fno-short-enums,$(CFLAGS))
+OSSL    := $(G)/openssl-3.5.4
 LDFLAGS := $(CPU) -T $(HB)/lscript.ld -specs=$(HB)/Xilinx.spec \
-           -Wl,--gc-sections,-build-id=none,-Map=build/amix.map,--no-enum-size-warning,--defsym=_HEAP_SIZE=0x07280000 -L$(BSP)/lib
-LIBS    := $(G)/build/arm/libOSMesa.a $(FF)/libavcodec/libavcodec.a $(FF)/libavutil/libavutil.a \
+           -Wl,--gc-sections,-build-id=none,-Map=build/amix.map,--no-enum-size-warning,--defsym=_HEAP_SIZE=0x07100000 -L$(BSP)/lib
+LIBS    := $(G)/build/arm/libOSMesa.a $(OSSL)/libcrypto.a $(FF)/libavcodec/libavcodec.a $(FF)/libavutil/libavutil.a \
            -Wl,--start-group,-lxil,-lstdc++,-lgcc,-lm,-lc,--end-group
 
 OBJS    := build/arm_main.o build/amix.o build/gpu.o build/decode.o build/player.o \
-           build/zzgl_dec.o build/spook.o build/armgl_compat.o build/xil-crt0.o
+           build/zzgl_dec.o build/spook.o build/armgl_compat.o build/zzc_arm.o build/xil-crt0.o
 
 all: build/z3660ARM_Core_amix.bin
 
@@ -57,9 +59,10 @@ build/decode.o: $(HB)/decode.c
 	@mkdir -p build
 	$(CC) $(HBFLAGS) -Dhb_decode=h264_hb_decode -c $< -o $@
 
+# 64 MB of video packets: minutes of buffer at the network's 130 KB/s
 build/player.o: $(HB)/player.c
 	@mkdir -p build
-	$(CC) $(HBFLAGS) -c $< -o $@
+	$(CC) $(HBFLAGS) -D'VQ_BYTES_MAX=(64 << 20)' -DAQ_MAX=40000 -c $< -o $@
 
 build/zzgl_dec.o: $(G)/zzgl/zzgl_dec.c $(G)/zzgl/zzgl.h $(G)/zzgl/gen/zzgl_gen_dec.h
 	@mkdir -p build
@@ -69,6 +72,10 @@ $(G)/zzgl/gen/zzgl_gen_dec.h: $(G)/zzgl/zzgl.h $(G)/zzgl/gen.py
 	@mkdir -p $(G)/zzgl/gen
 	python3 -I $(G)/zzgl/gen.py $(G)/zzgl/gen
 
+build/zzc_arm.o: $(G)/zzcrypto/zzc_arm.c $(G)/zzcrypto/zzcrypto.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -I$(OSSL)/include -c $< -o $@
+
 build/spook.o: $(G)/zzgl/spook.c $(G)/zzgl/spook_font.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -O3 -c $< -o $@
@@ -77,7 +84,7 @@ build/armgl_compat.o: $(G)/compat/arm/armgl_compat.c
 	@mkdir -p build
 	$(CC) $(CFLAGS) -I$(G)/compat/arm -c $< -o $@
 
-build/amix.elf: $(OBJS) $(G)/build/arm/libOSMesa.a
+build/amix.elf: $(OBJS) $(G)/build/arm/libOSMesa.a $(OSSL)/libcrypto.a
 	$(CXX) $(LDFLAGS) $(OBJS) $(LIBS) -o $@
 	$(SIZE) $@
 

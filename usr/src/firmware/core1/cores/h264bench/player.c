@@ -27,8 +27,14 @@
 #define LEAD                (PERIOD * 6)    /* written ahead of the DMA: 120 ms */
 #define LEAD_MIN            (PERIOD * 2)    /* below this, silence goes in */
 #define PCM_FRAMES          (RATE * 2)      /* decoded sound held: 2 s */
-#define VQ_BYTES_MAX        (6 << 20)       /* video packets held on core 1 */
-#define AQ_MAX              4000
+/* packets held on core 1 (from the heap): the amix core, with its 242 MiB,
+   builds with more (cores/amix/Makefile) to ride out the network's dips */
+#ifndef VQ_BYTES_MAX
+#define VQ_BYTES_MAX        (6 << 20)       /* video */
+#endif
+#ifndef AQ_MAX
+#define AQ_MAX              4000            /* sound, packets */
+#endif
 
 static volatile uint32_t *blk;
 static uint32_t get(int w) { return __builtin_bswap32(blk[w]); }
@@ -750,6 +756,7 @@ int player_run(void)
         t_pass = t;
         if (get(ZZAV_W_CMD) == ZZAV_CMD_CLOSE)
             break;
+        hb_service();
         paused = get(ZZAV_W_PAUSE) != 0;
         volume = (int)get(ZZAV_W_VOLUME);
         if (volume > 256 || volume < 0)

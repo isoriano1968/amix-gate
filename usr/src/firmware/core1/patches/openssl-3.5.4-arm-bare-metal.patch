@@ -1,0 +1,23 @@
+--- a/crypto/armcap.c	2026-11-03 07:02:37.355795868 +0100
++++ b/crypto/armcap.c	2026-11-03 07:02:37.363795872 +0100
+@@ -98,6 +98,20 @@
+ # endif
+ 
+ /*
++ * Bare metal (the Z3660's core 1, newlib): no auxiliary vector and no SIGILL
++ * to probe with; the build says what the CPU has (OPENSSL_ARM_BARE_METAL_HWCAP,
++ * AT_HWCAP bits, e.g. NEON on a Cortex-A9)
++ */
++# if defined(OPENSSL_ARM_BARE_METAL_HWCAP)
++#  define OSSL_IMPLEMENT_GETAUXVAL
++
++static unsigned long getauxval(unsigned long key)
++{
++  return key == 16 ? (unsigned long)(OPENSSL_ARM_BARE_METAL_HWCAP) : 0ul;
++}
++# endif
++
++/*
+  * Android: according to https://developer.android.com/ndk/guides/cpu-features,
+  * getauxval is supported starting with API level 18
+  */

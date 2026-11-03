@@ -24,10 +24,13 @@
    the overlay buffer at 0x06000000 is under 8 MB, as at 1920x1080) */
 #define HB_DATA_OFF         0x06800000UL
 #define HB_DATA_MAX         0x00800000UL
-/* a core image for -load/-reload: the data window and the megabyte after it,
-   core 0's MPEG sound (0x07000000), which nothing plays into while core 1
-   is idle; the amix core is 8.9 MB.  Job data stays within HB_DATA_MAX. */
-#define HB_IMAGE_MAX        0x00900000UL
+/* a core image for -load/-reload: the data window and what follows it up to
+   0x07400000, core 0's MPEG sound (0x07000000) and the start of the player's
+   and GL server's ring (0x07100000): nothing uses them while core 1 is idle,
+   and a reload happens only then.  The amix core is 10.3 MB; a core with an
+   older harness takes 9 MiB (until 2026-11-03) or 8 MiB.  Job data stays
+   within HB_DATA_MAX. */
+#define HB_IMAGE_MAX        0x00C00000UL
 
 /*
  * Core 0's loader (patch to the Z3660 firmware's main.c): one page below the

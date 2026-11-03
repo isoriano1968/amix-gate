@@ -10,6 +10,7 @@
 extern volatile uint8_t *pl_board;      /* the board memory's start */
 extern uint64_t pl_tick_hz;
 uint64_t pl_ticks(void);
+void hb_service(void);                          /* arm_main.c: zzcrypto jobs, when the core has them */
 void pl_load(uint64_t idle, uint32_t frames);    /* ticks with nothing to do, frames shown: for ztop */
 uint32_t pl_audio_pos(void);            /* bytes the audio DMA is into the sound ring */
 

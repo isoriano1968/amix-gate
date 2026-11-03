@@ -15,7 +15,7 @@ FF      := $(V)/build-arm
 
 CPU     := -mcpu=cortex-a9 -marm -mfpu=neon -mfloat-abi=hard
 CFLAGS  := $(CPU) -O2 -Wall -ffunction-sections -fdata-sections \
-           -I$(BSP)/include -I$(V)/ffmpeg-4.4.8 -I$(FF)
+           -I$(BSP)/include -I$(V)/ffmpeg-4.4.8 -I$(FF) -I$(V)/zzcrypto
 LDFLAGS := $(CPU) -T lscript.ld -specs=Xilinx.spec -Wl,--gc-sections,-build-id=none,-Map=build/h264bench.map \
            -L$(BSP)/lib
 LIBS    := $(BSP_CRT0_DIR)/xil-crt0.o $(FF)/libavcodec/libavcodec.a $(FF)/libavutil/libavutil.a \

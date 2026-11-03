@@ -25,6 +25,7 @@
 #include "xtime_l.h"
 #include <libavutil/log.h>
 #include "bench.h"
+#include "zzcrypto.h"
 #include "zzav.h"
 #include "player.h"
 
@@ -51,6 +52,12 @@ static volatile uint32_t *ctl = (volatile uint32_t *)(RTG_BASE + HB_CTL_OFF);
 
 /* the name ztop shows; another program built on this file defines its own */
 __attribute__((weak)) const char hb_core_name[16] = "h264bench";
+
+/* zzcrypto's jobs from the 060 (zzc_arm.c, in the cores that have it):
+   called while waiting, here and in the GL server and the player */
+__attribute__((weak)) void hb_service(void)
+{
+}
 
 /*
  * The heap.  Built with HB_HEAP_LOW it starts below the image, in core 1's
@@ -306,6 +313,7 @@ static void reload(uint32_t src, uint32_t size, uint32_t entry)
 
     put(W_MAGIC, 0);                    /* the 68k waits for the new image's mark */
     put(W_STAGE, 0);
+    ((volatile uint32_t *)(RTG_BASE + ZC_BLK_OFF))[ZC_W_MAGIC] = 0;   /* no jobs until the new image says */
     ((volatile uint32_t *)(RTG_BASE + ZZAV_OFF))[ZZAV_W_MAGIC] = 0;
     memcpy((void *)RELOAD_TRAMP, (const void *)reload_tramp, n);   /* uncached: straight to DDR */
     /* the copy overwrites our own page table (MMUTable, inside the image) while
@@ -395,6 +403,7 @@ int main(void)
     ((volatile uint32_t *)(RTG_BASE + ZZAV_OFF))[ZZAV_W_CMD] = 0;
     ((volatile uint32_t *)(RTG_BASE + ZZAV_OFF))[ZZAV_W_STATE] = 0;
     ((volatile uint32_t *)(RTG_BASE + ZZAV_OFF))[ZZAV_W_MAGIC] = __builtin_bswap32(ZZAV_MAGIC);
+    ((volatile uint32_t *)(RTG_BASE + ZC_BLK_OFF))[ZC_W_MAGIC] = 0;   /* a core without zzcrypto */
     put(W_MAGIC, HB_MAGIC_READY);
     put(W_STAGE, 5);
     CORE0_ACK = 0;
@@ -454,6 +463,7 @@ int main(void)
 
             put(W_HEARTBEAT, ++beat);
             put(W_NOW, (uint32_t)t0);
+            hb_service();
             /* ~1 ms; no WFE/WFI: nothing is sure to wake core 1 (no interrupts
                of its own, no event stream on the A9, core 0's SEV is rare) */
             while (ticks() - t0 < pl_tick_hz / 1000)
