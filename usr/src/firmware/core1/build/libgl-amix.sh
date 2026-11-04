@@ -27,5 +27,6 @@ m68k-elf-gcc -shared -Wl,-h,libGL.so.18 so_first.o obj/*.o amix_so.o amixgl_comp
 	-lXext -lX11 -lstdc++ -lsupc++ -lm so_last.o -o libGL.so.18
 m68k-elf-strip libGL.so.18
 "$T/amix-fix-data-relocs" libGL.so.18
+"$T/amix-fix-needed" libGL.so.18
 ln -sf libGL.so.18 libGL.so
 ls -l libGL.so.18

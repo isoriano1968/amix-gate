@@ -21,6 +21,7 @@ m68k-elf-gcc $F -c "$H/zzgl_amix.c" -o "$O/zzgl_amix.o"
 "$TOOLS/amix-got-check" "$O"/*.o
 mkdir -p "$L/pkgconfig" "$I"
 m68k-elf-gcc -shared -Wl,-h,libzzgl.so.1 "$O"/*.o -o "$L/libzzgl.so.1"
+"$TOOLS/amix-fix-needed" "$L/libzzgl.so.1"
 ln -sf libzzgl.so.1 "$L/libzzgl.so"
 cp "$H/zzgl_enc.h" "$H/zzgl_platform.h" "$I/"
 cat > "$L/pkgconfig/zzgl.pc" <<P
