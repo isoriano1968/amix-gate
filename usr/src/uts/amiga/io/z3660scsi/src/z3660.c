@@ -83,6 +83,7 @@
 
 #define	Z3660_PROD	0x144B0001	/* autocon pc = (manufacturer<<16)|product */
 #define	Z3660_FIXED	0x10000000	/* combo window base when not autoconfigured */
+#define	Z3660_RAM_PROD	0x144B0002	/* the Z3660's Zorro III RAM board */
 #define	VPOSR		0xDFF004	/* Agnus/Alice id: bits 8-14 >= 0x22 -> AGA */
 #define	PISCSI_OFFSET	0x00002000	/* register window within the board */
 #define	BOUNCE_OFFSET	0x00080000	/* bounce buffer within the board */
@@ -226,6 +227,21 @@
 
 extern int	autocon();
 extern caddr_t	sptalloc();
+#ifdef	Z3660_KVMAP
+/*
+ * 040/060 line (relink-040-z3660.sh defines Z3660_KVMAP and links the port's
+ * src/devkvmap040.s): a board at or above VSECT1 -- autoconfig_rtg YES puts it
+ * at 0x50000000 on an A3000 -- is mapped with an explicit noncacheable class
+ * (dev_kvmap, as the VA2000 driver does) instead of sptalloc's writethrough-
+ * cacheable leaves, so the mailbox works with a live data cache.  cputype is
+ * the port's CPU-class global (40 or 60, set by the loader).
+ */
+extern caddr_t	dev_kvmap();
+/* the port's cputype is a long (src/cputype060.s); sys/systm.h still declares
+ * the SVR4 short, so it is reached under its own name */
+extern long	z3660_cputype __asm__("cputype");
+#define	Z3660_CM_NCS	0x40		/* dev_kvmap: noncacheable, serialized */
+#endif
 extern void	bcopy();
 extern int	printf();
 
@@ -249,6 +265,7 @@ static long		board_phys;
 ulong	z3660_lastblock, z3660_lastlen, z3660_blocks0, z3660_dma;
 uchar	z3660_rc, z3660_lastcmd, z3660_present;
 uchar	z3660_direct_map;	/* 1 = section-0 identity, 0 = sptalloc'd */
+uchar	z3660_kvmap;		/* 1 = mapped by dev_kvmap, noncacheable */
 
 /*
  * Pending REQUEST SENSE data for the next C_REQ_SENSE.  A zero key means
@@ -455,7 +472,7 @@ ulong	lo, hi;			/* board window: lo inclusive, hi exclusive */
 	z3660_cacr = z3660_rd_cacr();
 
 	bad = 0;
-	for (i = 0; i < 2; ++i) {
+	for (i = 0; z3660_direct_map && i < 2; ++i) {
 		a  = i ? (hi - 1) : lo;
 		c0 = z3660_ttr_class( z3660_dtt0, a);
 		c1 = z3660_ttr_class( z3660_dtt1, a);
@@ -470,9 +487,10 @@ ulong	lo, hi;			/* board window: lo inclusive, hi exclusive */
 	 * and on the 040/060 line sptalloc() ignores its mode argument, so
 	 * segkmem_mapin builds a CM=00 leaf -- WRITETHROUGH CACHEABLE (port
 	 * src/devkvmap040.s header; src/segkmem040.s B1 note).  Not copyback, not
-	 * NCS.  See the mapping note above z3660map().
+	 * NCS.  See the mapping note above z3660map().  The dev_kvmap arm installs
+	 * NCS leaves (and asserts their PFNs), so it is not this failure.
 	 */
-	if (z3660_direct_map == 0) {
+	if (z3660_direct_map == 0 && z3660_kvmap == 0) {
 		z3660_sptalloc_unsafe++;
 		bad = 1;
 		printf( "z3660: sptalloc mapping arm is unsupported with a live data cache\n");
@@ -919,6 +937,16 @@ z3660map()
 
 	if (regs)
 		return 0;
+#ifdef	Z3660_KVMAP
+	/*
+	 * 040/060 line: arm the data-cache maintenance for the CPU the loader
+	 * reported, unless it was set by hand.  Required on real silicon (the
+	 * ARM writes disk data straight into copyback-cached RAM); harmless on
+	 * an emulated CPU, whose cache instructions do nothing.
+	 */
+	if (z3660_cache == 0 && (z3660_cputype == 40 || z3660_cputype == 60))
+		z3660_cache = z3660_cputype;
+#endif
 	found = autocon( Z3660_PROD, 0, &base, &size);
 	unless (found) {
 		/*
@@ -927,7 +955,17 @@ z3660map()
 		 * AGA is the LOW NIBBLE >= 2, not the whole id >= 0x22
 		 * (NTSC ECS 0x30 is not AGA).
 		 */
-		if ((((RDVPOSR() >> 8) & 0x7F) & 0x0F) < 2) {
+		if ((((RDVPOSR() >> 8) & 0x7F) & 0x0F) < 2
+#ifdef	Z3660_KVMAP
+		    /*
+		     * ECS/OCS, e.g. an A3000: a Z3660 is still certain when
+		     * its RAM board autoconfigured (autoconfig_rtg NO leaves
+		     * only the combo window out of the chain), so the fixed
+		     * window is probed then too.
+		     */
+		    && !autocon( Z3660_RAM_PROD, 0, &base, &size)
+#endif
+		    ) {
 			z3660_present = 0;
 			return ENXIO;	/* ECS/OCS machine -- no Z3660 here */
 		}
@@ -947,10 +985,18 @@ z3660map()
 		bounce = (volatile uchar *)phystokv( (paddr_t)base + BOUNCE_OFFSET);
 	} else {
 		z3660_direct_map = 0;
+#ifdef	Z3660_KVMAP
+		z3660_kvmap = 1;
+		regs   = (volatile uchar *)dev_kvmap( (ulong)base + PISCSI_OFFSET,
+				(ulong)REGS_BYTES, Z3660_CM_NCS, 0);
+		bounce = (volatile uchar *)dev_kvmap( (ulong)base + BOUNCE_OFFSET,
+				(ulong)BOUNCE_BYTES, Z3660_CM_NCS, 0);
+#else
 		regs   = (volatile uchar *)sptalloc( REGS_PAGES, PG_V,
 				phystopfn( (paddr_t)base + PISCSI_OFFSET), 0);
 		bounce = (volatile uchar *)sptalloc( BOUNCE_PAGES, PG_V,
 				phystopfn( (paddr_t)base + BOUNCE_OFFSET), 0);
+#endif
 	}
 	if (regs == 0 || bounce == 0) {
 		regs = 0;		/* sptalloc failure, or a base of 0 */
