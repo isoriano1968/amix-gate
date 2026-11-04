@@ -246,8 +246,8 @@ static void test_hotpath_trip_budget()
 	       "trip budget: READ(10) reads NO PDT register (served from cache)");
 	CHECK( mock_trips_drvnumx == 1,
 	       "trip budget: READ(10) writes DRVNUMX exactly once (redundant repeat gone)");
-	CHECK( rd_trips == 6,
-	       "trip budget: READ(10) costs 6 round trips (was 10 before the cache)");
+	CHECK( rd_trips == 9,
+	       "trip budget: READ(10) costs 9 round trips (6 + the register-race read-backs; 10 before the cache)");
 
 	/* ---- steady-state WRITE(10): 1 x 512-byte block @ LBA 12 ---- */
 	for (i = 0; i < 512; i++) src[i] = (uchar)(0x30 + (i & 0x0F));
@@ -265,8 +265,8 @@ static void test_hotpath_trip_budget()
 	       "trip budget: WRITE(10) touches none of the three static geometry registers");
 	CHECK( mock_trips_drvnumx == 1,
 	       "trip budget: WRITE(10) writes DRVNUMX exactly once");
-	CHECK( wr_trips == 5,
-	       "trip budget: WRITE(10) costs 5 round trips (was 9 before the cache)");
+	CHECK( wr_trips == 8,
+	       "trip budget: WRITE(10) costs 8 round trips (5 + the register-race read-backs; 9 before the cache)");
 
 	/*
 	 * The cached facts must still be the RIGHT facts -- a cache that answers
@@ -1404,6 +1404,129 @@ static void test_fault_knob()
 
 
 /* ====================================================================== */
+/* GATING: the register-race check (DI-1, 2026-11-04).                     */
+/*                                                                         */
+/* The mock's late latch keeps a register's previous value for chosen      */
+/* writes, as the firmware does when the value's AXI write lands after its */
+/* event.  With the check off, a late WRITE_ADDR1 on the third 2 KiB piece */
+/* of an 8 KiB write must give DI-1's picture; with it on, every piece     */
+/* must land at its own LBA, and a register that never latches must refuse */
+/* the chunk with no doorbell.                                             */
+/* ====================================================================== */
+extern unsigned long	z3660_regrace_on, z3660_regrace_n, z3660_regrace_fail;
+extern unsigned long	z3660_regrace_reg, z3660_regrace_want, z3660_regrace_got;
+
+#define RR_W1	0x240			/* P_WRITE_ADDR1 */
+#define RR_W3	0x248			/* P_WRITE_ADDR3 */
+#define RR_R1	0x020			/* P_READ_ADDR1  */
+
+static uchar	rr_p[4][4 * 512];
+
+static void rr_write8k( lba)		/* buf_breakup's four 2 KiB requests */
+unsigned long	lba;
+{
+	int	k;
+
+	for (k = 0; k < 4; k++)
+		pcr_rw( 0x2A, lba + 4 * k, 4UL, rr_p[k]);
+}
+
+static void test_regrace()
+{
+	unsigned char	*back = mock_backing( U_DISK);
+	uchar		old[16 * 512], buf[8 * 512];
+	unsigned long	db, rd;
+	int		k, all;
+
+	printf("\n=== GATE: register-race check -- late latch on the mailbox ===\n");
+	z3660_cache = 0;
+
+	CHECK( z3660_regrace_on == 1,
+	       "regrace: boots with the check on");
+	CHECK( z3660_regrace_n == 0 && z3660_regrace_fail == 0,
+	       "regrace: no mismatch in the whole run so far (no false alarm on the normal path)");
+
+	for (k = 0; k < 4; k++)
+		fk_fill( rr_p[k], sizeof rr_p[k], 0x11 + 0x30 * k);
+
+	/* ---- 1. check off: a late ADDR1 on piece 3 reproduces DI-1 ---- */
+	memcpy( old, back + 160 * DK_BS, 16 * DK_BS);
+	z3660_regrace_on = 0;
+	mock_stale_reg = RR_W1; mock_stale_skip = 2; mock_stale_n = 1;
+	rr_write8k( 160UL);
+	CHECK( g_okay && mock_stale_hits == 1,
+	       "regrace off: the mock latched piece 3's block register late, once");
+	CHECK( memcmp( back + 160 * DK_BS, rr_p[0], 4 * DK_BS) == 0
+	       && memcmp( back + 164 * DK_BS, rr_p[2], 4 * DK_BS) == 0
+	       && memcmp( back + 168 * DK_BS, old + 8 * DK_BS, 4 * DK_BS) == 0
+	       && memcmp( back + 172 * DK_BS, rr_p[3], 4 * DK_BS) == 0,
+	       "regrace off: +2048 holds piece 3, +4096 keeps old bytes -- DI-1's picture");
+	z3660_regrace_on = 1;
+
+	/* ---- 2. check on: the same late latch is caught and rewritten ---- */
+	mock_stale_reg = RR_W1; mock_stale_skip = 2; mock_stale_n = 1; mock_stale_hits = 0;
+	db = mock_doorbells[U_DISK];
+	rr_write8k( 176UL);
+	printf("       on: hits=%lu n=%lu fail=%lu reg=0x%03lX want=%lu got=%lu doorbells=+%lu\n",
+	       mock_stale_hits, z3660_regrace_n, z3660_regrace_fail, z3660_regrace_reg,
+	       z3660_regrace_want, z3660_regrace_got, mock_doorbells[U_DISK] - db);
+	CHECK( g_okay && g_status == 0 && mock_stale_hits == 1 && mock_doorbells[U_DISK] == db + 4,
+	       "regrace on: the four pieces complete GOOD, four doorbells");
+	for (all = 1, k = 0; k < 4; k++)
+		all &= memcmp( back + (176 + 4 * k) * DK_BS, rr_p[k], 4 * DK_BS) == 0;
+	CHECK( all, "regrace on: every piece at its own LBA (176/180/184/188)");
+	CHECK( z3660_regrace_n == 1 && z3660_regrace_fail == 0 && z3660_regrace_reg == RR_W1
+	       && z3660_regrace_want == 184 && z3660_regrace_got == 180,
+	       "regrace on: counted once; last = ADDR1, wrote 184, latched 180");
+
+	/* ---- 3. a late ADDR3 (buffer address) is caught too ---- */
+	mock_stale_reg = RR_W3; mock_stale_skip = 1; mock_stale_n = 1; mock_stale_hits = 0;
+	rr_write8k( 192UL);
+	for (all = 1, k = 0; k < 4; k++)
+		all &= memcmp( back + (192 + 4 * k) * DK_BS, rr_p[k], 4 * DK_BS) == 0;
+	CHECK( g_okay && mock_stale_hits == 1 && all && z3660_regrace_n == 2
+	       && z3660_regrace_reg == RR_W3 && z3660_regrace_want == (unsigned long)rr_p[1],
+	       "regrace on: a late ADDR3 on piece 2 is rewritten; every piece right");
+
+	/* ---- 4. READ side: a late READ_ADDR1 on the second request ---- */
+	mock_stale_reg = RR_R1; mock_stale_skip = 1; mock_stale_n = 1; mock_stale_hits = 0;
+	memset( buf, 0, sizeof buf);
+	pcr_rw( 0x28, 40UL, 4UL, buf);
+	pcr_rw( 0x28, 44UL, 4UL, buf + 4 * DK_BS);
+	CHECK( g_okay && mock_stale_hits == 1 && z3660_regrace_n == 3
+	       && memcmp( buf, back + 40 * DK_BS, 8 * DK_BS) == 0,
+	       "regrace on: a late READ_ADDR1 is rewritten; both pieces read the right blocks");
+
+	/* ---- 5. a register that never latches: the chunk is refused ---- */
+	memcpy( old, back + 208 * DK_BS, 4 * DK_BS);
+	mock_stale_reg = RR_W1; mock_stale_skip = 0; mock_stale_n = 100; mock_stale_hits = 0;
+	db = mock_doorbells[U_DISK];
+	rd = z3660_regrace_n;
+	pcr_rw( 0x2A, 208UL, 4UL, rr_p[0]);
+	printf("       stuck: status=0x%02X okay=%d hits=%lu n=+%lu fail=%lu doorbells=+%lu\n",
+	       g_status, g_okay, mock_stale_hits, z3660_regrace_n - rd, z3660_regrace_fail,
+	       mock_doorbells[U_DISK] - db);
+	CHECK( !g_okay && g_status == 0xff,
+	       "regrace stuck: the request fails (status 0xFF, okay FALSE -> EIO)");
+	CHECK( mock_doorbells[U_DISK] == db && memcmp( back + 208 * DK_BS, old, 4 * DK_BS) == 0,
+	       "regrace stuck: no doorbell, the medium is untouched");
+	CHECK( z3660_regrace_fail == 1 && z3660_regrace_n - rd == 5 && mock_stale_hits == 5,
+	       "regrace stuck: 5 mismatches (1 + 4 rewrites), refused once");
+
+	/* ---- 6. after the fault clears, the same request goes through ---- */
+	mock_stale_reg = 0; mock_stale_n = 0;
+	pcr_rw( 0x2A, 208UL, 4UL, rr_p[0]);
+	CHECK( g_okay && memcmp( back + 208 * DK_BS, rr_p[0], 4 * DK_BS) == 0
+	       && mock_doorbells[U_DISK] == db + 1,
+	       "regrace: the retried request lands at its LBA once the latch is right");
+
+	mock_stale_reg = 0; mock_stale_skip = mock_stale_n = mock_stale_hits = 0;
+	z3660_regrace_n = z3660_regrace_fail = 0;
+	z3660_regrace_reg = z3660_regrace_want = z3660_regrace_got = 0;
+}
+
+
+/* ====================================================================== */
 /* GATING: ZS-02 detection -- a signature the open bus cannot fake.        */
 /*                                                                         */
 /* Each cell starts from a forgotten board (z3660_test_unmap) and a fresh  */
@@ -1647,6 +1770,7 @@ int main()
 	test_f3_cache();
 	test_pagecross_ring();
 	test_fault_knob();
+	test_regrace();
 
 	stretch_cd_parity();
 

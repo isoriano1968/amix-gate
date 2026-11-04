@@ -12,7 +12,7 @@ make -C test/host clean
 
 ## What it exercises
 
-Current run: **155 gating assertions passed, 0 failed**, plus 6/6 stretch parity
+Current run: **230 gating assertions passed, 0 failed**, plus 6/6 stretch parity
 against the firmware's CD oracle.
 
 `z3660queue()` is driven with a hand-built `struct sdcom` and completes

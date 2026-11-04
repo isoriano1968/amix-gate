@@ -832,3 +832,29 @@ that it does not reproduce on a healthy bus. §1 item 5's metal step is done (§
 placement of the event is superseded (§9.6). Any prevalence detector built on §4.1's predictions
 must compare time-masked dinodes or block pointers (§9.2). §8.8's FTL ranking drops to weakened
 (§9.7).
+
+## 10. Recurrence on the A3000 and the driver check, 2026-11-04
+
+**Measured.** On 2026-11-03 the A3000 (Z3660, real 68060, fork firmware with `piscsi_reg_value`)
+showed the DI-1 picture four times in one day: inode groups 6672–6687 (the same block as DI-1),
+7680–7695, 100368–100383 and 168960–168975, each 2 KiB holding the following 2 KiB of the same
+8 KiB inode block. The following piece was unchanged against an Oct 26 image. Core 1 was running
+its own programs (GPU, video, crypto) on the shared DDR and L2, which the A4000D runs of §9.3 did
+not have. The page-cross ring of the running kernel was empty and the fault knob was off.
+
+**Why §9.8's "no driver change" no longer holds.** §8.10 assumed a driver read-back cannot see
+what core 0 latched. In the fork firmware a read of a piscsi register is served by core 0 itself:
+`rtg.c` read branch → `handle_piscsi_read()` → `piscsi_u32_read/_write[i]` (`scsi.c` ~2092),
+returned through REG5. Writes are acknowledged only after core 0 handled them. So a read-back
+returns exactly the value the doorbell will use. The firmware's own stopgap, `piscsi_reg_value()`,
+re-reads the cell until two reads 1 µs apart agree; a value that lands later than that is latched
+stale with two agreeing reads.
+
+**The check (src/z3660.c, `z3660_triple` / `z3660_regcheck`).** After each ADDR1/2/3 triple, READ
+and WRITE, the driver reads the three registers back and rewrites a mismatch, up to 4 times, then
+refuses the chunk (status 0xff, okay FALSE, no doorbell). `z3660_regrace_on/_n/_fail/_reg/_want/_got`
+are initialized `.data`, readable through /dev/kmem. Cost: three register reads per request
+(READ(10) 6 → 9 round trips, WRITE(10) 5 → 8). Host harness: a late-latch mode in the mock
+(`mock_stale_reg/_skip/_n`); gates show the DI-1 picture with the check off and every piece at its
+own LBA with it on, a late ADDR3 and a late READ_ADDR1 caught, and a register that never latches
+refused with no doorbell (230 gates pass).

@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-11-04 — DI-1 register-race check: read back the mailbox triple before every doorbell
+
+The A3000 showed the DI-1 picture four times on 2026-11-03 with core 1 loading the DDR. A read of a piscsi register is
+served by core 0 from the value it latched, so the driver now reads ADDR1/2/3 back after writing them, rewrites a
+mismatch (up to 4 times) and refuses the chunk otherwise; counters z3660_regrace_* in .data. Harness: late-latch mock,
+13 new gates, trip budget READ 9 / WRITE 8. Record: docs/DI-1-misplaced-write.md §10.
+
 ## 2026-10-13 — Publication scrub before the first push since August (40da0e8)
 
 README and a new root NOTICE carry the Amiga Corporation trademark wording. Internal report ids, scratch paths and

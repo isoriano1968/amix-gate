@@ -320,6 +320,16 @@ unsigned long	drive;
 	}
 }
 
+/* -------- late latch (DI-1 register race) -------------------------------
+ * The firmware latches a register write from the board cell at event time; if
+ * the value's AXI write has not landed, core 0 keeps the register's previous
+ * value (rtg.c piscsi_reg_value).  Here: after mock_stale_skip normal writes
+ * to register mock_stale_reg, the next mock_stale_n writes to it keep the old
+ * value.  Reads answer the latched value, as handle_piscsi_read() does.
+ */
+unsigned int	mock_stale_reg;		/* register offset; 0 = off */
+unsigned long	mock_stale_skip, mock_stale_n, mock_stale_hits;
+
 /* -------- the WRLONG / RDLONG seam (mock_regs.h) ------------------------ */
 
 void z3660_mock_wrlong( cmd, val)
@@ -333,6 +343,15 @@ unsigned long	val;
 	if (!bus_board()) {
 		bus_write( cmd, val);
 		return;
+	}
+	if (cmd == mock_stale_reg && mock_stale_n > 0) {
+		if (mock_stale_skip > 0)
+			mock_stale_skip--;
+		else {
+			mock_stale_n--;		/* latched stale: keep the old value */
+			mock_stale_hits++;
+			return;
+		}
 	}
 	if (cmd >= R_READ_ADDR1 && cmd <= R_READ_ADDR4) {
 		u32_read[(cmd - R_READ_ADDR1) / 4] = val;
@@ -424,6 +443,8 @@ void mock_reset()
 	memset( u32_write, 0, sizeof u32_write);
 	used_dma = 0;
 	g_inflight_hook = 0;
+	mock_stale_reg = 0;
+	mock_stale_skip = mock_stale_n = mock_stale_hits = 0;
 	mock_div0 = 0;
 	memset( mock_doorbells, 0, sizeof mock_doorbells);
 	mock_trips_reset();

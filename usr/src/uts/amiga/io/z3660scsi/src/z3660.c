@@ -644,6 +644,42 @@ ulong	z3660_fault_mode  = 0;			/* 0 REFUSE, 1 SHIFT           */
 ulong	z3660_fault_n     = 0;			/* times fired                 */
 long	z3660_fault_shift = 4;			/* SHIFT: blocks added, signed */
 
+/*
+ * REGISTER-RACE CHECK (DI-1, 2026-11-04).  The firmware takes a register write
+ * from an FPGA event and reads the value out of the board cell; the FPGA raises
+ * that event in the same clock it starts the AXI write of the value
+ * (docs/DI-1-misplaced-write.md §4.1).  The fork firmware re-reads the cell
+ * until two reads 1 us apart agree (rtg.c piscsi_reg_value), so a value that
+ * lands later than that is latched STALE: the previous request's block number,
+ * and the 2 KiB piece goes 4 blocks low.  On the A3000 with core 1 loading the
+ * DDR this put 48+13 inodes over their neighbours on 2026-11-03.
+ *
+ * The check: after the ADDR1/2/3 triple, read each register back.  A read of a
+ * piscsi register is answered by core 0 from the value it LATCHED
+ * (scsi.c handle_piscsi_read: piscsi_u32_read/_write[i]), not from the cell,
+ * and every write is acknowledged only after core 0 handled it -- so the read
+ * shows exactly what the doorbell will use.  On a mismatch the register is
+ * written again (the cell holds the new value by then, so even a stale re-read
+ * gives it) and read again, up to Z3660_REGRACE_TRIES times; then the chunk is
+ * refused (status 0xff, okay FALSE, no doorbell) rather than sent to the wrong
+ * LBA.  Explicitly initialized, so the cells sit in .data at fixed offsets and
+ * can be read off a running kernel through /dev/kmem.
+ *
+ *   z3660_regrace_on    1 = check (default); 0 = off, for timing comparisons
+ *   z3660_regrace_n     mismatches seen (each one rewritten)
+ *   z3660_regrace_fail  chunks refused after Z3660_REGRACE_TRIES rewrites
+ *   z3660_regrace_reg   last mismatch: register offset, value written, value
+ *   z3660_regrace_want  read back
+ *   z3660_regrace_got
+ */
+#define	Z3660_REGRACE_TRIES	4
+ulong	z3660_regrace_on   = 1;
+ulong	z3660_regrace_n    = 0;
+ulong	z3660_regrace_fail = 0;
+ulong	z3660_regrace_reg  = 0;
+ulong	z3660_regrace_want = 0;
+ulong	z3660_regrace_got  = 0;
+
 #ifndef	HOST_TEST
 #define	Z3660_CPUSHL(p)	__asm__ __volatile__( ".word 0xf468" : : "a" (p) : "memory")
 #define	Z3660_CINVL(p)	__asm__ __volatile__( ".word 0xf448" : : "a" (p) : "memory")
@@ -1330,10 +1366,61 @@ z3660_test_unmap()
 #endif	/* HOST_TEST */
 
 /*
+ * One register of a READ/WRITE triple, as the firmware latched it (see the
+ * REGISTER-RACE CHECK above): read back, rewrite on a mismatch.  0 = latched
+ * right, -1 = still wrong after Z3660_REGRACE_TRIES rewrites.
+ */
+static int
+z3660_regcheck( reg, val)
+ulong	reg, val;
+{
+	ulong	got;
+	int	i;
+
+	for (i = 0; ; ++i) {
+		got = RDLONG( reg);
+		if (got == val)
+			return 0;
+		z3660_regrace_n++;
+		z3660_regrace_reg  = reg;
+		z3660_regrace_want = val;
+		z3660_regrace_got  = got;
+		if (i == Z3660_REGRACE_TRIES)
+			break;
+		WRLONG( reg, val);
+	}
+	z3660_regrace_fail++;
+	return -1;
+}
+
+/*
+ * Load a READ or WRITE triple: ADDR1 = block, ADDR2 = byte length, ADDR3 =
+ * buffer address, at a1 = P_READ_ADDR1 or P_WRITE_ADDR1.  0 = all three
+ * latched as written, -1 = refuse this chunk.
+ */
+static int
+z3660_triple( a1, block, len, pa)
+ulong	a1, block, len, pa;
+{
+	WRLONG( a1,     block);
+	WRLONG( a1 + 4, len);
+	WRLONG( a1 + 8, pa);
+	if (!z3660_regrace_on)
+		return 0;
+	z3660_sync();			/* as S4: the writes precede the read-backs */
+	if (z3660_regcheck( a1, block) || z3660_regcheck( a1 + 4, len)
+	    || z3660_regcheck( a1 + 8, pa))
+		return -1;
+	return 0;
+}
+
+/*
  * Run one block READ or WRITE through the piscsi mailbox, chunked to <=64KB.
  * block = starting LBA, blocks = block count, bs = block size, data = buffer.
+ * 0 = done; -1 = a chunk's registers did not latch (the register-race check):
+ * that chunk and the rest were not transferred.
  */
-static void
+static int
 z3660_rw( unit, write, block, blocks, bs, data)
 int	unit, write;
 ulong	block, blocks, bs;
@@ -1389,9 +1476,8 @@ uchar	*data;
 				z3660_bounce_wr_n++;	/* unreachable on AMIX RAM */
 				bcopy( (caddr_t)data, (caddr_t)bounce, (int)len);
 			}
-			WRLONG( P_WRITE_ADDR1, block);
-			WRLONG( P_WRITE_ADDR2, len);
-			WRLONG( P_WRITE_ADDR3, pa);
+			if (z3660_triple( (ulong)P_WRITE_ADDR1, block, len, pa))
+				return -1;		/* not latched: no doorbell */
 			WRLONG( P_WRITE, unit);			/* trigger (sync) */
 			/* no completion op: TO_DEVICE never invalidates */
 		} else {
@@ -1401,9 +1487,8 @@ uchar	*data;
 			 * valid line may survive to be read instead of them.
 			 */
 			z3660_push( pa, len);
-			WRLONG( P_READ_ADDR1, block);
-			WRLONG( P_READ_ADDR2, len);
-			WRLONG( P_READ_ADDR3, pa);
+			if (z3660_triple( (ulong)P_READ_ADDR1, block, len, pa))
+				return -1;		/* not latched: no doorbell */
 			WRLONG( P_READ, unit);			/* trigger (sync) */
 			z3660_sync();		/* S4: doorbell must precede the readback */
 			z3660_dma = RDLONG( P_USED_DMA);
@@ -1429,6 +1514,7 @@ uchar	*data;
 		blocks -= chunk;
 		data   += len;
 	}
+	return 0;
 }
 
 /*
@@ -1788,13 +1874,18 @@ struct sdcom	*cp;
 			to = (long)block + z3660_fault_shift;
 			if (z3660_fault_mode == 1 && to >= 0
 			    && (ulong)to + blocks <= nb) {
-				z3660_rw( unit, write, (ulong)to, blocks, bs, data);
+				if (z3660_rw( unit, write, (ulong)to, blocks, bs, data)) {
+					cp->status = 0xff; cp->okay = FALSE;
+				}
 				break;
 			}
 			cp->status = 0xff; cp->okay = FALSE;	/* as a map failure */
 			break;
 		}
-		z3660_rw( unit, write, block, blocks, bs, data);
+		/* a refused chunk (register-race check) fails the request: EIO */
+		if (z3660_rw( unit, write, block, blocks, bs, data)) {
+			cp->status = 0xff; cp->okay = FALSE;
+		}
 		break;
 
 	default:

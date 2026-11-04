@@ -78,6 +78,15 @@ void mock_trips_reset(void);
  * firmware divides by zero; mock_doorbells[u] counts READ/WRITE triggers for
  * unit u.  Both are zeroed only by mock_reset().
  */
+/*
+ * Late latch (DI-1 register race, mock_piscsi.c): after mock_stale_skip normal
+ * writes to register mock_stale_reg (0 = off), the next mock_stale_n writes to
+ * it keep the previous value; mock_stale_hits counts them.  Reset by
+ * mock_reset().
+ */
+extern unsigned int  mock_stale_reg;
+extern unsigned long mock_stale_skip, mock_stale_n, mock_stale_hits;
+
 extern unsigned long mock_div0;
 extern unsigned long mock_doorbells[8];
 void mock_set_geom(int unit, unsigned long pdt,
