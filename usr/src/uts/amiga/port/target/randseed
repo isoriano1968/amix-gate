@@ -1,0 +1,40 @@
+#	randseed -- carry the /dev/urandom seed across reboots (src/random.c).
+#
+#	The driver seeds itself from the clock at its first open, which is
+#	guessable from the boot time.  At boot this writes the seed saved at
+#	the last shutdown, plus the process table and the date, into
+#	/dev/urandom, then saves a fresh seed at once, so a crash never
+#	reuses one.  At shutdown it saves the seed again.
+#
+#	Install as /etc/init.d/randseed, linked to /etc/rc2.d/S03randseed
+#	and /etc/rc0.d/K02randseed.  On a kernel without the driver it does
+#	nothing and keeps the old seed.
+
+SEED=/etc/random-seed
+
+save() {
+	umask 077
+	if /usr/bin/dd if=/dev/urandom of=${SEED}.new bs=512 count=1 >/dev/null 2>&1
+	then
+		/usr/bin/mv ${SEED}.new ${SEED}
+	else
+		/usr/bin/rm -f ${SEED}.new
+	fi
+}
+
+case $1 in
+'start')
+	if [ -f ${SEED} ]
+	then
+		/usr/bin/cat ${SEED} >/dev/urandom 2>/dev/null || exit 0
+	fi
+	(/usr/bin/date; /usr/bin/ps -ef) >/dev/urandom 2>/dev/null || exit 0
+	save
+	;;
+'stop')
+	save
+	;;
+*)
+	echo "usage: /etc/init.d/randseed {start|stop}"
+	;;
+esac

@@ -168,3 +168,9 @@ src/fpsp060_glue.s 972baea9b9c2	The skeleton's BSUN prelude (save, clear the NaN
 	only the destination changed, as the notice says.
 src/fpsp060_glue.s 5e52be45fead	The skeleton's FPU-disabled exit: restore d0 and make the stacked
 	PC name the faulting instruction.  The notice names the file.
+src/random.c ef98330ca40b	The SVR4 DDI open(9E) entry point in K&R form: the name list and the parameter types
+	(dev_t *, int, int, struct cred *) are fixed by cdevsw's d_open; every driver spells them alike.
+src/random.c ae30ff3a29ca	The SVR4 DDI close(9E) entry point in K&R form: (dev_t, int, int, struct cred *) are fixed
+	by cdevsw's d_close; the match ends at the body's first token.
+src/random.c 5fc64f25e962	The SVR4 DDI read(9E)/write(9E) entry points in K&R form: (dev_t, struct uio *,
+	struct cred *) are fixed by cdevsw's d_read and d_write.
