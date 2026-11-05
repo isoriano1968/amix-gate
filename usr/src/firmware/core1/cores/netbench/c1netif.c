@@ -63,6 +63,7 @@ static err_t c1_out(struct netif *n, struct pbuf *p)
     *(volatile uint32_t *)slot = p->tot_len;
     dmb();                              /* the frame before the index */
     c1n[C1NET_W_TXWR] = wr + 1;
+    c1n[C1NET_W_TXBYTES] += p->tot_len;
     return ERR_OK;
 }
 
@@ -89,6 +90,7 @@ static void c1_in(void)
         if (!p)
             continue;                   /* out of pbufs: TCP sends it again */
         pbuf_take(p, (const void *)(slot + C1NET_DATA), (u16_t)len);
+        c1n[C1NET_W_RXBYTES] += len;
         if (nif.input(p, &nif) != ERR_OK)
             pbuf_free(p);
     }
@@ -119,6 +121,8 @@ int c1net_start(void)
         return -1;                      /* firmware without C1LD_FEAT_NET */
     c1n[C1NET_W_RXRD] = c1n[C1NET_W_RXWR];      /* what came before us is not ours */
     c1n[C1NET_W_TXWR] = c1n[C1NET_W_TXRD];
+    for (int w = C1NET_W_UP; w < C1NET_W_REPORT_END; w++)
+        c1n[w] = 0;
     lwip_init();
     ip4_addr_set_zero(&z);
     netif_add(&nif, &z, &z, &z, NULL, c1_init, ethernet_input);
@@ -126,6 +130,7 @@ int c1net_start(void)
     netif_set_up(&nif);
     netif_set_link_up(&nif);
     c1n[C1NET_W_ON] = 1;
+    c1n[C1NET_W_UP] = 1;
     dhcp_start(&nif);
     started = 1;
     return 0;
@@ -149,6 +154,10 @@ void c1net_service(void)
     }
     c1_in();
     sys_check_timeouts();
+    /* the address for AMIX's monitors, as lwIP holds it (network order) */
+    c1n[C1NET_W_IP] = c1net_addr();
+    c1n[C1NET_W_NETMASK] = ip4_addr_get_u32(netif_ip4_netmask(&nif));
+    c1n[C1NET_W_GW] = ip4_addr_get_u32(netif_ip4_gw(&nif));
 }
 
 uint32_t c1net_addr(void)

@@ -1,6 +1,8 @@
 # amix: one core 1 image for AMIX -- gpu's GL server (Mesa 18.3 OSMesa +
-# softpipe), h264bench's H.264 player and decoder (FFmpeg 4.4.8) and
-# zzcrypto's public-key jobs (OpenSSL 3.5.4's libcrypto, configure-openssl-arm.sh),
+# softpipe), h264bench's H.264 player and decoder (FFmpeg 4.4.8),
+# zzcrypto's public-key jobs (OpenSSL 3.5.4's libcrypto, configure-openssl-arm.sh)
+# and core 1's own network (lwIP 2.1.3, netbench's port and c1netif.c) for the
+# streams it fetches itself (netsrc.c, libavformat's demuxers),
 # in h264bench's harness, with the heap from 0x30000000.
 # The single cores (gpu, h264bench, glbench) stay buildable on their own.
 CROSS_COMPILE ?= arm-none-eabi-
@@ -10,6 +12,8 @@ SIZE    := $(CROSS_COMPILE)size
 OBJCOPY := $(CROSS_COMPILE)objcopy
 HB      := $(abspath ../h264bench)
 GPU     := $(abspath ../gpu)
+NB      := $(abspath ../netbench)
+LWIP    ?= $(abspath ../../../../../../../upstream/Z3660-fork10)/z3660-firmware/Z-TURN/vitis_ide/design_1_wrapper/ps7_cortexa9_0/standalone_domain/bsp/ps7_cortexa9_0/libsrc/lwip213_v1_1/src/lwip-2.1.3/src
 Z3660   ?= $(abspath ../../../../../../../upstream/Z3660-beta21)
 BSP     := $(Z3660)/z3660-firmware/Z-TURN/vitis_ide/design_1_wrapper/ps7_cortexa9_1/standalone_ps7_cortexa9_1/bsp/ps7_cortexa9_1
 V       := $(abspath ../..)
@@ -22,14 +26,24 @@ CFLAGS  := $(CPU) -O2 -Wall -ffunction-sections -fdata-sections -fno-short-enums
 # FFmpeg (build-arm) has the ABI's short enums, Mesa and OpenSSL do not:
 # what uses FFmpeg's structures is built as FFmpeg, or reads AVFrame wrongly
 HBFLAGS := $(filter-out -fno-short-enums,$(CFLAGS))
+# lwIP and what uses it with FFmpeg (netsrc.c) alike: FFmpeg's enums
+NETFLAGS := $(HBFLAGS) -I$(NB) -I$(LWIP)/include
 OSSL    := $(G)/openssl-3.5.4
 LDFLAGS := $(CPU) -T $(HB)/lscript.ld -specs=$(HB)/Xilinx.spec \
            -Wl,--gc-sections,-build-id=none,-Map=build/amix.map,--no-enum-size-warning,--defsym=_HEAP_SIZE=0x07100000 -L$(BSP)/lib
-LIBS    := $(G)/build/arm/libOSMesa.a $(OSSL)/libcrypto.a $(FF)/libavcodec/libavcodec.a $(FF)/libavutil/libavutil.a \
+LIBS    := $(G)/build/arm/libOSMesa.a $(OSSL)/libcrypto.a $(FF)/libavformat/libavformat.a \
+           $(FF)/libavcodec/libavcodec.a $(FF)/libavutil/libavutil.a \
            -Wl,--start-group,-lxil,-lstdc++,-lgcc,-lm,-lc,--end-group
 
+LWIP_SRCS := $(addprefix $(LWIP)/core/,init.c def.c dns.c inet_chksum.c ip.c mem.c memp.c netif.c pbuf.c \
+             raw.c stats.c sys.c tcp.c tcp_in.c tcp_out.c timeouts.c udp.c) \
+             $(addprefix $(LWIP)/core/ipv4/,dhcp.c etharp.c icmp.c ip4.c ip4_addr.c ip4_frag.c) \
+             $(LWIP)/netif/ethernet.c
+LWIP_OBJS := $(patsubst $(LWIP)/%.c,build/lwip/%.o,$(LWIP_SRCS))
+
 OBJS    := build/arm_main.o build/amix.o build/gpu.o build/decode.o build/player.o \
-           build/zzgl_dec.o build/spook.o build/armgl_compat.o build/zzc_arm.o build/xil-crt0.o
+           build/zzgl_dec.o build/spook.o build/armgl_compat.o build/zzc_arm.o build/xil-crt0.o \
+           build/c1netif.o build/netsrc.o $(LWIP_OBJS)
 
 all: build/z3660ARM_Core_amix.bin
 
@@ -46,9 +60,21 @@ build/arm_main.o: $(HB)/arm_main.c
 	@mkdir -p build
 	$(CC) $(HBFLAGS) -DHB_HEAP_LOW -c $< -o $@
 
-build/amix.o: amix.c
+build/amix.o: amix.c $(NB)/c1netif.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -I$(NB) -c $< -o $@
+
+build/lwip/%.o: $(LWIP)/%.c $(NB)/lwipopts.h $(NB)/arch/cc.h
+	@mkdir -p $(dir $@)
+	$(CC) $(NETFLAGS) -c $< -o $@
+
+build/c1netif.o: $(NB)/c1netif.c $(NB)/c1netif.h $(NB)/lwipopts.h $(HB)/core1_net.h
+	@mkdir -p build
+	$(CC) $(NETFLAGS) -c $< -o $@
+
+build/netsrc.o: netsrc.c $(NB)/c1netif.h $(NB)/lwipopts.h $(HB)/zzav.h $(HB)/player.h
+	@mkdir -p build
+	$(CC) $(NETFLAGS) -c $< -o $@
 
 # the two jobs under their own names; amix.c's hb_decode chooses
 build/gpu.o: $(GPU)/gpu.c
@@ -74,7 +100,7 @@ $(G)/zzgl/gen/zzgl_gen_dec.h: $(G)/zzgl/zzgl.h $(G)/zzgl/gen.py
 
 build/zzc_arm.o: $(G)/zzcrypto/zzc_arm.c $(G)/zzcrypto/zzcrypto.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -I$(OSSL)/include -c $< -o $@
+	$(CC) $(CFLAGS) -I$(OSSL)/include -Dhb_service=zzc_service -c $< -o $@
 
 build/spook.o: $(G)/zzgl/spook.c $(G)/zzgl/spook_font.h
 	@mkdir -p build

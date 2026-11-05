@@ -32,6 +32,20 @@ enum {
    C1NET_W_NWORDS
 };
 
+/* core 1's own report, for AMIX's monitors (libamixstat); core 0 does not
+   touch these, a core 1 image clears them when it starts.  IP, NETMASK and GW
+   are in network order (read as a big-endian word on the 68k: a.b.c.d is
+   0xaabbccdd), the rest are little-endian like the words above. */
+enum {
+   C1NET_W_UP = 32,     /* 1 while a core with the network runs (DHCP may still be asking) */
+   C1NET_W_IP,          /* DHCP's address, 0 none yet */
+   C1NET_W_NETMASK,
+   C1NET_W_GW,
+   C1NET_W_RXBYTES,     /* frames' bytes taken / sent by core 1, wrapping */
+   C1NET_W_TXBYTES,
+   C1NET_W_REPORT_END
+};
+
 #define C1NET_SLOT         2048UL
 #define C1NET_DATA         64UL            /* the frame's offset in a slot (cache line, GEM DMA) */
 #define C1NET_RX_OFF       (C1NET_OFF + 0x10000UL)

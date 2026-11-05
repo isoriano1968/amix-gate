@@ -17,4 +17,14 @@ uint32_t pl_audio_pos(void);            /* bytes the audio DMA is into the sound
 /* play what ZZAV_CMD_OPEN set up, until ZZAV_CMD_CLOSE */
 int player_run(void);
 
+/* core 1's own streams (cores/amix/netsrc.c, in the cores that have it): the
+   player takes its packets from pl_net_pull instead of the 68k's ring when
+   OPEN follows a successful OPEN_URL; pl_net_pull gives them with these */
+void pl_net_pull(void) __attribute__((weak));
+struct AVPacket;
+int player_room(void);                          /* the queues take more */
+void player_queue(int video, struct AVPacket *p);       /* the player frees it */
+void player_end(void);                          /* no more packets */
+void player_keep(void);                         /* the sound, while netsrc waits */
+
 #endif

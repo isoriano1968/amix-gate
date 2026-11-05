@@ -97,6 +97,7 @@ static AVFrame *vframe, *aframe;
 static double vtb, atb;
 static uint32_t rd, ring_size;
 static int eof_in, vflushed, vdone, aflushed, adone;
+static int src_net, running;            /* packets from netsrc.c, not the ring; in player_run */
 
 /* ---- the ring ---- */
 
@@ -149,6 +150,39 @@ static void pull_ring(void)
     }
     if (rd == wr && get(ZZAV_W_EOF))
         eof_in = 1;
+}
+
+/* ---- packets from core 1's own stream (cores/amix/netsrc.c) ---- */
+
+int player_room(void)
+{
+    return vq.bytes < VQ_BYTES_MAX && aq.n < AQ_MAX;
+}
+
+/* a packet in the stream's time base: the player's from now on */
+void player_queue(int video, AVPacket *p)
+{
+    if ((video && !vctx) || (!video && !actx)) {
+        av_packet_free(&p);
+        return;
+    }
+    pq_put(video ? &vq : &aq, p);
+    put(video ? ZZAV_W_VPKTS : ZZAV_W_APKTS, get(video ? ZZAV_W_VPKTS : ZZAV_W_APKTS) + 1);
+}
+
+void player_end(void)
+{
+    eof_in = 1;
+}
+
+static int audio_on;                    /* below, with the sound */
+static void audio_service(void);
+
+/* while netsrc waits for the network inside a read: the sound goes on */
+void player_keep(void)
+{
+    if (running && audio_on)
+        audio_service();
 }
 
 /* ---- sound ---- */
@@ -718,6 +752,8 @@ int player_run(void)
 
     blk = (volatile uint32_t *)(pl_board + ZZAV_OFF);
     c1ld = (volatile uint32_t *)(pl_board + C1LD_OFF);
+    /* OPEN after OPEN_URL: core 1 fetched the stream, netsrc.c gives the packets */
+    src_net = get(ZZAV_W_STATE) == ZZAV_READY && pl_net_pull;
     dbuf = get(ZZAV_W_OVL_DBUF) != 0;
     if (dbuf)
         c1ld[C1LD_W_FLIP] = 0;
@@ -774,6 +810,7 @@ int player_run(void)
     wr_abs = dma_abs + PERIOD;
     put(ZZAV_W_STATE, ZZAV_PLAYING);
     put(ZZAV_W_CMD, ZZAV_CMD_NONE);
+    running = 1;
 
     t_pass = now_ticks();
     idle_ticks = 0;
@@ -798,7 +835,10 @@ int player_run(void)
                 audio_service();
             continue;
         }
-        pull_ring();
+        if (src_net)
+            pl_net_pull();
+        else
+            pull_ring();
         audio_decode();
         if (audio_on)
             audio_service();
@@ -939,6 +979,7 @@ int player_run(void)
             (!audio_on || get(ZZAV_W_ALEAD_MS) <= (LEAD_MIN + PERIOD) * 1000 / (RATE * FRAME_BYTES)))   /* only silence ahead */
             put(ZZAV_W_STATE, ZZAV_FINISHED);
     }
+    running = 0;
     cleanup();
     put(ZZAV_W_STATE, ZZAV_IDLE);
     put(ZZAV_W_CMD, ZZAV_CMD_NONE);

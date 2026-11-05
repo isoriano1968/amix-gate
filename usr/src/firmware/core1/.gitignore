@@ -17,3 +17,4 @@ cores/*/build/
 *.elf
 *.map
 *.log
+/tools/c1net

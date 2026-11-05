@@ -35,9 +35,12 @@
 
 /* ZZAV_W_CMD, written by the 68k; core 1 sets it back to 0 when taken */
 enum { ZZAV_CMD_NONE, ZZAV_CMD_OPEN, ZZAV_CMD_CLOSE,
-       ZZAV_CMD_PROBE };                /* idle only: sample the audio formatter into ZZAV_PROBE_OFF */
+       ZZAV_CMD_PROBE,                  /* idle only: sample the audio formatter into ZZAV_PROBE_OFF */
+       ZZAV_CMD_OPEN_URL };             /* idle only: core 1 fetches the stream itself (below) */
 /* ZZAV_W_STATE */
-enum { ZZAV_IDLE, ZZAV_PLAYING, ZZAV_FINISHED, ZZAV_ERROR };
+enum { ZZAV_IDLE, ZZAV_PLAYING, ZZAV_FINISHED, ZZAV_ERROR,
+       ZZAV_OPENING,                    /* OPEN_URL taken: connecting, probing, seeking */
+       ZZAV_READY };                    /* OPEN_URL done: the stream words are set, OPEN plays it */
 /* ZZAV_W_ACODEC / ZZAV_W_VCODEC */
 enum { ZZAV_NONE, ZZAV_H264, ZZAV_AAC };
 
@@ -76,8 +79,40 @@ enum {
     ZZAV_W_SHOW_US,                             /* the last second's average conversion into the overlay */
     ZZAV_W_DISPW,                               /* 68k: the picture's width shown at full size: the coded
                                                    width times the sample aspect ratio; 0 = as coded */
+    /* core 1's own streams (ZZAV_CMD_OPEN_URL, cores/amix/netsrc.c) */
+    ZZAV_W_FEAT,                                /* core 1, at start: ZZAV_FEAT_* */
+    ZZAV_W_START_MS,                            /* 68k: OPEN_URL starts here, ms after the stream's start */
+    ZZAV_W_DUR_MS,                              /* core 1: the stream's length, 0 unknown (live) */
+    ZZAV_W_T0_MS,                               /* core 1: the stream's first time (position = CLOCK_MS - T0_MS) */
+    ZZAV_W_SAR_NUM, ZZAV_W_SAR_DEN,             /* core 1: the picture's sample aspect ratio, 0 unknown */
+    ZZAV_W_SEEKABLE,                            /* core 1: 1 if the server seeks (HTTP Range) */
+    ZZAV_W_HTTP,                                /* core 1: the last HTTP status */
+    ZZAV_W_BUF_MS,                              /* core 1: media time demuxed beyond the clock */
+    ZZAV_W_NET_KBS,                             /* core 1: the download over the last second, KB/s */
+    ZZAV_W_NET_KB,                              /* core 1: KB fetched since OPEN_URL */
     ZZAV_W_NWORDS
 };
+
+/*
+ * ZZAV_CMD_OPEN_URL: the 68k writes the URL (http://host[:port]/path, NUL-ended)
+ * at ZZAV_URL_OFF and ZZAV_W_START_MS, then the command.  Core 1 says
+ * ZZAV_OPENING, fetches, probes and seeks, sets the stream words as the 68k
+ * does for its own ring (codecs, extradata, time bases, size; DUR_MS, T0_MS,
+ * SAR, SEEKABLE) and says ZZAV_READY, or ZZAV_ERROR with ZZAV_W_ERR one of
+ * ZZAV_NETERR_*.  The 68k then sets the overlay up and sends ZZAV_CMD_OPEN as
+ * for its ring; CLOSE stops as always.  OPEN_URL with the same URL again only
+ * seeks.  CLOSE when READY or ERROR: back to IDLE.
+ */
+#define ZZAV_URL_OFF        (ZZAV_OFF + 0x400UL)
+#define ZZAV_URL_MAX        3072
+#define ZZAV_FEAT_URL       1                   /* ZZAV_W_FEAT: OPEN_URL */
+enum { ZZAV_NETERR_URL = 0x201,                 /* not http://host[:port]/path */
+       ZZAV_NETERR_NONET,                       /* no address from DHCP (or the firmware has no rings) */
+       ZZAV_NETERR_DNS, ZZAV_NETERR_CONNECT,
+       ZZAV_NETERR_HTTP,                        /* not 200/206: ZZAV_W_HTTP */
+       ZZAV_NETERR_FORMAT,                      /* libavformat does not know it */
+       ZZAV_NETERR_STREAMS,                     /* no H.264 video and no AAC sound */
+       ZZAV_NETERR_TIMEOUT, ZZAV_NETERR_MEM };
 
 /* ZZAV_CMD_PROBE's result: words at this offset (big-endian):
    [0] 0x50524F42 "PROB" when done, [1] n, [2] interval in us, [3..7] the formatter's MM2S

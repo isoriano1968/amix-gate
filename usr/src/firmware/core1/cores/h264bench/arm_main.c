@@ -60,6 +60,18 @@ __attribute__((weak)) void hb_service(void)
 {
 }
 
+/* core 1's own streams (cores/amix/netsrc.c, in the cores that have it):
+   ZZAV_CMD_OPEN_URL, and what ZZAV_W_FEAT says */
+__attribute__((weak)) uint32_t pl_features(void)    /* a function: a weak const is folded to its 0 */
+{
+    return 0;
+}
+__attribute__((weak)) void pl_open_url(void)
+{
+    ((volatile uint32_t *)(RTG_BASE + ZZAV_OFF))[ZZAV_W_ERR] = __builtin_bswap32(ZZAV_NETERR_NONET);
+    ((volatile uint32_t *)(RTG_BASE + ZZAV_OFF))[ZZAV_W_STATE] = __builtin_bswap32(ZZAV_ERROR);
+}
+
 /*
  * The heap.  Built with HB_HEAP_LOW it starts below the image, in core 1's
  * own DDR from 0x30000000 (the Z3660's memory map gives core 1
@@ -404,7 +416,15 @@ int main(void)
     put(W_TICK_HZ, pl_tick_hz);
     ((volatile uint32_t *)(RTG_BASE + ZZAV_OFF))[ZZAV_W_CMD] = 0;
     ((volatile uint32_t *)(RTG_BASE + ZZAV_OFF))[ZZAV_W_STATE] = 0;
+    ((volatile uint32_t *)(RTG_BASE + ZZAV_OFF))[ZZAV_W_FEAT] = __builtin_bswap32(pl_features());
     ((volatile uint32_t *)(RTG_BASE + ZZAV_OFF))[ZZAV_W_MAGIC] = __builtin_bswap32(ZZAV_MAGIC);
+    /* core 1's network is off until this image's c1netif starts it (one without
+       it would leave core 0 putting our frames into a ring nobody empties) */
+    if (((volatile uint32_t *)(RTG_BASE + C1NET_OFF))[C1NET_W_MAGIC] == C1NET_MAGIC) {
+        ((volatile uint32_t *)(RTG_BASE + C1NET_OFF))[C1NET_W_ON] = 0;
+        for (i = C1NET_W_UP; i < C1NET_W_REPORT_END; i++)
+            ((volatile uint32_t *)(RTG_BASE + C1NET_OFF))[i] = 0;
+    }
     ((volatile uint32_t *)(RTG_BASE + ZC_BLK_OFF))[ZC_W_MAGIC] = 0;   /* a core without zzcrypto */
     put(W_MAGIC, HB_MAGIC_READY);
     put(W_STAGE, 5);
@@ -423,6 +443,20 @@ int main(void)
             put(W_STATE, HB_IDLE);
             win_start = ticks();
             win_idle = 0;
+            continue;
+        }
+        if (__builtin_bswap32(((volatile uint32_t *)(RTG_BASE + ZZAV_OFF))[ZZAV_W_CMD]) == ZZAV_CMD_OPEN_URL) {
+            put(W_STATE, HB_RUNNING);
+            /* taken first: a CLOSE while it opens stays for pl_open_url to see */
+            ((volatile uint32_t *)(RTG_BASE + ZZAV_OFF))[ZZAV_W_CMD] = 0;
+            pl_open_url();              /* says OPENING, then READY, ERROR, or IDLE if CLOSEd */
+            put(W_STATE, HB_IDLE);
+            continue;
+        }
+        if (__builtin_bswap32(((volatile uint32_t *)(RTG_BASE + ZZAV_OFF))[ZZAV_W_CMD]) == ZZAV_CMD_CLOSE) {
+            /* not playing: a stream opened (READY) or failed and not played */
+            ((volatile uint32_t *)(RTG_BASE + ZZAV_OFF))[ZZAV_W_STATE] = __builtin_bswap32(ZZAV_IDLE);
+            ((volatile uint32_t *)(RTG_BASE + ZZAV_OFF))[ZZAV_W_CMD] = 0;
             continue;
         }
         if (__builtin_bswap32(((volatile uint32_t *)(RTG_BASE + ZZAV_OFF))[ZZAV_W_CMD]) == ZZAV_CMD_PROBE) {

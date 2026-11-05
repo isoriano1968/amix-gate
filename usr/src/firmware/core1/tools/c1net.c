@@ -20,6 +20,7 @@
 #include <sys/time.h>
 #include "../cores/h264bench/bench.h"
 #include "../cores/h264bench/core1_net.h"
+#include "../cores/h264bench/zzav.h"
 
 #define FB_PHYS 0x00200000UL    /* /dev/zz9000 offset 0 = board + 2 MB */
 #define PAGE    4096UL
@@ -75,6 +76,18 @@ int main(int argc, char **argv)
         }
         for (i = 0; i < C1NET_W_NWORDS; i++)
             printf("%-9s %08lx  %lu\n", names[i], le(w[i]), le(w[i]));
+        /* core 1's own report: addresses in network order (big-endian here) */
+        printf("up        %lu\n", le(w[C1NET_W_UP]));
+        for (i = C1NET_W_IP; i <= C1NET_W_GW; i++)
+            printf("%-9s %lu.%lu.%lu.%lu\n", i == C1NET_W_IP ? "ip" : i == C1NET_W_NETMASK ? "netmask" : "gw",
+                   w[i] >> 24, w[i] >> 16 & 255, w[i] >> 8 & 255, w[i] & 255);
+        printf("rxbytes   %lu\ntxbytes   %lu\n", le(w[C1NET_W_RXBYTES]), le(w[C1NET_W_TXBYTES]));
+        {
+            volatile unsigned long *z = (volatile unsigned long *)map(fd, ZZAV_OFF, PAGE);
+
+            if (z)
+                printf("player    magic %08lx state %lu feat %lu\n", z[ZZAV_W_MAGIC], z[ZZAV_W_STATE], z[ZZAV_W_FEAT]);
+        }
         return 0;
     }
     cmd[0] = 0;
