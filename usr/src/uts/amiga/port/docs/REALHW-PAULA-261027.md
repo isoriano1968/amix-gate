@@ -50,3 +50,19 @@ loops alone, 66 854 next to `poll`, 67 292 next to `sleep`). `ps` TIME of a prog
 - The DMA-off → on and on → loop waits are 5 scanlines each; no module with very low periods was
   tested for clicks.
 - `tools/check-verbatim.py` could not run on this machine (no reference trees, exit 2).
+
+## Defect found the same day: a second opener of /dev/audio
+
+**HW.** `/dev/audio` (c 46,0) is one STREAMS device, not a clone, so every opener shares one
+stream. STREAMS runs the driver's open on every `open()` of that stream but its close only on the
+last close, and the stock open hands each call a new client and points the stream at it. A test
+probe that opened `/dev/audio` while mikmod played through it (drv_amix) therefore took mikmod's
+stream over, and `audio_nopen`, counted on that open, was never counted down: `/dev/paula` then
+answered EBUSY to everyone until a reboot. Read from the running kernel: `paula.c`'s own `busy`
+was 0, so the refusal came from `audio_nopen`.
+
+Fix (`patch_audio_paula.py`): `audioopen()` refuses a stream that is already open (EBUSY). Kernel
+`a3k-kv16-ser-z3-rtg-hya-con-aud-paula2-c1u0`, build id `68040-261027-ia`, booted natively.
+Retest: mikmod with an 8-channel module then a 4-channel one logged `8 channels on amix`,
+`4 channels on paula`; `/dev/paula` free afterwards (paulatest: `/dev/audio` EBUSY while it is
+open, scale played).

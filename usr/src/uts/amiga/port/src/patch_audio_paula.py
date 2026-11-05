@@ -16,6 +16,17 @@ The count goes up where a client joins the client list in audioopen() and
 down where it leaves the list in audioclose().  Both run in process
 context on a uniprocessor kernel, so a plain int is enough.
 
+/dev/audio (c 46,0) is one STREAMS device, not a clone: every process
+that opens it shares one stream.  STREAMS calls audioopen() on every
+open() of that stream but audioclose() only on its last close, and the
+stock audioopen() gives each call a new client and points the stream at
+it.  A second opener therefore took the first one's stream over, and
+once counted here, it was never counted down: audio_nopen stuck at 1 and
+/dev/paula refused everyone until a reboot (2026-10-27, a test probe
+opening /dev/audio while mikmod played).  So audioopen() now refuses a
+stream that is already open (EBUSY): one client at a time, which is all
+one stream can carry, and the count stays exact.
+
 The source is Commodore's and is not in this repository, and neither is
 any of its text: every place is found by a fingerprint (linepatch.py)
 and only our own lines go in after it.
@@ -32,6 +43,8 @@ PLACES = [
     ]),
     ('audioopen MODOPEN test', 2, '50f82981f433b6f645666ff58c60ed12b0ad392a13fe55d188792c1e55c8eafc', 2, 0, [
         "    if (paula_busy)",
+        "\treturn EBUSY;",
+        "    if (q->q_ptr != NULL)\t/* the one stream is someone's already */",
         "\treturn EBUSY;",
     ]),
     ('audioopen list insert', 1, '6d4aa0e4693fbd2dc350b1a03f9053e937b5b6a6acf6ca2637af6d769cd3d446', 1, 0, [
