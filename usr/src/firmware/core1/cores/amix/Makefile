@@ -30,7 +30,7 @@ HBFLAGS := $(filter-out -fno-short-enums,$(CFLAGS))
 NETFLAGS := $(HBFLAGS) -I$(NB) -I$(LWIP)/include
 OSSL    := $(G)/openssl-3.5.4
 LDFLAGS := $(CPU) -T $(HB)/lscript.ld -specs=$(HB)/Xilinx.spec \
-           -Wl,--gc-sections,-build-id=none,-Map=build/amix.map,--no-enum-size-warning,--defsym=_HEAP_SIZE=0x07100000 -L$(BSP)/lib
+           -Wl,--gc-sections,-build-id=none,-Map=build/amix.map,--no-enum-size-warning,--defsym=_HEAP_SIZE=0x07000000 -L$(BSP)/lib
 LIBS    := $(G)/build/arm/libOSMesa.a $(OSSL)/libcrypto.a $(FF)/libavformat/libavformat.a \
            $(FF)/libavcodec/libavcodec.a $(FF)/libavutil/libavutil.a \
            -Wl,--start-group,-lxil,-lstdc++,-lgcc,-lm,-lc,--end-group

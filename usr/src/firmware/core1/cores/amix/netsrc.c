@@ -44,7 +44,7 @@
 
 uint32_t pl_features(void)
 {
-    return ZZAV_FEAT_URL;
+    return ZZAV_FEAT_URL | ZZAV_FEAT_SOUND;
 }
 
 static volatile uint32_t *blk;
@@ -574,6 +574,21 @@ static void close_stream(void)
     vs = as = -1;
 }
 
+/* the player's code for a sound codec core 1 decodes, ZZAV_NONE for others */
+static uint32_t acode(enum AVCodecID id)
+{
+    switch (id) {
+    case AV_CODEC_ID_AAC: return ZZAV_AAC;
+    case AV_CODEC_ID_AC3: return ZZAV_AC3;
+    case AV_CODEC_ID_EAC3: return ZZAV_EAC3;
+    case AV_CODEC_ID_DTS: return ZZAV_DTS;
+    case AV_CODEC_ID_MP3: return ZZAV_MP3;
+    case AV_CODEC_ID_MP2: return ZZAV_MP2;
+    case AV_CODEC_ID_VORBIS: return ZZAV_VORBIS;
+    default: return ZZAV_NONE;
+    }
+}
+
 static void put_stream_words(void)
 {
     AVStream *v = vs >= 0 ? fmt->streams[vs] : NULL, *a = as >= 0 ? fmt->streams[as] : NULL;
@@ -595,7 +610,7 @@ static void put_stream_words(void)
         put(ZZAV_W_SAR_DEN, (uint32_t)(c->sample_aspect_ratio.num > 0 ? c->sample_aspect_ratio.den : 0));
         vtb_ms = 1000.0 * v->time_base.num / v->time_base.den;
     }
-    put(ZZAV_W_ACODEC, a ? ZZAV_AAC : ZZAV_NONE);
+    put(ZZAV_W_ACODEC, a ? acode(a->codecpar->codec_id) : ZZAV_NONE);
     put(ZZAV_W_AEXTRA_LEN, 0);
     if (a) {
         AVCodecParameters *c = a->codecpar;
@@ -677,8 +692,11 @@ static int open_stream(const char *url)
 
         if (vs < 0 && c->codec_id == AV_CODEC_ID_H264 && c->width > 0)
             vs = i;
-        else if (as < 0 && c->codec_id == AV_CODEC_ID_AAC && c->sample_rate > 0 && c->channels > 0)
-            as = i;
+        else if (c->codec_type == AVMEDIA_TYPE_AUDIO && acode(c->codec_id) != ZZAV_NONE &&
+                 c->sample_rate > 0 && c->channels > 0 &&
+                 (as < 0 || (fmt->streams[i]->disposition & AV_DISPOSITION_DEFAULT &&
+                             !(fmt->streams[as]->disposition & AV_DISPOSITION_DEFAULT))))
+            as = i;                     /* the first one, or the one marked default */
     }
     for (i = 0; i < (int)fmt->nb_streams; i++)
         fmt->streams[i]->discard = i == vs || i == as ? AVDISCARD_DEFAULT : AVDISCARD_ALL;

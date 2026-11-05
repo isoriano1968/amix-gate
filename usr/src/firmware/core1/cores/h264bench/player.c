@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/mem.h>
+#include <libavutil/channel_layout.h>
 #include "zzav.h"
 #include "bench.h"
 #include "player.h"
@@ -372,16 +373,95 @@ static int16_t s16(float v)
 }
 
 /* resample one decoded frame into pcm (linear: good enough against AAC's own filtering) */
+/* one sample of channel ch, as a float, from any of the decoders' formats */
+static float smp(const AVFrame *f, int ch, int i)
+{
+    switch (f->format) {
+    case AV_SAMPLE_FMT_FLTP: return ((const float *)f->extended_data[ch])[i];
+    case AV_SAMPLE_FMT_FLT:  return ((const float *)f->extended_data[0])[i * f->channels + ch];
+    case AV_SAMPLE_FMT_S16P: return ((const int16_t *)f->extended_data[ch])[i] * (1.0f / 32768);
+    case AV_SAMPLE_FMT_S16:  return ((const int16_t *)f->extended_data[0])[i * f->channels + ch] * (1.0f / 32768);
+    case AV_SAMPLE_FMT_S32P: return ((const int32_t *)f->extended_data[ch])[i] * (1.0f / 2147483648.0f);
+    case AV_SAMPLE_FMT_S32:  return ((const int32_t *)f->extended_data[0])[i * f->channels + ch] * (1.0f / 2147483648.0f);
+    default: return 0;
+    }
+}
+
+/* the frame down to stereo: front left/right, the centre and the surrounds at
+   -3 dB to their side, no LFE, scaled so the sum cannot clip (a film's 5.1:
+   the dialogue is in the centre) */
+static float *mixl, *mixr;
+static int mix_n;
+
+static int downmix(const AVFrame *f, const float **l, const float **r)
+{
+    float wl[16], wr[16], sl = 0, sr = 0, norm;
+    const int ch = f->channels < 16 ? f->channels : 16, n = f->nb_samples;
+    uint64_t layout = f->channel_layout ? f->channel_layout : (uint64_t)av_get_default_channel_layout(ch);
+    int c, i;
+
+    if (f->format == AV_SAMPLE_FMT_FLTP && ch <= 2) {   /* the common case: as it is */
+        *l = (const float *)f->extended_data[0];
+        *r = ch > 1 ? (const float *)f->extended_data[1] : *l;
+        return 0;
+    }
+    if (n > mix_n) {
+        free(mixl);
+        free(mixr);
+        mixl = malloc(n * sizeof *mixl);
+        mixr = malloc(n * sizeof *mixr);
+        mix_n = mixl && mixr ? n : 0;
+        if (!mix_n)
+            return -1;
+    }
+    for (c = 0; c < ch; c++) {
+        uint64_t b = av_channel_layout_extract_channel(layout, c);
+
+        wl[c] = wr[c] = 0;
+        if (ch == 1)
+            wl[c] = wr[c] = 1;
+        else if (b == AV_CH_FRONT_LEFT)
+            wl[c] = 1;
+        else if (b == AV_CH_FRONT_RIGHT)
+            wr[c] = 1;
+        else if (b == AV_CH_LOW_FREQUENCY)
+            ;
+        else if (b == AV_CH_SIDE_LEFT || b == AV_CH_BACK_LEFT || b == AV_CH_FRONT_LEFT_OF_CENTER)
+            wl[c] = 0.7071f;
+        else if (b == AV_CH_SIDE_RIGHT || b == AV_CH_BACK_RIGHT || b == AV_CH_FRONT_RIGHT_OF_CENTER)
+            wr[c] = 0.7071f;
+        else
+            wl[c] = wr[c] = 0.7071f;    /* the centres */
+        sl += wl[c];
+        sr += wr[c];
+    }
+    norm = sl > sr ? sl : sr;
+    norm = norm > 1 ? 1 / norm : 1;
+    for (i = 0; i < n; i++) {
+        float a = 0, b = 0;
+
+        for (c = 0; c < ch; c++) {
+            const float v = smp(f, c, i);
+
+            a += wl[c] * v;
+            b += wr[c] * v;
+        }
+        mixl[i] = a * norm;
+        mixr[i] = b * norm;
+    }
+    *l = mixl;
+    *r = mixr;
+    return 0;
+}
+
 static void audio_add(AVFrame *f)
 {
     const float *l, *r;
     float lv[2];
     int n = f->nb_samples, i0;
 
-    if (f->format != AV_SAMPLE_FMT_FLTP || n <= 0)
+    if (n <= 0 || f->channels <= 0 || downmix(f, &l, &r) < 0)
         return;
-    l = (const float *)f->extended_data[0];
-    r = f->channels > 1 ? (const float *)f->extended_data[1] : l;
     if (!pcm_valid) {
         pcm_valid = 1;
         pcm_t0 = f->best_effort_timestamp != AV_NOPTS_VALUE ? f->best_effort_timestamp * atb : 0;
@@ -452,12 +532,112 @@ static void audio_decode(void)
 /* called by the H.264 decoder as rows of a picture are done */
 static uint64_t last_service;
 
+static volatile uint32_t *c1ld;         /* below, with the overlay */
+static int dbuf;
+static void flip(void);
+
+/* ---- when a picture reaches the screen ----
+ * Frames are decoded ahead into a queue (NQ), the next one is drawn into the
+ * overlay's back buffer as soon as that is free (right after the last flip),
+ * and the flip is asked for half a refresh before the frame's time: core 0
+ * makes it at the next vblank, the one nearest the time stamp.  The check runs
+ * in the main loop and in the decoder's band callback, so a long decode does
+ * not push a frame off its refresh: 25 fps at 60 Hz then shows 2,3,2,3
+ * refreshes, as a PC's player does, not 2,3,3,2,4.
+ * A flip asked for the buffer already shown changes nothing but is still taken
+ * (cleared) at the vblank: that measures the refresh period. */
+#define NQ 4
+static AVFrame *fq[NQ];                 /* decoded, not drawn yet; [0] next */
+static double fq_pts[NQ];
+static int nq;
+static int ready, ready_key;            /* the back buffer holds the next frame */
+static double ready_pts;
+static int flip_req, paused_now, new_lag;
+static uint64_t t_req, t_take;
+static double refresh = 1.0 / 60, lag_last;
+static uint32_t cad[5];                 /* frames by refreshes on the screen: 1, 2, 3, 4+ */
+static int clock_started;
+static double t_start_media;
+static uint64_t t_start, t_pause, paused_ticks;
+
+static double clock_now(uint64_t t)
+{
+    if (audio_on)
+        return pcm_valid || seg_n ? audio_clock() : -1;
+    return clock_started ? t_start_media + secs((t_pause ? t_pause : t) - t_start - paused_ticks) : -1;
+}
+
+/* the flip asked for has been made (core 0 cleared the word at a vblank) */
+static void flip_poll(uint64_t t)
+{
+    int n;
+
+    if (!flip_req || (dbuf && c1ld[C1LD_W_FLIP] != 0 && t - t_req < pl_tick_hz / 10))
+        return;
+    if (t_take && !paused_now) {            /* how long the last frame stayed */
+        n = (int)(secs(t - t_take) / refresh + 0.5);
+        cad[n < 1 ? 1 : n > 4 ? 4 : n]++;
+    }
+    t_take = paused_now ? 0 : t;
+    flip_req = 0;
+}
+
+/* the frame in the back buffer is due: ask for the flip */
+static void flip_due(uint64_t t)
+{
+    double clk;
+
+    if (!ready || flip_req || paused_now)
+        return;
+    clk = clock_now(t);
+    if (clk < 0 || clk < ready_pts - refresh / 2)
+        return;
+    flip();
+    flip_req = 1;
+    t_req = t;
+    ready = 0;
+    lag_last = clk - ready_pts;
+    new_lag = 1;
+    put(ZZAV_W_SHOWN, get(ZZAV_W_SHOWN) + 1);
+}
+
+/* the refresh period, from three vblanks (a flip to the buffer shown) */
+static void measure_refresh(void)
+{
+    uint64_t tv[4], t0;
+    double best = 0;
+    int i;
+
+    if (!dbuf)
+        return;
+    for (i = 0; i < 4; i++) {
+        c1ld[C1LD_W_FLIP] = c1ld[C1LD_W_FRONT];
+        for (t0 = now_ticks(); c1ld[C1LD_W_FLIP] != 0 && now_ticks() - t0 < pl_tick_hz / 10; )
+            ;
+        if (c1ld[C1LD_W_FLIP] != 0) {           /* no vblank: the overlay is off */
+            c1ld[C1LD_W_FLIP] = 0;
+            return;
+        }
+        tv[i] = now_ticks();
+    }
+    for (i = 1; i < 4; i++) {
+        double d = secs(tv[i] - tv[i - 1]);
+
+        if (d > 0.012 && d < 0.05 && (best == 0 || d < best))
+            best = d;
+    }
+    if (best > 0)
+        refresh = best;
+}
+
 static void hband(struct AVCodecContext *s, const AVFrame *src, int offset[AV_NUM_DATA_POINTERS],
                   int y, int type, int height)
 {
     uint64_t t = now_ticks();
 
     (void)s; (void)src; (void)offset; (void)y; (void)type; (void)height;
+    flip_poll(t);
+    flip_due(t);
     if (audio_on && t - last_service > pl_tick_hz / 100) {
         last_service = t;
         audio_service();
@@ -503,12 +683,6 @@ static uint32_t ovl_back(void)
     if (!dbuf)
         return ZZAV_OVL_OFF;
     return __builtin_bswap32(c1ld[C1LD_W_FRONT]) == 2 ? ZZAV_OVL_OFF : ZZAV_OVL_OFF1;
-}
-
-/* a flip asked for and not taken yet: the next frame waits (at most 50 ms) */
-static int flip_pending(void)
-{
-    return dbuf && c1ld[C1LD_W_FLIP] != 0;
 }
 
 static void flip(void)
@@ -678,7 +852,7 @@ static void show(AVFrame *f)
         if ((y & 31) == 31)
             hband(NULL, NULL, NULL, 0, 0, 0);
     }
-    flip();
+    /* the flip: flip_due(), at the frame's time */
 }
 
 /* ---- the whole ---- */
@@ -730,6 +904,9 @@ static void cleanup(void)
     avcodec_free_context(&vctx);
     avcodec_free_context(&actx);
     av_frame_free(&vframe);
+    for (int i = 0; i < NQ; i++)
+        av_frame_free(&fq[i]);
+    nq = ready = flip_req = 0;
     av_frame_free(&aframe);
     free(pcm);
     free(line);
@@ -741,12 +918,11 @@ static void cleanup(void)
 
 int player_run(void)
 {
-    int have_frame = 0, skip = 0, shown_any = 0;
-    double vpts = 0, vdur = 0.04, t_start_media = 0, lag = 0;
-    uint64_t t_start = 0, t_pause = 0, paused_ticks = 0, t_report = 0, t_skip = 0;
+    int skip = 0, shown_any = 0, i;
+    double vpts = 0, vdur = 0.04, lag = 0;
+    uint64_t t_report = 0, t_skip = 0;
     uint64_t dec_ticks = 0;
     uint32_t dec_n = 0;
-    int clock_started = 0;
     uint64_t t_first = 0, t_shown = 0, show_ticks = 0;
     uint32_t show_n = 0;
 
@@ -781,13 +957,31 @@ int player_run(void)
     vtb = get(ZZAV_W_VTB_DEN) ? (double)get(ZZAV_W_VTB_NUM) / get(ZZAV_W_VTB_DEN) : 0;
     atb = get(ZZAV_W_ATB_DEN) ? (double)get(ZZAV_W_ATB_NUM) / get(ZZAV_W_ATB_DEN) : 0;
     vctx = get(ZZAV_W_VCODEC) == ZZAV_H264 ? open_codec(AV_CODEC_ID_H264, ZZAV_VEXTRA_OFF, get(ZZAV_W_VEXTRA_LEN)) : NULL;
-    actx = get(ZZAV_W_ACODEC) == ZZAV_AAC ? open_codec(AV_CODEC_ID_AAC, ZZAV_AEXTRA_OFF, get(ZZAV_W_AEXTRA_LEN)) : NULL;
+    {
+        static const enum AVCodecID aid[] = { AV_CODEC_ID_NONE, AV_CODEC_ID_NONE, AV_CODEC_ID_AAC,
+            AV_CODEC_ID_AC3, AV_CODEC_ID_EAC3, AV_CODEC_ID_DTS, AV_CODEC_ID_MP3, AV_CODEC_ID_MP2, AV_CODEC_ID_VORBIS };
+        const uint32_t ac = get(ZZAV_W_ACODEC);
+
+        actx = ac >= ZZAV_AAC && ac <= ZZAV_VORBIS ?
+               open_codec(aid[ac], ZZAV_AEXTRA_OFF, get(ZZAV_W_AEXTRA_LEN)) : NULL;
+    }
     vframe = av_frame_alloc();
+    for (i = 0; i < NQ; i++)
+        fq[i] = av_frame_alloc();
+    nq = ready = flip_req = new_lag = paused_now = 0;
+    t_take = t_pause = paused_ticks = 0;
+    clock_started = 0;
+    memset(cad, 0, sizeof cad);
+    refresh = 1.0 / 60;
+    measure_refresh();
+    put(ZZAV_W_REFRESH_US, (uint32_t)(refresh * 1e6));
+    for (i = ZZAV_W_CAD1; i <= ZZAV_W_CAD4; i++)
+        put(i, 0);
     aframe = av_frame_alloc();
     pcm = malloc(PCM_FRAMES * FRAME_BYTES);
     line = malloc(4096 * 4);
     if ((get(ZZAV_W_VCODEC) && !vctx) || (get(ZZAV_W_ACODEC) && !actx) || (!vctx && !actx) ||
-        !vframe || !aframe || !pcm || !line) {
+        !vframe || !aframe || !pcm || !line || !fq[NQ - 1]) {
         put(ZZAV_W_ERR, !vctx && get(ZZAV_W_VCODEC) ? 1 : !actx && get(ZZAV_W_ACODEC) ? 2 : 3);
         put(ZZAV_W_STATE, ZZAV_ERROR);
         put(ZZAV_W_CMD, ZZAV_CMD_NONE);
@@ -844,30 +1038,32 @@ int player_run(void)
             audio_service();
 
         /* the clock */
-        if (audio_on)
-            clk = pcm_valid || seg_n ? audio_clock() : -1;
-        else {
+        if (!audio_on) {
             if (paused && !t_pause)
                 t_pause = t;
             else if (!paused && t_pause) {
                 paused_ticks += t - t_pause;
                 t_pause = 0;
             }
-            clk = clock_started ? t_start_media + secs((t_pause ? t_pause : t) - t_start - paused_ticks) : -1;
         }
+        paused_now = paused;
+        flip_poll(t);
+        clk = clock_now(t);
 
-        /* the picture */
-        if (vctx && !have_frame && !vdone) {
-            int r = avcodec_receive_frame(vctx, vframe);
+        /* the picture: decoded ahead into the queue */
+        if (vctx && !vdone && nq < NQ) {
+            int r = avcodec_receive_frame(vctx, fq[nq]);
 
             if (r == 0) {
-                have_frame = 1;
-                if (vframe->best_effort_timestamp != AV_NOPTS_VALUE)
-                    vpts = vframe->best_effort_timestamp * vtb;
+                const AVFrame *f = fq[nq];
+
+                if (f->best_effort_timestamp != AV_NOPTS_VALUE)
+                    vpts = f->best_effort_timestamp * vtb;
                 else
                     vpts += vdur;
-                if (vframe->pkt_duration > 0)
-                    vdur = vframe->pkt_duration * vtb;
+                if (f->pkt_duration > 0)
+                    vdur = f->pkt_duration * vtb;
+                fq_pts[nq++] = vpts;
                 put(ZZAV_W_DECODED, get(ZZAV_W_DECODED) + 1);
             } else if (r == AVERROR_EOF)
                 vdone = 1;
@@ -888,53 +1084,68 @@ int player_run(void)
             } else
                 vdone = 1;
         }
-        if (have_frame) {
+
+        /* the next frame into the back buffer as soon as it is free (with one
+           buffer only, the one on the screen: at the frame's time) */
+        if (nq && !ready && !flip_req) {
+            AVFrame *f = fq[0];
+            const double fpts = fq_pts[0];
+
             if (!audio_on && !clock_started) {
                 clock_started = 1;
                 t_start = now_ticks();
                 /* on from where the sound left off (it ended first), else from this frame */
-                t_start_media = clock_hold > 0 && clock_hold < vpts ? clock_hold : vpts;
+                t_start_media = clock_hold > 0 && clock_hold < fpts ? clock_hold : fpts;
                 clk = t_start_media;
             }
-            if (!audio_on && paused)
-                ;                       /* hold the frame */
-            else if (clk < 0 && audio_on && !pcm_valid && (adone || (eof_in && !aq.n))) {
+            if (clk < 0 && audio_on && !pcm_valid && (adone || (eof_in && !aq.n)))
                 audio_on = 0;           /* the file's sound ended before it began: run on the timer */
-            } else if (flip_pending() && secs(t - t_shown) < 0.05) {
-                ;                       /* the last frame is not on the screen yet */
-            } else if (clk >= 0 && clk >= vpts - 0.005) {
-                lag = clk - vpts;
-                /* a little late is still worth showing: a slow decoder then shows
-                   what it manages instead of dropping everything once behind */
-                /* late frames are dropped, but one is shown at least every 80 ms:
-                   a decoder slower than the file then shows ~12 fps instead of nothing */
-                if (shown_any && lag > 0.25 && !vframe->key_frame && secs(t - t_shown) < 0.08)
+            else if (!dbuf && (clk < 0 || clk < fpts - 0.005))
+                ;
+            else {
+                /* late frames are dropped, but one is drawn at least every 80 ms:
+                   a decoder slower than the file then shows ~12 fps, not nothing */
+                if (clk >= 0 && shown_any && clk - fpts > 0.25 && !f->key_frame && secs(t - t_shown) < 0.08)
                     put(ZZAV_W_DROPPED, get(ZZAV_W_DROPPED) + 1);
                 else {
                     uint64_t t0 = now_ticks();
 
-                    show(vframe);
+                    show(f);
                     t_shown = now_ticks();
                     show_ticks += t_shown - t0;
                     show_n++;
                     if (!shown_any)
-                        t_first = now_ticks();
+                        t_first = t_shown;
                     shown_any = 1;
-                    put(ZZAV_W_SHOWN, get(ZZAV_W_SHOWN) + 1);
+                    ready = 1;
+                    ready_pts = fpts;
+                    ready_key = f->key_frame;
                 }
-                av_frame_unref(vframe);
-                have_frame = 0;
-                put(ZZAV_W_LAG_MS, (uint32_t)(int32_t)(lag * 1000));
-                /* fall behind: first the loop filter goes, then frames that are no reference, then all but keyframes */
-                if (t - t_skip > pl_tick_hz / 2) {
-                    /* keyframes only as a last resort: files with few of them would show nothing */
-                    int want = lag > 3.0 ? 3 : lag > 0.6 ? 2 : lag > 0.06 ? 1 : 0;
+                av_frame_unref(f);
+                for (i = 1; i < nq; i++) {      /* the pool keeps its frames: rotate */
+                    fq[i - 1] = fq[i];
+                    fq_pts[i - 1] = fq_pts[i];
+                }
+                fq[nq - 1] = f;
+                nq--;
+            }
+        }
+        flip_due(now_ticks());
 
-                    if (want > skip || (want < skip && lag < 0.03)) {
-                        skip = want > skip ? want : skip - 1;
-                        set_skip(skip);
-                        t_skip = t;
-                    }
+        /* fall behind: first the loop filter goes, then frames that are no
+           reference, then all but keyframes (a last resort: files with few
+           of them would show nothing) */
+        if (new_lag) {
+            new_lag = 0;
+            lag = lag_last;
+            put(ZZAV_W_LAG_MS, (uint32_t)(int32_t)(lag * 1000));
+            if (t - t_skip > pl_tick_hz / 2) {
+                int want = lag > 3.0 ? 3 : lag > 0.6 ? 2 : lag > 0.06 ? 1 : 0;
+
+                if (want > skip || (want < skip && lag < 0.03)) {
+                    skip = want > skip ? want : skip - 1;
+                    set_skip(skip);
+                    t_skip = t;
                 }
             }
         }
@@ -958,6 +1169,8 @@ int player_run(void)
             put(ZZAV_W_ASAMPLES, asamples);
             put(ZZAV_W_CLOCKSRC, audio_on ? 1 : 2);
             put(ZZAV_W_CLOCK_MS, clk >= 0 ? (uint32_t)(clk * 1000) : 0);
+            for (i = 1; i <= 4; i++)
+                put(ZZAV_W_CAD1 + i - 1, cad[i]);
             if (show_n) {
                 put(ZZAV_W_SHOW_US, (uint32_t)(secs(show_ticks) * 1e6 / show_n));
                 if (show_n > 25) {
@@ -974,7 +1187,7 @@ int player_run(void)
             }
         }
         /* all shown and heard: say so, then play silence until CLOSE */
-        if (eof_in && !vq.n && !aq.n && (!vctx || vdone) && !have_frame && (!actx || (adone && !pcm_n)) &&
+        if (eof_in && !vq.n && !aq.n && (!vctx || vdone) && !nq && !ready && !flip_req && (!actx || (adone && !pcm_n)) &&
             get(ZZAV_W_STATE) == ZZAV_PLAYING &&
             (!audio_on || get(ZZAV_W_ALEAD_MS) <= (LEAD_MIN + PERIOD) * 1000 / (RATE * FRAME_BYTES)))   /* only silence ahead */
             put(ZZAV_W_STATE, ZZAV_FINISHED);

@@ -42,7 +42,8 @@ enum { ZZAV_IDLE, ZZAV_PLAYING, ZZAV_FINISHED, ZZAV_ERROR,
        ZZAV_OPENING,                    /* OPEN_URL taken: connecting, probing, seeking */
        ZZAV_READY };                    /* OPEN_URL done: the stream words are set, OPEN plays it */
 /* ZZAV_W_ACODEC / ZZAV_W_VCODEC */
-enum { ZZAV_NONE, ZZAV_H264, ZZAV_AAC };
+enum { ZZAV_NONE, ZZAV_H264, ZZAV_AAC,
+       ZZAV_AC3, ZZAV_EAC3, ZZAV_DTS, ZZAV_MP3, ZZAV_MP2, ZZAV_VORBIS };     /* sound: the amix core */
 
 enum {
     ZZAV_W_MAGIC, ZZAV_W_CMD, ZZAV_W_STATE, ZZAV_W_ERR,
@@ -90,6 +91,10 @@ enum {
     ZZAV_W_BUF_MS,                              /* core 1: media time demuxed beyond the clock */
     ZZAV_W_NET_KBS,                             /* core 1: the download over the last second, KB/s */
     ZZAV_W_NET_KB,                              /* core 1: KB fetched since OPEN_URL */
+    /* core 1: how the pictures reached the screen (player.c, double-buffered) */
+    ZZAV_W_REFRESH_US,                          /* the screen's refresh period, measured */
+    ZZAV_W_CAD1, ZZAV_W_CAD2, ZZAV_W_CAD3,      /* frames that stayed 1, 2, 3 refreshes */
+    ZZAV_W_CAD4,                                /* ... 4 or more (a stall) */
     ZZAV_W_NWORDS
 };
 
@@ -106,12 +111,13 @@ enum {
 #define ZZAV_URL_OFF        (ZZAV_OFF + 0x400UL)
 #define ZZAV_URL_MAX        3072
 #define ZZAV_FEAT_URL       1                   /* ZZAV_W_FEAT: OPEN_URL */
+#define ZZAV_FEAT_SOUND     2                   /* ZZAV_W_FEAT: the sound codecs after ZZAV_AAC */
 enum { ZZAV_NETERR_URL = 0x201,                 /* not http://host[:port]/path */
        ZZAV_NETERR_NONET,                       /* no address from DHCP (or the firmware has no rings) */
        ZZAV_NETERR_DNS, ZZAV_NETERR_CONNECT,
        ZZAV_NETERR_HTTP,                        /* not 200/206: ZZAV_W_HTTP */
        ZZAV_NETERR_FORMAT,                      /* libavformat does not know it */
-       ZZAV_NETERR_STREAMS,                     /* no H.264 video and no AAC sound */
+       ZZAV_NETERR_STREAMS,                     /* no H.264 picture and no sound core 1 decodes */
        ZZAV_NETERR_TIMEOUT, ZZAV_NETERR_MEM };
 
 /* ZZAV_CMD_PROBE's result: words at this offset (big-endian):
