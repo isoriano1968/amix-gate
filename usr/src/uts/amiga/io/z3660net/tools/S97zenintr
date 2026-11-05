@@ -1,0 +1,29 @@
+#!/sbin/sh
+#
+# S97zenintr - the Z3660 ethernet's INT6 receive on at boot.
+#
+# A kernel built with the driver's INT6 receive (Z3660 line, unix.z3-z3l)
+# boots polled; this switches it on (/opt/amix/bin/zenintr 6, which writes
+# z3660eth_intr in /dev/kmem), after the network is up (S69inet).  In the
+# background: finding the kernel file in /stand takes a few seconds.  On a
+# kernel without it zenintr says so and nothing changes.  `zenintr 0' turns
+# it off again while the system runs.
+#
+# Install as /etc/rc2.d/S97zenintr.
+
+case "$1" in
+''|start)
+	if [ -x /opt/amix/bin/zenintr ] && [ -x /usr/local/bin/python3 ]; then
+		UNAME_A=`/usr/bin/uname -a`
+		export UNAME_A
+		(/usr/local/bin/python3 /opt/amix/bin/zenintr 6 > /dev/null 2>&1 &)
+		echo "INFO: Z3660 ethernet: INT6 receive requested"
+	fi
+	;;
+stop)
+	;;
+*)
+	echo "usage: $0 {start|stop}"
+	;;
+esac
+exit 0
