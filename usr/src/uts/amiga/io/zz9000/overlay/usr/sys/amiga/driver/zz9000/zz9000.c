@@ -241,6 +241,9 @@ static void (*zz9k_old_conputc)();
 static int zz9k_console_on;
 static int zz9k_console_redirect;
 static int zz9k_console_disabled;
+static int zz9k_vt_on;            /* the port's vt040.c mirrors the consoles */
+static void zz9k_vt_map();
+int zz9000vtdirty;                /* bumped per console write; vt040.c clears it */
 static int zz9k_console_row;
 static int zz9k_console_col;
 static int zz9k_console_cols;
@@ -1577,6 +1580,13 @@ static void
 zz9k_conputc(c)
 unsigned char c;
 {
+    if (zz9k_vt_on) {
+        /* the stock console draws it; vt040.c mirrors that screen */
+        if (zz9k_old_conputc)
+            (*zz9k_old_conputc)(c);
+        ++zz9000vtdirty;
+        return;
+    }
     if (!zz9k_console_on || !zz9k_console_bp)
         return;
 
@@ -1706,6 +1716,7 @@ struct zz9k_board *bp;
     conputc = zz9k_conputc;
     zz9k_console_redirect = 1;
     zz9k_console_disabled = 0;
+    zz9k_vt_map(bp);
     return 0;
 }
 
@@ -1723,6 +1734,7 @@ struct zz9k_board *bp;
     conputc = zz9k_conputc;
     zz9k_console_redirect = 1;
     zz9k_console_disabled = 0;
+    zz9k_vt_map(bp);
     return 0;
 }
 
@@ -1773,6 +1785,88 @@ unsigned n;
         ++p;
     }
     return 1;
+}
+
+/*
+ * VT switching (the 040/060 port's src/vt040.c, relink-040-vt.sh).  The
+ * text consoles keep their stock rendering into chip RAM; vt040.c copies the
+ * displayed one into a console buffer of its own in off-screen VRAM and pans
+ * the card between that buffer and the screen at framebuffer offset 0, the
+ * X server's.  An X session's pixels are never touched, so switching back to
+ * it needs no repaint.  ZZ9K_VT_OFF is clear of the screen and soft3D's back
+ * buffer (rows 1100.., the screen's stride) and below the video overlay
+ * (board 0x06000000) and core 1's rings (board 0x07100000).
+ */
+#define ZZ9K_VT_OFF    0x02000000UL      /* framebuffer offset of the buffer */
+#define ZZ9K_VT_SIZE   0x00400000UL      /* 1920x1080x16 bpp fits */
+
+static char *zz9k_vt_fb;                 /* kernel mapping of the buffer */
+
+/*
+ * Map the console buffer.  Called when the console redirect is switched on
+ * (an ioctl: process context), never from vt040.c, whose calls can come
+ * from the keyboard interrupt: dev_kvmap goes through sptalloc.
+ */
+static void
+zz9k_vt_map(bp)
+struct zz9k_board *bp;
+{
+    if (zz9k_vt_fb || ZZ9K_VT_OFF + ZZ9K_VT_SIZE > bp->fb_size)
+        return;
+#ifdef ZZ9K_KVMAP
+    zz9k_vt_fb = dev_kvmap((unsigned long)ZZ9K_FBPA(bp) + ZZ9K_VT_OFF,
+        ZZ9K_VT_SIZE, ZZ9K_CM_NC, 0);
+#else
+    zz9k_vt_fb = bp->fb + ZZ9K_VT_OFF;
+#endif
+}
+
+/*
+ * The console buffer and the mode it is drawn in, once the console redirect
+ * is on (the boot's rc script).  Turns the RTG console's own drawing off:
+ * from now on vt040.c shows the stock consoles.  0 = ready, -1 = not (no
+ * board, redirect off, mode not 16 bpp, or no mapping).
+ */
+int
+zz9000vtinfo(fbp, wp, hp)
+char **fbp;
+int *wp, *hp;
+{
+    struct zz9k_board *bp = zz9k_console_bp;
+
+    if (!bp || !zz9k_console_redirect)
+        return -1;
+    if (!zz9k_vt_fb || zz9k_bpp(bp->color_mode) != 2 ||
+        (unsigned long)bp->width * bp->height * 2 > ZZ9K_VT_SIZE)
+        return -1;
+    if (!zz9k_vt_on) {
+        zz9k_console_cursor(0);
+        zz9k_vt_on = 1;
+    }
+    *fbp = zz9k_vt_fb;
+    *wp = bp->width;
+    *hp = bp->height;
+    return 0;
+}
+
+/*
+ * Show the console buffer (on) or the screen at offset 0 (off).  The
+ * firmware adds X1/Y1 to a PAN write (rtg.c REG_ZZ_PAN), so they are cleared
+ * first, and the blitter cache forgets them, as zz9k_set_mode_hw does.
+ */
+void
+zz9000vtpan(on)
+int on;
+{
+    struct zz9k_board *bp = zz9k_console_bp;
+
+    if (!bp || !zz9k_vt_fb)
+        return;
+    zz9k_wr(bp, ZZ9K_R_X1, 0);
+    zz9k_wr(bp, ZZ9K_R_Y1, 0);
+    zz9k_wr(bp, ZZ9K_R_X2, 0);
+    zz9k_wr32(bp, ZZ9K_R_PAN, on ? ZZ9K_VT_OFF : 0);
+    ZZ9K_BLIT_FORGET(bp);
 }
 
 static void
