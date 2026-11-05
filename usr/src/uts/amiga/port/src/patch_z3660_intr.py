@@ -15,6 +15,12 @@
 # z3660eth_p2_next (their initialiser relocations), which the wrappers call
 # first.  Exactly one site each; both or nothing.  Idempotent.  The driver
 # stays polled until z3660eth_intr is 6 in /dev/kmem.
+#
+# With the Hydra driver (relink-040-hydra.sh), slot 4 is no use: its
+# parinit_hydra.s writes hydra_int2 into int2_tbl[4] at boot, over whatever
+# the image holds, and hydra_int2 calls aenintr, then hydraintr.  Then the
+# level-2 site is that jsr in hydra_int2 instead, and at run time
+# int2_tbl[4] -> hydra_int2 -> z3660eth_p2 (aenintr, the drain) -> hydraintr.
 
 import struct, sys
 
@@ -74,18 +80,22 @@ def main():
                 out.append((o, roff, names[info >> 8]))
         return out
 
+    sites = list(SITES)
+    if "hydra_int2" in names:		# parinit_hydra.s rewrites int2_tbl[4] at boot
+        sites[1] = (".rela.text", "hydra_int2", 0x0c, "z3660eth_p2", "z3660eth_p2_next")
+        print("  [*]    Hydra glue present: level 2 through hydra_int2's call")
     plan, skip = [], 0
-    for sec, region, length, wrapper, ptr in SITES:
+    for sec, region, length, wrapper, ptr in sites:
         lo = sym_value(region)
         hits = relocs(sec, lo, lo + length)
         if region == "int2_tbl":
             hits = [h for h in hits if h[1] == lo + P2_SLOT]
-        else:			# the call: jsr abs.l (0x4eb9) before it; p6int also loads CACR
+        if region != "int2_tbl":	# the call: jsr abs.l (0x4eb9) before it; p6int also loads CACR
             text = sh[byname[sec]["info"]]["offset"]
             hits = [h for h in hits if b[text + h[1] - 2:text + h[1]] == b"\x4e\xb9"]
         if len(hits) != 1:
             raise SystemExit("ABORT: %d relocations in %s+0x%x (%s) -- expected one"
-                             % (len(hits), region, 0 if region == "p6int" else P2_SLOT, sec))
+                             % (len(hits), region, P2_SLOT if region == "int2_tbl" else 0, sec))
         site, roff, cur = hits[0]
         p = relocs(".rela.data", sym_value(ptr), sym_value(ptr) + 4)
         if len(p) != 1:
