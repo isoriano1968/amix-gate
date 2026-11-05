@@ -21,8 +21,12 @@
 # the image holds, and hydra_int2 calls aenintr, then hydraintr.  Then the
 # level-2 site is that jsr in hydra_int2 instead, and at run time
 # int2_tbl[4] -> hydra_int2 -> z3660eth_p2 (aenintr, the drain) -> hydraintr.
+#
+# Z3660ETH_P2_ALONE=1 (a kernel for the Z3660 without the A2065 and Hydra
+# boards): slot 4 is the drain's alone; z3660eth_p2_next points at the
+# driver's z3660eth_none instead of what the slot held.
 
-import struct, sys
+import os, struct, sys
 
 KERNEL = sys.argv[1]
 R_68K_32 = 1
@@ -81,6 +85,9 @@ def main():
         return out
 
     sites = list(SITES)
+    alone = os.environ.get("Z3660ETH_P2_ALONE") == "1"
+    if alone and "hydra_int2" in names:
+        raise SystemExit("ABORT: Z3660ETH_P2_ALONE with the Hydra glue in the kernel -- leave relink-040-hydra.sh out")
     if "hydra_int2" in names:		# parinit_hydra.s rewrites int2_tbl[4] at boot
         sites[1] = (".rela.text", "hydra_int2", 0x0c, "z3660eth_p2", "z3660eth_p2_next")
         print("  [*]    Hydra glue present: level 2 through hydra_int2's call")
@@ -111,9 +118,10 @@ def main():
     if plan and skip:
         raise SystemExit("ABORT: half wired (%d done, %d to do) -- the two go together" % (skip, len(plan)))
     for site, pr, off, region, cur, wrapper, ptr in plan:
-        struct.pack_into(">I", b, pr + 4, (sym_index(cur) << 8) | R_68K_32)
+        nxt = "z3660eth_none" if alone and ptr == "z3660eth_p2_next" else cur
+        struct.pack_into(">I", b, pr + 4, (sym_index(nxt) << 8) | R_68K_32)
         struct.pack_into(">I", b, site + 4, (sym_index(wrapper) << 8) | R_68K_32)
-        print("  [ok]   %s+0x%x  %s -> %s; %s = %s" % (region, off, cur, wrapper, ptr, cur))
+        print("  [ok]   %s+0x%x  %s -> %s; %s = %s" % (region, off, cur, wrapper, ptr, nxt))
     open(KERNEL, "wb").write(b)
     print("Z3660 ethernet INT6 receive wired (p6int, int2_tbl) -> %s" % KERNEL)
 
