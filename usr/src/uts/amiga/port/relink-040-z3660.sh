@@ -65,7 +65,10 @@ CF=$(echo "$AMIX_KERNEL_CFLAGS" | sed 's/-m68020/-m68040/')
 # also arm their data-cache maintenance from cputype.  Needed on real 040/060.
 m68k-cbm-sysv4-gcc $CF -DZ3660_KVMAP -I"$ALIEN" -I"$HERE/build" \
 	-c "$HERE/build/z3660_040.c"    -o "$HERE/build/z3660_040.o"
-m68k-cbm-sysv4-gcc $CF -DZ3660_KVMAP -I"$ALIEN" -I"$HERE/build" \
+# Z3660ETH_CFLAGS: optional extra ethernet driver defines, e.g.
+# -DZ3660ETH_STATIC_INTR (INT6 receive, wired by relink-040-z3660intr.sh)
+[ -n "$Z3660ETH_CFLAGS" ] && echo "[*] extra ethernet driver flags: $Z3660ETH_CFLAGS"
+m68k-cbm-sysv4-gcc $CF -DZ3660_KVMAP $Z3660ETH_CFLAGS -I"$ALIEN" -I"$HERE/build" \
 	-c "$HERE/build/z3660eth_040.c" -o "$HERE/build/z3660eth_040.o"
 
 # Guard the conversion at the OBJECT level, not at the source level: the whole
