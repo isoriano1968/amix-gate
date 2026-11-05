@@ -34,6 +34,8 @@ cp "$SRC/audio.c" "$SRC/audio.h" "$B/"
 cp "$AMIX_ROOT/usr/sys/amiga/inc/memory.h" "$B/"
 run_step 1 python3 "$HERE/src/patch_audio_close.py" "$B/audio.c"
 run_step 1 python3 "$HERE/src/patch_audio_stereo.py" "$B/audio.c" "$B/audio.h"
+# /dev/paula (relink-040-paula.sh) and /dev/audio exclude each other
+run_step 1 python3 "$HERE/src/patch_audio_paula.py" "$B/audio.c"
 CF=$(echo "$AMIX_KERNEL_CFLAGS" | sed 's/-m68020/-m68040/')
 # -traditional knows no "signed"; audio.h and audiohw.h use "signed char"
 CF="$CF -Dsigned=__signed__"
