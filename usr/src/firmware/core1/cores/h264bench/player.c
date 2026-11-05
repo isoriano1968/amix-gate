@@ -531,6 +531,19 @@ static int widen(const uint32_t *in, int n, int s)
     return o;
 }
 
+/* n pixels stretched to o into wide[] (o > n: a picture with non-square
+   pixels, such as a 16:9 DVD's 720 x 576), sampled at each pixel's centre */
+static int stretch(const uint32_t *in, int n, int o)
+{
+    const uint32_t step = ((uint32_t)n << 16) / (uint32_t)o;
+    uint32_t pos = step >> 1;
+    int i;
+
+    for (i = 0; i < o; i++, pos += step)
+        wide[i] = in[pos >> 16];
+    return o;
+}
+
 /* a new size or place: what the last picture left in the two buffers goes */
 static void clear_overlay(void)
 {
@@ -555,20 +568,32 @@ static void show(AVFrame *f)
     int scale = shift ? 1 : (int)get(ZZAV_W_OVL_SCALE);
     int w = f->width >> shift, h = f->height >> shift, x, y;
     int maxw = (int)get(ZZAV_W_OVL_MAXW), maxh = (int)get(ZZAV_W_OVL_MAXH);
+    int dw = (int)get(ZZAV_W_DISPW), ow;
     uint32_t pitch = get(ZZAV_W_OVL_PITCH);
     volatile uint8_t *dst = pl_board + ovl_back() + (uint32_t)get(ZZAV_W_OVL_ROW0) * pitch;
 
     if (scale < 1 || scale > 4)
         scale = 1;
-    if (maxw > 0 && w * scale > maxw)
-        w = maxw / scale;
+    /* the shown width: the 68k's DISPW (coded width x sample aspect ratio) */
+    dw = dw > 0 ? (dw >> shift) & ~1 : w;
+    if (dw == w) {
+        if (maxw > 0 && w * scale > maxw)
+            w = maxw / scale;
+        dw = w;
+        ow = w * scale;
+    } else {
+        ow = dw * scale;                /* the whole picture, stretched */
+        if (maxw > 0 && ow > maxw)
+            ow = maxw;
+    }
     if (maxh > 0 && h * scale > maxh)
         h = maxh / scale;
-    if (w <= 0 || h <= 0 || !pitch || (uint32_t)(w * scale) * 4 > pitch)
+    if (w <= 0 || h <= 0 || ow <= 0 || !pitch || (uint32_t)ow * 4 > pitch ||
+        (uint32_t)ow > sizeof wide / sizeof wide[0])
         return;
-    if ((int)get(ZZAV_W_OUTW) != w * scale || (int)get(ZZAV_W_OUTH) != h * scale ||
+    if ((int)get(ZZAV_W_OUTW) != ow || (int)get(ZZAV_W_OUTH) != h * scale ||
         get(ZZAV_W_OVL_ROW0) != last_row0) {
-        put(ZZAV_W_OUTW, (uint32_t)(w * scale));
+        put(ZZAV_W_OUTW, (uint32_t)ow);
         put(ZZAV_W_OUTH, (uint32_t)(h * scale));
         last_row0 = get(ZZAV_W_OVL_ROW0);
         clear_overlay();
@@ -601,7 +626,13 @@ static void show(AVFrame *f)
                 line[x] = clamp8(yy + trv[v]) << 16 | clamp8(yy + tgu[u] + tgv[v]) << 8 | clamp8(yy + tbu[u]);
             }
         }
-        if (scale == 1) {
+        if (dw != w) {
+            const int o = stretch(line, w, ow);
+            int k;
+
+            for (k = 0; k < scale; k++)
+                row_out(dst + (uint32_t)(y * scale + k) * pitch, wide, o);
+        } else if (scale == 1) {
             row_out(dst + (uint32_t)y * pitch, line, w);
         } else {
             const int o = widen(line, w, scale);
@@ -706,7 +737,8 @@ int player_run(void)
     media_started = 0;
     asamples = 0;
     volume = 256;
-    for (int w = ZZAV_W_CLOCK_MS; w < ZZAV_W_NWORDS; w++)
+    /* core 1's words; DISPW after them is the 68k's, set before INIT */
+    for (int w = ZZAV_W_CLOCK_MS; w < ZZAV_W_DISPW; w++)
         put(w, 0);
     put(ZZAV_W_ERR, 0);
 

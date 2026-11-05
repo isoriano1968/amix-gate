@@ -74,6 +74,8 @@ enum {
     ZZAV_W_CLOCKSRC,                            /* 1 the sound, 2 the timer (sound gave nothing) */
     ZZAV_W_VPKTS,                               /* video packets taken */
     ZZAV_W_SHOW_US,                             /* the last second's average conversion into the overlay */
+    ZZAV_W_DISPW,                               /* 68k: the picture's width shown at full size: the coded
+                                                   width times the sample aspect ratio; 0 = as coded */
     ZZAV_W_NWORDS
 };
 
