@@ -27,6 +27,7 @@
 #include "bench.h"
 #include "zzcrypto.h"
 #include "zzav.h"
+#include "core1_net.h"
 #include "player.h"
 
 #define RTG_BASE            0x18000000UL
@@ -384,6 +385,7 @@ int main(void)
         set_section(RTG_BASE + ZZAV_RING_OFF + i * 0x100000UL, NORM_NONCACHE);
     set_section(RTG_BASE + ZZAV_AUDIO_OFF, NORM_NONCACHE);  /* the board's sound ring: the DMA reads DDR */
     set_section(RTG_BASE + ZZAV_PROBE_OFF, NORM_NONCACHE); /* same megabyte as the blocks: already */
+    set_section(RTG_BASE + C1NET_OFF, NORM_NONCACHE);   /* our network rings: core 0 writes them */
     set_section(RELOAD_TRAMP, NORM_NONCACHE);   /* reload(): its code runs on with the MMU off */
     set_section(0xFFF00000UL, NORM_NONCACHE);     /* the handshake word */
     mmu_sync();
