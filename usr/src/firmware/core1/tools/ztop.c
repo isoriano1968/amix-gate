@@ -14,6 +14,9 @@
  * 68040 emulator runs there.  A program on core 1 that publishes a status
  * block in board memory is shown from that block (read through mmap(), so
  * a ZZ9K_MAP_BOARD kernel); so far h264bench (vplay-amix arm/h264bench).
+ * Core 1's own network (the amix core fetches video streams itself over
+ * lwIP, amix-gate core1 core1_net.h): its address and what it moved; with
+ * -l, its speed over each interval.
  *
  * usage: ztop [-l [seconds]] [device]      (device default /dev/zz9000)
  */
@@ -60,7 +63,24 @@
 #define HB_W_LOAD               23
 #define HB_W_NAME               25	/* 16 bytes: the program's name (0: an older h264bench) */
 
+/* core 1's network block (amix-gate core1 cores/h264bench/core1_net.h):
+   little-endian words (the ARM's), the addresses in network order */
+#define C1NET_OFF               0x07900000UL
+#define C1NET_MAGIC             0x43314E54UL	/* "C1NT" */
+#define C1_W_MAGIC              0
+#define C1_W_ON                 1
+#define C1_W_UP                 32
+#define C1_W_IP                 33
+#define C1_W_NETMASK            34
+#define C1_W_GW                 35
+#define C1_W_RXBYTES            36
+#define C1_W_TXBYTES            37
+
 static int fd;
+static volatile unsigned long *c1n;	/* core 1's network block, or 0 */
+static unsigned long c1_rx, c1_tx;	/* at the last look (-l) */
+static int c1_have;
+static int show_secs;			/* -l's interval */
 static volatile unsigned long *hb;	/* h264bench's block, or 0 */
 static unsigned long hb_beat;
 
@@ -88,6 +108,80 @@ core1_map()
 
     if (p != (caddr_t)-1)
         hb = (volatile unsigned long *)p;
+    p = mmap((caddr_t)0, 4096, PROT_READ, MAP_SHARED, fd,
+        (off_t)(C1NET_OFF - ZZ9K_Z3660_FB_PHYS));
+    if (p != (caddr_t)-1)
+        c1n = (volatile unsigned long *)p;
+}
+
+static unsigned long
+le32(v)
+unsigned long v;
+{
+    return (v >> 24) | (v >> 8 & 0xff00UL) | (v << 8 & 0xff0000UL) | (v << 24);
+}
+
+/* bytes as KB or MB */
+static char *
+amount(b)
+unsigned long b;
+{
+    static char s[2][16];
+    static int k;
+
+    k ^= 1;
+    if (b >= 10UL * 1024 * 1024)
+        sprintf(s[k], "%lu MB", b >> 20);
+    else
+        sprintf(s[k], "%lu KB", b >> 10);
+    return s[k];
+}
+
+/* core 1's own network: its address, what it moved (and its speed, looping
+   every secs seconds) */
+static void
+c1net(loop, secs)
+int loop, secs;
+{
+    unsigned long ip, rx, tx;
+
+    if (!c1n || le32(c1n[C1_W_MAGIC]) != C1NET_MAGIC) {
+        if (!loop)
+            printf("core 1 net      none (%s)\n", c1n ? "the firmware has no rings for core 1" :
+                "board memory not mappable");
+        return;
+    }
+    if (le32(c1n[C1_W_UP]) != 1 || le32(c1n[C1_W_ON]) != 1) {
+        if (loop)
+            printf("  c1net off");
+        else
+            printf("core 1 net      off (the core on core 1 has no network)\n");
+        c1_have = 0;
+        return;
+    }
+    ip = c1n[C1_W_IP];
+    rx = le32(c1n[C1_W_RXBYTES]);
+    tx = le32(c1n[C1_W_TXBYTES]);
+    if (loop) {
+        if (c1_have && secs > 0)
+            printf("  c1net in %lu out %lu KB/s", (rx - c1_rx) / 1024 / secs, (tx - c1_tx) / 1024 / secs);
+        else
+            printf("  c1net %lu.%lu.%lu.%lu", ip >> 24, ip >> 16 & 255, ip >> 8 & 255, ip & 255);
+    } else if (!ip)
+        printf("core 1 net      waiting for an address (DHCP)\n");
+    else {
+        unsigned long m = c1n[C1_W_NETMASK], g = c1n[C1_W_GW];
+        int bits = 0;
+
+        while (bits < 32 && (m << bits & 0x80000000UL))
+            bits++;
+        printf("core 1 net      %lu.%lu.%lu.%lu/%d gw %lu.%lu.%lu.%lu, in %s out %s\n",
+            ip >> 24, ip >> 16 & 255, ip >> 8 & 255, ip & 255, bits,
+            g >> 24, g >> 16 & 255, g >> 8 & 255, g & 255, amount(rx), amount(tx));
+    }
+    c1_rx = rx;
+    c1_tx = tx;
+    c1_have = 1;
 }
 
 /* the core 1 program's name, as it put it into the block */
@@ -178,12 +272,14 @@ int loop;
             reg32(REG_ZZ_LTC_060_TEMP) * 0.01, reg32(REG_ZZ_LTC_TEMP) * 0.01,
             reg32(REG_ZZ_LTC_V1) * 0.01, reg32(REG_ZZ_LTC_V2) * 0.01);
         core1(0);
+        c1net(0, 0);
     } else {
         printf("Zynq %5.1f C  060 %5.1f C  board %5.1f C  VCCINT %4.2f  3V3 %4.2f  5V %4.2f  %ld MHz",
             reg32(REG_ZZ_TEMPERATURE) * 0.1, reg32(REG_ZZ_LTC_060_TEMP) * 0.01,
             reg32(REG_ZZ_LTC_TEMP) * 0.01, reg32(REG_ZZ_VOLTAGE_INT) * 0.01,
             reg32(REG_ZZ_LTC_V1) * 0.01, reg32(REG_ZZ_LTC_V2) * 0.01, reg32(REG_ZZ_CPU_FREQ));
         core1(1);
+        c1net(1, show_secs);
         printf("\n");
     }
     fflush(stdout);
@@ -212,6 +308,7 @@ char **argv;
     }
     core1_map();
     show(0);
+    show_secs = loop;
     while (loop) {
         sleep(loop);
         show(1);
