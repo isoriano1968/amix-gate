@@ -270,6 +270,17 @@ static void mmu_sync(void)
                      "isb" : : "r"(0) : "memory");
 }
 
+/* player.c, at OPEN: the overlay's two buffers (ZZAV_OVL_OFF, 16 MB) as the
+   rest of the board memory (write-through) or Normal Non-cacheable */
+void pl_ovl_map(int nc)
+{
+    uint32_t i;
+
+    for (i = 0; i < 16; i++)
+        set_section(RTG_BASE + ZZAV_OVL_OFF + i * 0x100000UL, nc ? NORM_NONCACHE : RTG_POLICY);
+    mmu_sync();
+}
+
 /*
  * Reload: copy a new image over this one and start it, without a reset.
  * The copy runs from RELOAD_TRAMP (uncached, above image, heap and stack):

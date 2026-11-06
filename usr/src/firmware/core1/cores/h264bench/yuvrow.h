@@ -70,6 +70,45 @@ static void row_neon(uint32_t *out, const uint8_t *y, const uint8_t *y2, const u
         vst4_u8((uint8_t *)(out + x), px);
     }
 }
+
+/*
+ * Full size only, n a multiple of 16, about three times as fast: 16-bit
+ * lanes in 1/64 units (298/256 Y = 149 Y / 128; chroma 102, 25, 52, 129 per
+ * 64 -- 409/4 = 102.25 is the one coefficient rounded, so red may differ from
+ * row_neon's by 1), the chroma terms once per chroma sample, saturating adds
+ * (a sum past 16 bits is past 255 after the shift as well) and a rounding,
+ * saturating narrow.
+ */
+static void row_neon16(uint32_t *out, const uint8_t *y, const uint8_t *u, const uint8_t *v, int n)
+{
+    const uint8x8_t c149 = vdup_n_u8(149), c128 = vdup_n_u8(128);
+    const int16x8_t c1192 = vdupq_n_s16(16 * 149 / 2);
+    int x;
+
+    for (x = 0; x < n; x += 16) {
+        const uint8x16_t y16 = vld1q_u8(y + x);
+        const int16x8_t uu = vreinterpretq_s16_u16(vsubl_u8(vld1_u8(u + x / 2), c128));
+        const int16x8_t vv = vreinterpretq_s16_u16(vsubl_u8(vld1_u8(v + x / 2), c128));
+        const int16x8x2_t rv = vzipq_s16(vmulq_n_s16(vv, 102), vmulq_n_s16(vv, 102));
+        const int16x8_t g1 = vmlaq_n_s16(vmulq_n_s16(uu, 25), vv, 52);
+        const int16x8x2_t gv = vzipq_s16(g1, g1);
+        const int16x8_t b1 = vmulq_n_s16(uu, 129);
+        const int16x8x2_t bu = vzipq_s16(b1, b1);
+        int h;
+
+        for (h = 0; h < 2; h++) {
+            const uint8x8_t yh = h ? vget_high_u8(y16) : vget_low_u8(y16);
+            const int16x8_t ys = vsubq_s16(vreinterpretq_s16_u16(vshrq_n_u16(vmull_u8(yh, c149), 1)), c1192);
+            uint8x8x4_t px;
+
+            px.val[0] = vqrshrun_n_s16(vqaddq_s16(ys, bu.val[h]), 6);
+            px.val[1] = vqrshrun_n_s16(vqsubq_s16(ys, gv.val[h]), 6);
+            px.val[2] = vqrshrun_n_s16(vqaddq_s16(ys, rv.val[h]), 6);
+            px.val[3] = vdup_n_u8(0);
+            vst4_u8((uint8_t *)(out + x + h * 8), px);
+        }
+    }
+}
 #endif
 
 #endif

@@ -535,6 +535,7 @@ static uint64_t last_service;
 static volatile uint32_t *c1ld;         /* below, with the overlay */
 static int dbuf;
 static void flip(void);
+static void draw_next(uint64_t t, double clk);
 
 /* ---- when a picture reaches the screen ----
  * Frames are decoded ahead into a queue (NQ), the next one is drawn into the
@@ -545,8 +546,11 @@ static void flip(void);
  * not push a frame off its refresh: 25 fps at 60 Hz then shows 2,3,2,3
  * refreshes, as a PC's player does, not 2,3,3,2,4.
  * A flip asked for the buffer already shown changes nothing but is still taken
- * (cleared) at the vblank: that measures the refresh period. */
-#define NQ 4
+ * (cleared) at the vblank: that measures the refresh period.
+ * Eight frames ahead (320 ms at 25 fps): a run of slow frames in a busy
+ * scene comes out of what the easy ones before it saved. */
+#define NQ 8
+static int nq_max = NQ;                 /* 4 with ZZAV_TUNE_NQ4 */
 static AVFrame *fq[NQ];                 /* decoded, not drawn yet; [0] next */
 static double fq_pts[NQ];
 static int nq;
@@ -558,6 +562,22 @@ static double refresh = 1.0 / 60, lag_last;
 static uint32_t cad[5];                 /* frames by refreshes on the screen: 1, 2, 3, 4+ */
 static int clock_started;
 static double t_start_media;
+/* the flip log (zzav.h ZZAV_FLOG_W): what the flip being waited for went through */
+static uint64_t t_ready, poll_last, gap_max;
+static double req_slip, req_margin;
+
+static void flog(uint32_t v)
+{
+    const uint32_t k = get(ZZAV_W_FLOG_N);
+
+    put(ZZAV_FLOG_W + (int)(k % ZZAV_FLOG_LEN), v);
+    put(ZZAV_W_FLOG_N, k + 1);
+}
+
+static uint32_t cap(double v, uint32_t max)
+{
+    return v <= 0 ? 0 : v >= max ? max : (uint32_t)v;
+}
 static uint64_t t_start, t_pause, paused_ticks;
 
 static double clock_now(uint64_t t)
@@ -570,14 +590,21 @@ static double clock_now(uint64_t t)
 /* the flip asked for has been made (core 0 cleared the word at a vblank) */
 static void flip_poll(uint64_t t)
 {
-    int n;
+    int n = 0;
 
-    if (!flip_req || (dbuf && c1ld[C1LD_W_FLIP] != 0 && t - t_req < pl_tick_hz / 10))
+    if (!flip_req)
+        return;
+    if (t - poll_last > gap_max)
+        gap_max = t - poll_last;
+    poll_last = t;
+    if (dbuf && c1ld[C1LD_W_FLIP] != 0 && t - t_req < pl_tick_hz / 10)
         return;
     if (t_take && !paused_now) {            /* how long the last frame stayed */
         n = (int)(secs(t - t_take) / refresh + 0.5);
         cad[n < 1 ? 1 : n > 4 ? 4 : n]++;
     }
+    flog((uint32_t)(n > 15 ? 15 : n) | cap(req_slip * 1e4, 4095) << 4 |
+         cap(secs(gap_max) * 1e4, 255) << 16 | cap(req_margin * 1e3, 255) << 24);
     t_take = paused_now ? 0 : t;
     flip_req = 0;
 }
@@ -589,12 +616,18 @@ static void flip_due(uint64_t t)
 
     if (!ready || flip_req || paused_now)
         return;
+    if (audio_on)
+        dma_update();           /* the clock as the DMA is now, not at the last audio_service */
     clk = clock_now(t);
     if (clk < 0 || clk < ready_pts - refresh / 2)
         return;
     flip();
     flip_req = 1;
     t_req = t;
+    poll_last = t;
+    gap_max = 0;
+    req_slip = clk - (ready_pts - refresh / 2);
+    req_margin = secs(t - t_ready);
     ready = 0;
     lag_last = clk - ready_pts;
     new_lag = 1;
@@ -638,6 +671,8 @@ static void hband(struct AVCodecContext *s, const AVFrame *src, int offset[AV_NU
     (void)s; (void)src; (void)offset; (void)y; (void)type; (void)height;
     flip_poll(t);
     flip_due(t);
+    if (dbuf)
+        draw_next(t, clock_now(t));
     if (audio_on && t - last_service > pl_tick_hz / 100) {
         last_service = t;
         audio_service();
@@ -752,6 +787,28 @@ static int stretch(const uint32_t *in, int n, int o)
     return o;
 }
 
+/*
+ * The same, filtered: each output pixel the two source pixels around its
+ * centre, weighted by distance (linear, 7-bit weights).  Moving edges then
+ * travel evenly; picking the nearest pixel doubles every second or third
+ * column, and an edge in a pan jumps by one or two pixels from frame to frame.
+ * stretch_lin.h has the row; the tables are made once per width.
+ */
+#include "stretch_lin.h"
+
+static struct lin_tab lin, lin_scratch;
+static int stretch_nearest;             /* ZZAV_TUNE_NEAREST */
+/* the filter costs ~3 ms a frame: while the decoder is behind (fewer than 3
+   frames decoded ahead) the nearest pixel, until 5 are ahead again */
+static int cheap;
+#define CHEAP_ON    3
+#define CHEAP_OFF   5
+/* widening, the usual case: Y, U and V rows stretched first (8-bit, cheap),
+   then converted at the shown width */
+static struct lin8_tab l8y, l8c;
+static uint8_t yb[LIN_MAX + 16], ub[LIN_MAX / 2 + 32], vb[LIN_MAX / 2 + 32];
+static uint64_t conv_ticks, out_ticks;  /* show(): the two halves of SHOW_US */
+
 /* a new size or place: what the last picture left in the two buffers goes */
 static void clear_overlay(void)
 {
@@ -774,7 +831,7 @@ static void show(AVFrame *f)
 
     int shift = (int)get(ZZAV_W_OVL_SHIFT) ? 1 : 0;
     int scale = shift ? 1 : (int)get(ZZAV_W_OVL_SCALE);
-    int w = f->width >> shift, h = f->height >> shift, x, y;
+    int w = f->width >> shift, h = f->height >> shift, x, y, plane, nearest;
     int maxw = (int)get(ZZAV_W_OVL_MAXW), maxh = (int)get(ZZAV_W_OVL_MAXH);
     int dw = (int)get(ZZAV_W_DISPW), ow;
     uint32_t pitch = get(ZZAV_W_OVL_PITCH);
@@ -806,6 +863,21 @@ static void show(AVFrame *f)
         last_row0 = get(ZZAV_W_OVL_ROW0);
         clear_overlay();
     }
+    if (cheap ? nq >= CHEAP_OFF : nq < CHEAP_ON)
+        cheap = !cheap;
+    nearest = stretch_nearest || cheap;
+    if (dw != w && nearest && !stretch_nearest)
+        put(ZZAV_W_CHEAP, get(ZZAV_W_CHEAP) + 1);
+    if (dw != w && !shift && !nearest && ow <= LIN_MAX && (l8y.n != w || l8y.o != ow)) {
+        if (!lin8_make(&l8y, &lin_scratch, w, ow) || !lin8_make(&l8c, &lin_scratch, (w + 1) / 2, (ow + 1) / 2))
+            l8y.n = l8y.o = -1;         /* not an enlargement this way: the 32-bit stretch */
+        if (l8y.n < 0) {
+            l8y.n = w;                  /* asked once per size */
+            l8y.o = ow;
+            l8c.n = l8c.o = 0;
+        }
+    }
+    plane = dw != w && !shift && !nearest && l8c.o > 0 && l8y.n == w && l8y.o == ow;
     for (y = 0; y < h; y++) {
         int sy = y << shift;
         const uint8_t *py = f->data[0] + sy * f->linesize[0];
@@ -813,10 +885,46 @@ static void show(AVFrame *f)
         const uint8_t *pv = f->data[2] + (sy >> 1) * f->linesize[2];
 
         const uint8_t *py2 = py + (sy + 1 < f->height ? f->linesize[0] : 0);
+        const uint64_t t0 = now_ticks();
 
+        if (plane) {
+            uint64_t t1;
+            int k;
+
+            lin8_row(&l8y, py, yb);
+            lin8_row(&l8c, pu, ub);
+            lin8_row(&l8c, pv, vb);
+            x = 0;
+#ifdef __ARM_NEON
+            if (!full_range) {
+                row_neon16(line, yb, ub, vb, ow & ~15);
+                x = ow & ~15;
+            }
+#endif
+            for (; x < ow; x++) {
+                int yy = ty[yb[x]], u = ub[x >> 1], v = vb[x >> 1];
+
+                line[x] = clamp8(yy + trv[v]) << 16 | clamp8(yy + tgu[u] + tgv[v]) << 8 | clamp8(yy + tbu[u]);
+            }
+            t1 = now_ticks();
+            conv_ticks += t1 - t0;
+            for (k = 0; k < scale; k++)
+                row_out(dst + (uint32_t)(y * scale + k) * pitch, line, ow);
+            out_ticks += now_ticks() - t1;
+            if ((y & 31) == 31)
+                hband(NULL, NULL, NULL, 0, 0, 0);
+            continue;
+        }
         x = 0;
 #ifdef __ARM_NEON
-        if (!full_range) {
+        if (!full_range && !shift) {
+            row_neon16(line, py, pu, pv, w & ~15);
+            x = w & ~15;
+            if ((w & ~7) > x) {
+                row_neon(line + x, py + x, py2 + x, pu + x / 2, pv + x / 2, 8, 0);
+                x += 8;
+            }
+        } else if (!full_range) {
             row_neon(line, py, py2, pu, pv, w & ~7, shift);
             x = w & ~7;
         }
@@ -835,24 +943,103 @@ static void show(AVFrame *f)
             }
         }
         if (dw != w) {
-            const int o = stretch(line, w, ow);
-            int k;
+            int o, k;
+            uint64_t t1;
 
+            if (nearest)
+                o = stretch(line, w, ow);
+            else {
+                if (lin.n != w || lin.o != ow)
+                    lin_make(&lin, w, ow);
+                o = lin_row(&lin, line, wide);
+            }
+            t1 = now_ticks();
+            conv_ticks += t1 - t0;
             for (k = 0; k < scale; k++)
                 row_out(dst + (uint32_t)(y * scale + k) * pitch, wide, o);
+            out_ticks += now_ticks() - t1;
         } else if (scale == 1) {
+            const uint64_t t1 = now_ticks();
+
+            conv_ticks += t1 - t0;
             row_out(dst + (uint32_t)y * pitch, line, w);
+            out_ticks += now_ticks() - t1;
         } else {
             const int o = widen(line, w, scale);
+            const uint64_t t1 = now_ticks();
             int k;
 
+            conv_ticks += t1 - t0;
             for (k = 0; k < scale; k++)
                 row_out(dst + (uint32_t)(y * scale + k) * pitch, wide, o);
+            out_ticks += now_ticks() - t1;
         }
         if ((y & 31) == 31)
             hband(NULL, NULL, NULL, 0, 0, 0);
     }
     /* the flip: flip_due(), at the frame's time */
+}
+
+/* the next decoded frame into the back buffer as soon as that is free (with
+   one buffer only, the one on the screen: at the frame's time).  From the
+   main loop and from hband: a frame that decodes for 25 ms must not hold up
+   the picture after it (with eight decoded ahead the decoder is nearly
+   always busy) */
+static int shown_any, in_draw;
+static uint64_t t_first, t_shown, show_ticks;
+static uint32_t show_n;
+
+static void draw_next(uint64_t t, double clk)
+{
+    int i;
+
+    if (!nq || ready || flip_req || in_draw)
+        return;
+    in_draw = 1;
+    {
+        AVFrame *f = fq[0];
+        const double fpts = fq_pts[0];
+
+        if (!audio_on && !clock_started) {
+            clock_started = 1;
+            t_start = now_ticks();
+            /* on from where the sound left off (it ended first), else from this frame */
+            t_start_media = clock_hold > 0 && clock_hold < fpts ? clock_hold : fpts;
+            clk = t_start_media;
+        }
+        if (clk < 0 && audio_on && !pcm_valid && (adone || (eof_in && !aq.n)))
+            audio_on = 0;           /* the file's sound ended before it began: run on the timer */
+        else if (!dbuf && (clk < 0 || clk < fpts - 0.005))
+            ;
+        else {
+            /* late frames are dropped, but one is drawn at least every 80 ms:
+               a decoder slower than the file then shows ~12 fps, not nothing */
+            if (clk >= 0 && shown_any && clk - fpts > 0.25 && !f->key_frame && secs(t - t_shown) < 0.08)
+                put(ZZAV_W_DROPPED, get(ZZAV_W_DROPPED) + 1);
+            else {
+                uint64_t t0 = now_ticks();
+
+                show(f);
+                t_shown = t_ready = now_ticks();
+                show_ticks += t_shown - t0;
+                show_n++;
+                if (!shown_any)
+                    t_first = t_shown;
+                shown_any = 1;
+                ready = 1;
+                ready_pts = fpts;
+                ready_key = f->key_frame;
+            }
+            av_frame_unref(f);
+            for (i = 1; i < nq; i++) {      /* the pool keeps its frames: rotate */
+                fq[i - 1] = fq[i];
+                fq_pts[i - 1] = fq_pts[i];
+            }
+            fq[nq - 1] = f;
+            nq--;
+        }
+    }
+    in_draw = 0;
 }
 
 /* ---- the whole ---- */
@@ -918,13 +1105,11 @@ static void cleanup(void)
 
 int player_run(void)
 {
-    int skip = 0, shown_any = 0, i;
+    int skip = 0, i;
     double vpts = 0, vdur = 0.04, lag = 0;
     uint64_t t_report = 0, t_skip = 0;
     uint64_t dec_ticks = 0;
     uint32_t dec_n = 0;
-    uint64_t t_first = 0, t_shown = 0, show_ticks = 0;
-    uint32_t show_n = 0;
 
     blk = (volatile uint32_t *)(pl_board + ZZAV_OFF);
     c1ld = (volatile uint32_t *)(pl_board + C1LD_OFF);
@@ -977,6 +1162,25 @@ int player_run(void)
     put(ZZAV_W_REFRESH_US, (uint32_t)(refresh * 1e6));
     for (i = ZZAV_W_CAD1; i <= ZZAV_W_CAD4; i++)
         put(i, 0);
+    put(ZZAV_W_FLOG_N, 0);
+    put(ZZAV_W_CONV_US, 0);
+    put(ZZAV_W_OUT_US, 0);
+    {
+        /* the earlier ways, for tests: once, this OPEN only */
+        const uint32_t tune = get(ZZAV_W_TUNE);
+
+        put(ZZAV_W_TUNE, 0);
+        nq_max = tune & ZZAV_TUNE_NQ4 ? 4 : NQ;
+        conv_ticks = out_ticks = 0;
+        cheap = 0;
+        put(ZZAV_W_CHEAP, 0);
+        shown_any = in_draw = 0;
+        t_first = t_shown = show_ticks = 0;
+        show_n = 0;
+        stretch_nearest = (tune & ZZAV_TUNE_NEAREST) != 0;
+        if (pl_ovl_map)
+            pl_ovl_map((tune & ZZAV_TUNE_OVL_NC) != 0);
+    }
     aframe = av_frame_alloc();
     pcm = malloc(PCM_FRAMES * FRAME_BYTES);
     line = malloc(4096 * 4);
@@ -1051,7 +1255,7 @@ int player_run(void)
         clk = clock_now(t);
 
         /* the picture: decoded ahead into the queue */
-        if (vctx && !vdone && nq < NQ) {
+        if (vctx && !vdone && nq < nq_max) {
             int r = avcodec_receive_frame(vctx, fq[nq]);
 
             if (r == 0) {
@@ -1085,51 +1289,9 @@ int player_run(void)
                 vdone = 1;
         }
 
-        /* the next frame into the back buffer as soon as it is free (with one
-           buffer only, the one on the screen: at the frame's time) */
-        if (nq && !ready && !flip_req) {
-            AVFrame *f = fq[0];
-            const double fpts = fq_pts[0];
-
-            if (!audio_on && !clock_started) {
-                clock_started = 1;
-                t_start = now_ticks();
-                /* on from where the sound left off (it ended first), else from this frame */
-                t_start_media = clock_hold > 0 && clock_hold < fpts ? clock_hold : fpts;
-                clk = t_start_media;
-            }
-            if (clk < 0 && audio_on && !pcm_valid && (adone || (eof_in && !aq.n)))
-                audio_on = 0;           /* the file's sound ended before it began: run on the timer */
-            else if (!dbuf && (clk < 0 || clk < fpts - 0.005))
-                ;
-            else {
-                /* late frames are dropped, but one is drawn at least every 80 ms:
-                   a decoder slower than the file then shows ~12 fps, not nothing */
-                if (clk >= 0 && shown_any && clk - fpts > 0.25 && !f->key_frame && secs(t - t_shown) < 0.08)
-                    put(ZZAV_W_DROPPED, get(ZZAV_W_DROPPED) + 1);
-                else {
-                    uint64_t t0 = now_ticks();
-
-                    show(f);
-                    t_shown = now_ticks();
-                    show_ticks += t_shown - t0;
-                    show_n++;
-                    if (!shown_any)
-                        t_first = t_shown;
-                    shown_any = 1;
-                    ready = 1;
-                    ready_pts = fpts;
-                    ready_key = f->key_frame;
-                }
-                av_frame_unref(f);
-                for (i = 1; i < nq; i++) {      /* the pool keeps its frames: rotate */
-                    fq[i - 1] = fq[i];
-                    fq_pts[i - 1] = fq_pts[i];
-                }
-                fq[nq - 1] = f;
-                nq--;
-            }
-        }
+        /* the next frame into the back buffer as soon as it is free (draw_next;
+           also from hband, while a frame decodes) */
+        draw_next(t, clk);
         flip_due(now_ticks());
 
         /* fall behind: first the loop filter goes, then frames that are no
@@ -1173,8 +1335,10 @@ int player_run(void)
                 put(ZZAV_W_CAD1 + i - 1, cad[i]);
             if (show_n) {
                 put(ZZAV_W_SHOW_US, (uint32_t)(secs(show_ticks) * 1e6 / show_n));
+                put(ZZAV_W_CONV_US, (uint32_t)(secs(conv_ticks) * 1e6 / show_n));
+                put(ZZAV_W_OUT_US, (uint32_t)(secs(out_ticks) * 1e6 / show_n));
                 if (show_n > 25) {
-                    show_ticks = 0;
+                    show_ticks = conv_ticks = out_ticks = 0;
                     show_n = 0;
                 }
             }

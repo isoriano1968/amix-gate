@@ -95,8 +95,33 @@ enum {
     ZZAV_W_REFRESH_US,                          /* the screen's refresh period, measured */
     ZZAV_W_CAD1, ZZAV_W_CAD2, ZZAV_W_CAD3,      /* frames that stayed 1, 2, 3 refreshes */
     ZZAV_W_CAD4,                                /* ... 4 or more (a stall) */
+    ZZAV_W_CONV_US,                             /* of SHOW_US: YUV to RGB and the stretch */
+    ZZAV_W_OUT_US,                              /* of SHOW_US: the rows written into the overlay */
+    ZZAV_W_TUNE,                                /* 68k (tests): ZZAV_TUNE_*, read and cleared at OPEN */
+    ZZAV_W_FLOG_N,                              /* core 1: flips logged at ZZAV_FLOG_W, all told */
+    ZZAV_W_CHEAP,                               /* core 1: frames stretched by the nearest pixel because
+                                                   the decoder was behind (fewer than 3 decoded ahead) */
     ZZAV_W_NWORDS
 };
+
+/* ZZAV_W_TUNE: the earlier ways, to compare (0: the defaults) */
+#define ZZAV_TUNE_NEAREST   1                   /* stretch by the nearest pixel, not filtered */
+#define ZZAV_TUNE_OVL_NC    2                   /* overlay buffers Normal Non-cacheable, not write-through */
+#define ZZAV_TUNE_NQ4       4                   /* decode 4 frames ahead, not 8 */
+
+/*
+ * The flip log: words ZZAV_FLOG_W.. of the block, a ring of ZZAV_FLOG_LEN, one
+ * word per flip core 0 made, entry (FLOG_N - 1) % LEN the latest:
+ *   bits 0-3   refreshes the frame before stayed on the screen (as CAD1..4)
+ *   bits 4-15  how late the flip was asked for: the clock past the frame's
+ *              time less half a refresh, 0.1 ms (4095: more)
+ *   bits 16-23 the longest gap between two looks at the flip word while
+ *              waiting for it, 0.1 ms (255: more)
+ *   bits 24-31 ms from the picture being in the back buffer to its flip
+ *              asked for (0: drawn too late for its refresh)
+ */
+#define ZZAV_FLOG_W         128
+#define ZZAV_FLOG_LEN       128
 
 /*
  * ZZAV_CMD_OPEN_URL: the 68k writes the URL (http://host[:port]/path, NUL-ended)
