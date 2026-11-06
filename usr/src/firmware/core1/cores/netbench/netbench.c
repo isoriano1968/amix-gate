@@ -23,6 +23,8 @@
 #define GET_TIMEOUT_S   120
 
 const char hb_core_name[16] = "netbench";
+const uint32_t hb_core_version = HB_VERSION(1, 0, 0);   /* cores/CHANGES.md */
+const uint32_t hb_core_parts = HB_PART_NETBENCH;
 
 void hb_service(void)
 {

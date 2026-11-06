@@ -24,6 +24,8 @@
 
 /* ztop shows this name for core 1 */
 const char hb_core_name[16] = "glbench";
+const uint32_t hb_core_version = HB_VERSION(1, 0, 0);   /* cores/CHANGES.md */
+const uint32_t hb_core_parts = HB_PART_GLBENCH;
 
 /* zz_exec.c (in libOSMesa.a) reports to zzgl's server, which this program
    does not have: nothing to report to */

@@ -20,6 +20,8 @@
 /* ztop shows this name for core 1 */
 #ifndef HB_COMBINED
 const char hb_core_name[16] = "gpu";
+const uint32_t hb_core_version = HB_VERSION(1, 0, 0);   /* cores/CHANGES.md */
+const uint32_t hb_core_parts = HB_PART_GL;
 #endif
 
 #define AUDIO_POS_REG   0x7FC00128UL    /* the formatter's position in the HDMI ring (vplay) */

@@ -14,6 +14,8 @@
 #include "c1netif.h"
 
 const char hb_core_name[16] = "amix";
+const uint32_t hb_core_version = HB_VERSION(1, 4, 0);   /* cores/CHANGES.md */
+const uint32_t hb_core_parts = HB_PART_GL | HB_PART_H264 | HB_PART_CRYPTO | HB_PART_NET;
 
 int gl_hb_decode(const uint8_t *data, size_t size, int flags, hb_clock clock,
                  void (*progress)(uint32_t frames), struct hb_result *r);

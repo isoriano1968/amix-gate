@@ -79,8 +79,22 @@ enum {
                                                    (read by ztop on AMIX) */
     W_STAGE,                                    /* how far core 1's start-up got (1-4, 5 = ready) */
     W_NAME, W_NAME_END = W_NAME + 3,            /* the program's name, 16 bytes, NUL-padded (ztop) */
+    W_VERSION,                                  /* the program's version: major << 16 | minor << 8 |
+                                                   patch; 0 = a core from before versions */
+    W_PARTS,                                    /* what it can do: HB_PART_* bits */
     W_NWORDS
 };
+
+/* W_VERSION */
+#define HB_VERSION(maj, min, pat) ((uint32_t)(maj) << 16 | (uint32_t)(min) << 8 | (uint32_t)(pat))
+
+/* W_PARTS: the services a core 1 program offers (ztop names them) */
+#define HB_PART_GL          0x01            /* zzgl: the GL server (Mesa softpipe) */
+#define HB_PART_H264        0x02            /* the zzav player: H.264 + sound to HDMI */
+#define HB_PART_CRYPTO      0x04            /* zzcrypto: public-key jobs for OpenSSL */
+#define HB_PART_NET         0x08            /* core 1's own network: streams by URL */
+#define HB_PART_GLBENCH     0x10            /* the Mesa benchmark (osbench) */
+#define HB_PART_NETBENCH    0x20            /* the lwIP benchmark */
 
 struct hb_result {
     uint32_t frames, width, height, errors, checksum;

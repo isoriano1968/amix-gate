@@ -4,7 +4,8 @@
  * decoder's speed and checksum (compare with h264bench-host on the PC).
  *
  *   armbench [-nodeblock] clip.h264
- *   armbench -dump        (the control block's words, raw)
+ *   armbench -dump        (the control block's words, raw, then the core's
+ *                          name, version and parts)
  *   armbench -load z3660ARM_Core_h264bench.bin    (core 0 starts core 1 with this image:
  *                                                once per power cycle)
  *   armbench -reload [-force] z3660ARM_Core_xxx.bin (the running image replaces itself:
@@ -326,6 +327,26 @@ int main(int argc, char **argv)
         }
         for (i = 0; i < 40; i++)
             printf("%08lx%c", ctl[i], i % 8 == 7 ? '\n' : ' ');
+        if (ctl[W_MAGIC] == HB_MAGIC_READY) {
+            static const char *parts[] = { "gl", "h264", "crypto", "net", "glbench", "netbench" };
+            unsigned long v = ctl[W_VERSION];
+            char name[17];
+
+            for (i = 0; i < 16; i++) {          /* big-endian words: the bytes in order */
+                name[i] = (char)(ctl[W_NAME + i / 4] >> (24 - 8 * (i % 4)));
+                if (name[i] < ' ' || name[i] > '~')
+                    name[i] = 0;
+            }
+            name[16] = 0;
+            if (v && v <= 0xffffff) {
+                printf("core: %s %lu.%lu.%lu [", name[0] ? name : "h264bench", v >> 16, (v >> 8) & 0xff, v & 0xff);
+                for (i = 0, f = 0; i < 6; i++)
+                    if (ctl[W_PARTS] & (1UL << i))
+                        printf("%s%s", f++ ? " " : "", parts[i]);
+                printf("]\n");
+            } else
+                printf("core: %s (from before versions)\n", name[0] ? name : "h264bench");
+        }
         if ((ctl = (volatile unsigned long *)map(fd, C1LD_OFF, PAGE)) != NULL)
             printf("loader: %08lx cmd %08lx status %ld loads %lu\n", ctl[C1LD_W_MAGIC], ctl[C1LD_W_CMD],
                    (long)ctl[C1LD_W_STATUS], ctl[C1LD_W_COUNT]);

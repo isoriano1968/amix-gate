@@ -53,6 +53,14 @@ static volatile uint32_t *ctl = (volatile uint32_t *)(RTG_BASE + HB_CTL_OFF);
 
 /* the name ztop shows; another program built on this file defines its own */
 __attribute__((weak)) const char hb_core_name[16] = "h264bench";
+/* each program's version and parts (bench.h W_VERSION, W_PARTS); see
+   cores/CHANGES.md */
+extern const uint32_t hb_core_version __attribute__((weak));
+extern const uint32_t hb_core_parts __attribute__((weak));
+/* h264bench's own, when the program defines none (a weak definition with a
+   value would be folded in here, and the program's would never be read) */
+#define HB_OWN_VERSION  HB_VERSION(1, 0, 0)
+#define HB_OWN_PARTS    HB_PART_H264
 
 /* zzcrypto's jobs from the 060 (zzc_arm.c, in the cores that have it):
    called while waiting, here and in the GL server and the player */
@@ -418,6 +426,8 @@ int main(void)
     for (i = 0; i < 4; i++)              /* big-endian words: the 68k reads the bytes in order */
         put(W_NAME + i, (uint32_t)hb_core_name[i * 4] << 24 | (uint32_t)hb_core_name[i * 4 + 1] << 16 |
                         (uint32_t)hb_core_name[i * 4 + 2] << 8 | (uint32_t)hb_core_name[i * 4 + 3]);
+    put(W_VERSION, &hb_core_version ? hb_core_version : HB_OWN_VERSION);
+    put(W_PARTS, &hb_core_parts ? hb_core_parts : HB_OWN_PARTS);
     put(W_STATE, HB_IDLE);
     put(W_LOAD, 0);
     win_start = ticks();

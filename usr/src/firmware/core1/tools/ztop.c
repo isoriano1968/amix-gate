@@ -62,6 +62,8 @@
 #define HB_W_FAULT_PC           22
 #define HB_W_LOAD               23
 #define HB_W_NAME               25	/* 16 bytes: the program's name (0: an older h264bench) */
+#define HB_W_VERSION            29	/* major << 16 | minor << 8 | patch (0: before versions) */
+#define HB_W_PARTS              30	/* bench.h HB_PART_* */
 
 /* core 1's network block (amix-gate core1 cores/h264bench/core1_net.h):
    little-endian words (the ARM's), the addresses in network order */
@@ -199,6 +201,28 @@ core1_name()
     return name[0] ? name : "h264bench";
 }
 
+/* ", v1.4 [gl h264 crypto net]", or "" for a core from before versions */
+static char *
+core1_version()
+{
+    static char buf[80];
+    static char *parts[] = { "gl", "h264", "crypto", "net", "glbench", "netbench" };
+    unsigned long v = hb[HB_W_VERSION], p = hb[HB_W_PARTS];
+    int i, n;
+
+    if (!v || v > 0xffffff)
+        return "";
+    n = sprintf(buf, ", v%lu.%lu", v >> 16, (v >> 8) & 0xff);
+    if (v & 0xff)
+        n += sprintf(buf + n, ".%lu", v & 0xff);
+    n += sprintf(buf + n, " [");
+    for (i = 0; i < 6; i++)
+        if (p & (1UL << i))
+            n += sprintf(buf + n, "%s%s", buf[n - 1] == '[' ? "" : " ", parts[i]);
+    sprintf(buf + n, "]");
+    return buf;
+}
+
 /* core 1, one line (loop 0) or a short column */
 static void
 core1(loop)
@@ -239,7 +263,7 @@ int loop;
             hb[HB_W_LOAD] / 10, hb[HB_W_LOAD] % 10, hb[HB_W_CPU_HZ] / 1000000);
         if (hb[HB_W_STATE] == 2)
             printf(", %lu frames", hb[HB_W_PROGRESS]);
-        printf("\n");
+        printf("%s\n", core1_version());
         if (hb[HB_W_FRAMES] && hb[HB_W_TICK_HZ]) {
             double sec = (hb[HB_W_TICKS_HI] * 4294967296.0 + hb[HB_W_TICKS_LO]) / hb[HB_W_TICK_HZ];
 
