@@ -98,14 +98,40 @@ def next_seq(builddir, today):
         f.write(f"{today} {seq}\n")
     return seq
 
+def next_stamp_minute(builddir, now):
+    """Our block (isoriano, seq 100+): the build id is the build time, MMDD-hhmm.
+
+    A per-day counter of 16 ran out in a busy day (2026-11-06/07); a time stamp does not.
+    Unique per build directory: the last minute used is kept in .build-stamp, and a second
+    stamp within the same minute takes the next one (a monotonic clock, never a repeat).
+    The year is not in the id (16-char field); records carry the date and sha256 anyway.
+    """
+    f = os.path.join(builddir, '.build-stamp')
+    t = now.replace(second=0, microsecond=0)
+    try:
+        last = datetime.datetime.strptime(open(f).read().strip(), '%Y%m%d%H%M')
+        if t <= last:
+            t = last + datetime.timedelta(minutes=1)
+    except (OSError, ValueError):
+        pass
+    with open(f, 'w') as fh:
+        fh.write(t.strftime('%Y%m%d%H%M') + "\n")
+    return t
+
 def main():
     if len(sys.argv) != 2:
         die(f"usage: {sys.argv[0]} <kernel-elf>")
     path = sys.argv[1]
-    today = datetime.date.today().strftime('%y%m%d')
-    seq = next_seq(os.path.dirname(path) or '.', today)
-    # local (isoriano): seq 100+ has no two-digit room; tag it "i<hex>" so it never reads as an upstream id
-    field = (f" 68040-{today}-i{seq-100:x}" if seq >= 100 else f" 68040-{today}-{seq:02d}").encode()
+    builddir = os.path.dirname(path) or '.'
+    lo, hi = seq_block()
+    if lo >= 100:
+        # local (isoriano): " 68040-MMDD-hhmm" -- 4+4 digits, never the upstream 6+2 shape
+        t = next_stamp_minute(builddir, datetime.datetime.now())
+        field = t.strftime(" 68040-%m%d-%H%M").encode()
+    else:
+        today = datetime.date.today().strftime('%y%m%d')
+        seq = next_seq(builddir, today)
+        field = f" 68040-{today}-{seq:02d}".encode()
     if len(field) != FIELD_LEN:
         die(f"stamp too long: {field!r} ({len(field)} != {FIELD_LEN})")
 

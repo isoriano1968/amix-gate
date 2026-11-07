@@ -24,6 +24,7 @@ Numbers that carry a per-line block never do. This table is the registry, and
 | antti.sokero@gmail.com | 1-99 | 1-49 |
 | jussi@alanara.fi | 100-199 | 50-99 |
 | 81116077+isoriano1968@users.noreply.github.com | 200-299 | 100-115 |
+| 81116077+isoriano1968@users.noreply.github.com | 200-299 | 100-115 |
 
 **Identity comes from `git config user.email`.** It is already on every machine, git already
 uses it for authorship, and it survives a fresh clone and a lost session — which is what a
@@ -43,6 +44,10 @@ Do not take one by hand. Scanning `KNOWN-ISSUES.md` for the highest number and a
 exactly the reasoning that produced the collision below, and it is the reasoning a fresh
 assistant session will arrive at unaided if the easy path does not already give the right
 answer.
+
+Since 2026-11-07 the `81116077+isoriano1968@users.noreply.github.com` line stamps the build time instead of a sequence
+(`68060-1107-1432`): 4+4 digits, so it can never take the shape of another line's
+`YYMMDD-NN`, and it cannot run out the way 16 per day did on 2026-11-06/07.
 
 Build-id sequences need no discipline at all: `src/stamp_buildid.py` performs the same
 lookup itself, so an image cannot be stamped outside its block. That is deliberate. A rule
