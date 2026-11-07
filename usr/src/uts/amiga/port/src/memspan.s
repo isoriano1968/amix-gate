@@ -238,13 +238,10 @@ Lmb_ab_cond:
 	subl	%d7,%d0
 	addl	%d0,%d5
 	movel	%d5,maxmem
-| SVR4.0's anon_resv also needs anoninfo.ani_max (only swapadd raises it, by
-| the swap size), so without this the processes together could reserve no
-| more anonymous memory than swap, whatever the RAM (6 x 64 MB failed with
-| 200 MB swap and 528 MB RAM, 2026-11-07).  The RAM counts as well, as
-| Solaris' swapfs does; availsmem (RAM + swap, set from maxmem and by
-| swapadd) still bounds the total.
-	addl	%d5,anoninfo
+| NOT here: adding the RAM to anoninfo.ani_max (swapfs-like) let processes
+| reserve more than the real swap; segu_get then panicked "swap allocation
+| failure" (2026-11-07, 8 x 64 MB with 200 MB swap).  SVR4.0 needs every
+| reservation backed by real swap: give it enough swap instead.
 	movel	mspan_extra,%d0
 	addl	%d0,physmem
 	movel	mspan_top,maxclick	| the array's end (step 3)

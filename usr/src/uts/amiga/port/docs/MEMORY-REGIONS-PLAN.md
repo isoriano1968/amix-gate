@@ -204,9 +204,11 @@ as managed, and sets `maxclick` to the array's end. Built on `a3k-kv32-ser` (arr
 Booted on the A3000 (68060-1107-2326): Total 553644032, available 540499968.
 
 SVR4.0's `anon_resv` needs `anoninfo.ani_max` too, which only `swapadd` raises (by the swap
-size): 6 x 64 MB processes failed with 200 MB swap while 515 MB RAM was free. `mspan_build`
-now adds `maxmem` to `ani_max` (RAM counts as reservable, as Solaris' swapfs); `availsmem`
-(RAM + swap) still bounds the total. Built, not yet booted.
+size): 6 x 64 MB processes failed with 200 MB swap while 515 MB RAM was free. Adding
+`maxmem` to `ani_max` (swapfs-like) was tried and is WRONG: 8 x 64 MB then paged out, the
+real swap ran out, "memhold was killed due to lack of swap space", and `segu_get` panicked
+"swap allocation failure". Reverted: SVR4.0 needs every reservation backed by real swap, so
+the 512 MB machine needs swap of at least its anonymous memory (a 2 GB swap disk).
 
 ### Step 3: vmemmap only if a hole gets big
 If a future layout has a hole of hundreds of MB inside the span, map the hole part of the
