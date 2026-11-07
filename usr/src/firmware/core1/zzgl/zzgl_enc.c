@@ -896,6 +896,24 @@ zzgl_close(void)
 }
 
 /*
+ * glLockArraysEXT: a hint only, kept here.  Each draw sends its own
+ * elements rebased to its first one, so core 1's Mesa must not see a lock
+ * on the program's numbering: with it, Quake 3 drawn in another surface
+ * order took wrong vertices.  Core 1 gains nothing from a lock either.
+ */
+static void GLAPIENTRY
+zzgl_LockArraysEXT_t(GLint first, GLsizei count)
+{
+   (void)first;
+   (void)count;
+}
+
+static void GLAPIENTRY
+zzgl_UnlockArraysEXT_t(void)
+{
+}
+
+/*
  * By name.
  */
 static const struct {
@@ -917,6 +935,8 @@ static const struct {
    { "glDrawArrays", (void *)zzgl_DrawArrays },
    { "glDrawElements", (void *)zzgl_DrawElements },
    { "glArrayElement", (void *)zzgl_ArrayElement },
+   { "glLockArraysEXT", (void *)zzgl_LockArraysEXT_t },
+   { "glUnlockArraysEXT", (void *)zzgl_UnlockArraysEXT_t },
    { "glLoadMatrixf", (void *)zzgl_LoadMatrixf },
    { "glMultMatrixf", (void *)zzgl_MultMatrixf },
    { "glColor4ubv", (void *)zzgl_Color4ubv },
