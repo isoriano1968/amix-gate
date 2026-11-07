@@ -138,6 +138,62 @@ struct zz9k_blitx {
     unsigned long color;
 };
 /*
+ * ZZ9KIOC_GETMODES: the board's mode table, one row per firmware timing, in
+ * the driver's order (the first row of a size is the one plain SETMODE
+ * picks).  The caller passes room for n rows; the driver copies
+ * min(n, rows) of them and sets n to the number of rows it has, so a call
+ * with n 0 asks for the count.  Returns 0.  Changes nothing: anyone who can
+ * open the device may ask.
+ *
+ * hz100 is the refresh rate in 1/100 Hz and pixclk the pixel clock in kHz,
+ * both computed from the firmware's PLL values and totals (Z3660 src/video.c
+ * preset_video_modes: 100 MHz * mul / div / div2, / htotal / vtotal), not
+ * measured; 0 = not known (the ZZ9000 rows).  The flags describe the row
+ * as the board is now.
+ */
+#define ZZ9KIOC_GETMODES       (ZZ9K_IOC | 19)
+#define ZZ9K_MODES_MAX         64      /* rows a call may ask for */
+
+#define ZZ9K_MF_FIRST          0x0001  /* plain SETMODE picks this row for its size */
+#define ZZ9K_MF_CURRENT        0x0002  /* the board shows this timing now */
+#define ZZ9K_MF_CONSOLE        0x0004  /* the kernel console's mode */
+#define ZZ9K_MF_NOVT           0x0008  /* at 16 bpp too big for the VT console buffer */
+#define ZZ9K_MF_NOFIT          0x0010  /* at 16 bpp bigger than the framebuffer */
+
+struct zz9k_moderow {
+    unsigned short width;
+    unsigned short height;
+    unsigned short hz100;         /* refresh, 1/100 Hz; 0 = not known */
+    unsigned short id;            /* firmware mode id */
+    unsigned long pixclk;         /* pixel clock, kHz; 0 = not known */
+    unsigned short flags;         /* ZZ9K_MF_* */
+    unsigned short pad;
+};
+
+struct zz9k_modelist {
+    struct zz9k_moderow *rows;    /* room for n rows */
+    unsigned long n;              /* in: room; out: rows in the table */
+};
+
+/*
+ * ZZ9KIOC_SETMODEHZ: SETMODE with a refresh rate.  Of the rows of the size
+ * the one nearest hz100 is set (a tie goes to the earlier row); hz100 0
+ * means the first row, as plain SETMODE.  Errors as SETMODE.  On success
+ * hz100 is set to the chosen row's rate (0 if not known) and the ioctl
+ * returns the firmware id.
+ */
+#define ZZ9KIOC_SETMODEHZ      (ZZ9K_IOC | 20)
+
+struct zz9k_modehz {
+    unsigned short width;
+    unsigned short height;
+    unsigned short hz100;         /* in: wanted; out: chosen */
+    unsigned short color_mode;
+    unsigned short scale_mode;
+    unsigned short pad;
+};
+
+/*
  * ZZ9KIOC_GETMONSW was answered by the interim RT-03 driver (03844ac, 407d379) that drove the
  * monitor-switch line itself; it is kept here for zz9k_monsw, which still meets such kernels.
  * Since RT-04 the line belongs to the kernel's monsw driver (sys/monsw.h) and this driver no
@@ -404,6 +460,8 @@ struct zz9k_modetab {
     unsigned short width;
     unsigned short height;
     unsigned short id;
+    unsigned short hz100;         /* refresh, 1/100 Hz; 0 = not known */
+    unsigned long pixclk;         /* pixel clock, kHz; 0 = not known */
 };
 
 struct zz9k_boardtab {

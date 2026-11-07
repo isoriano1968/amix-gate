@@ -4,6 +4,9 @@
  *   zz9k_mode [/dev/zz9000]                 show the driver's current mode
  *   zz9k_mode [/dev/zz9000] WxH [16|32]     set the mode (RGB565 or 32-bit)
  *                                           and switch the output to RTG
+ *   zz9k_mode [/dev/zz9000] WxH@HZ [16|32]  the same, the timing of that size
+ *                                           nearest HZ (e.g. 1920x1080@50,
+ *                                           @60.6): ZZ9KIOC_SETMODEHZ
  *
  * The mode names are the resolutions the driver's table for the attached
  * board accepts (EINVAL otherwise); the framebuffer is left as it is.  For
@@ -16,11 +19,11 @@
 #include "../zz9000.h"
 
 static int
-parse_res(s, w, h)
+parse_res(s, w, h, hz100)
 char *s;
-unsigned short *w, *h;
+unsigned short *w, *h, *hz100;
 {
-    unsigned int a, b;
+    unsigned int a, b, hz, frac, digits;
     char *p;
 
     a = 0;
@@ -31,6 +34,23 @@ unsigned short *w, *h;
     b = 0;
     for (++p; *p >= '0' && *p <= '9'; ++p)
         b = b * 10 + (*p - '0');
+    *hz100 = 0;
+    if (*p == '@') {                    /* HZ, up to two decimals */
+        hz = frac = digits = 0;
+        for (++p; *p >= '0' && *p <= '9' && hz < 1000; ++p)
+            hz = hz * 10 + (*p - '0');
+        if (*p == '.')
+            for (++p; *p >= '0' && *p <= '9'; ++p)
+                if (digits < 2) {
+                    frac = frac * 10 + (*p - '0');
+                    ++digits;
+                }
+        if (digits == 1)
+            frac *= 10;
+        if (hz == 0 || hz > 200)
+            return 0;
+        *hz100 = (unsigned short)(hz * 100 + frac);
+    }
     if (*p != 0 || a == 0 || b == 0 || a > 4096 || b > 4096)
         return 0;
     *w = (unsigned short)a;
@@ -47,6 +67,8 @@ char **argv;
     int fd, i, rc;
     struct zz9k_info info;
     struct zz9k_mode mode;
+    struct zz9k_modehz mh;
+    unsigned short hz100;
 
     devname = "/dev/zz9000";
     i = 1;
@@ -75,8 +97,8 @@ char **argv;
         close(fd);
         return 0;
     }
-    if (!parse_res(argv[i], &mode.width, &mode.height)) {
-        printf("usage: zz9k_mode [/dev/zz9000] [WxH [16|32]]\n");
+    if (!parse_res(argv[i], &mode.width, &mode.height, &hz100)) {
+        printf("usage: zz9k_mode [/dev/zz9000] [WxH[@HZ] [16|32]]\n");
         close(fd);
         return 2;
     }
@@ -84,9 +106,21 @@ char **argv;
     if (argc > i + 1 && argv[i + 1][0] == '3' && argv[i + 1][1] == '2')
         mode.color_mode = ZZ9K_COLOR_32BIT;
     mode.scale_mode = 0;
-    rc = ioctl(fd, ZZ9KIOC_SETMODE, &mode);
+    if (hz100) {
+        mh.width = mode.width;
+        mh.height = mode.height;
+        mh.hz100 = hz100;
+        mh.color_mode = mode.color_mode;
+        mh.scale_mode = 0;
+        mh.pad = 0;
+        rc = ioctl(fd, ZZ9KIOC_SETMODEHZ, &mh);
+        if (rc >= 0)
+            printf("firmware id %d, %u.%02u Hz\n", rc, mh.hz100 / 100,
+                mh.hz100 % 100);
+    } else
+        rc = ioctl(fd, ZZ9KIOC_SETMODE, &mode);
     if (rc < 0) {
-        perror("ZZ9KIOC_SETMODE");
+        perror(hz100 ? "ZZ9KIOC_SETMODEHZ" : "ZZ9KIOC_SETMODE");
         printf("%s: mode %ux%u not accepted by the attached board\n", argv[0],
             mode.width, mode.height);
         close(fd);

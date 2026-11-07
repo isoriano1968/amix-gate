@@ -350,25 +350,34 @@ static unsigned short zz9k_regoff_z3660[ZZ9K_NREG] = {
     ZZ9K_Z3660_REG_MONITOR_SWITCH
 };
 
+/*
+ * Refresh (1/100 Hz) and pixel clock (kHz) from the firmware's table (Z3660
+ * src/video.c preset_video_modes, identical in beta 21, fork 1.0 and
+ * amix-main): 100 MHz * mul / div / div2 over htotal * vtotal, computed, not
+ * measured.  Several "60 Hz" presets are really 56-58 Hz.  1920x1080 has two
+ * timings: id 5 (60.6 Hz) stays first, so plain SETMODE keeps choosing it;
+ * id 7 (50.5 Hz) is reached through SETMODEHZ.
+ */
 static struct zz9k_modetab zz9k_modes_z3660[] = {
-    { 1280, 720, ZZ9K_MODE_1280x720 },
-    { 800, 600, ZZ9K_MODE_800x600 },
-    { 640, 480, ZZ9K_MODE_640x480 },
-    { 1024, 768, ZZ9K_MODE_1024x768 },
-    { 1280, 1024, ZZ9K_MODE_1280x1024 },
-    { 1920, 1080, ZZ9K_MODE_1920x1080 },
-    { 720, 576, ZZ9K_MODE_720x576 },
-    { 720, 480, ZZ9K_MODE_720x480 },
-    { 640, 512, ZZ9K_MODE_640x512 },
-    { 1600, 1200, ZZ9K_MODE_1600x1200 },
-    { 2560, 1440, ZZ9K_MODE_2560x1440 },
-    { 640, 400, ZZ9K_Z3660_MODE_640x400 },
-    { 1280, 800, ZZ9K_Z3660_MODE_1280x800 },
-    { 1920, 1200, ZZ9K_Z3660_MODE_1920x1200 },
-    { 1600, 900, ZZ9K_Z3660_MODE_1600x900 },
-    { 1680, 1050, ZZ9K_Z3660_MODE_1680x1050 },
-    { 1366, 768, ZZ9K_Z3660_MODE_1366x768 },
-    { 0, 0, 0 }
+    { 1280, 720, ZZ9K_MODE_1280x720, 5999, 74242 },
+    { 800, 600, ZZ9K_MODE_800x600, 6032, 40000 },
+    { 640, 480, ZZ9K_MODE_640x480, 5952, 25000 },
+    { 1024, 768, ZZ9K_MODE_1024x768, 6000, 65000 },
+    { 1280, 1024, ZZ9K_MODE_1280x1024, 6002, 108000 },
+    { 1920, 1080, ZZ9K_MODE_1920x1080, 6061, 150000 },
+    { 720, 576, ZZ9K_MODE_720x576, 5020, 27108 },
+    { 720, 480, ZZ9K_MODE_720x480, 6032, 25333 },
+    { 640, 512, ZZ9K_MODE_640x512, 6032, 40000 },
+    { 1600, 1200, ZZ9K_MODE_1600x1200, 6021, 161538 },
+    { 2560, 1440, ZZ9K_MODE_2560x1440, 3003, 146428 },
+    { 640, 400, ZZ9K_Z3660_MODE_640x400, 5952, 25000 },
+    { 1280, 800, ZZ9K_Z3660_MODE_1280x800, 5625, 66666 },
+    { 1920, 1200, ZZ9K_Z3660_MODE_1920x1200, 5839, 150000 },
+    { 1600, 900, ZZ9K_Z3660_MODE_1600x900, 5727, 93333 },
+    { 1680, 1050, ZZ9K_Z3660_MODE_1680x1050, 5737, 114000 },
+    { 1366, 768, ZZ9K_Z3660_MODE_1366x768, 6000, 72000 },
+    { 1920, 1080, ZZ9K_MODE_1920x1080p50, 5051, 150000 },
+    { 0, 0, 0, 0, 0 }
 };
 #endif /* ZZ9K_TARGET_Z3660 */
 
@@ -484,6 +493,38 @@ unsigned short height;
         if (m->width == width && m->height == height)
             return m->id;
     return 0xffff;
+}
+
+/*
+ * The row of width x height nearest hz100 (0: the first row of the size);
+ * a tie keeps the earlier row.  0 if the size is not in the table.
+ */
+static struct zz9k_modetab *
+zz9k_mode_hz(bp, width, height, hz100)
+struct zz9k_board *bp;
+unsigned short width;
+unsigned short height;
+unsigned short hz100;
+{
+    struct zz9k_modetab *m, *best;
+    long d, bestd;
+
+    best = (struct zz9k_modetab *)0;
+    bestd = 0;
+    for (m = bp->bt->modes; m->width; ++m) {
+        if (m->width != width || m->height != height)
+            continue;
+        if (!hz100)
+            return m;
+        d = (long)m->hz100 - (long)hz100;
+        if (d < 0)
+            d = -d;
+        if (!best || d < bestd) {
+            best = m;
+            bestd = d;
+        }
+    }
+    return best;
 }
 
 static unsigned short
@@ -1793,32 +1834,70 @@ unsigned n;
  * displayed one into a console buffer of its own in off-screen VRAM and pans
  * the card between that buffer and the screen at framebuffer offset 0, the
  * X server's.  An X session's pixels are never touched, so switching back to
- * it needs no repaint.  ZZ9K_VT_OFF is clear of the screen and soft3D's back
- * buffer (rows 1100.., the screen's stride) and below the video overlay
- * (board 0x06000000) and core 1's rings (board 0x07100000).
+ * it needs no repaint.
+ *
+ * The buffer ends at framebuffer offset ZZ9K_VT_END, where soft3D's data
+ * block starts (libs3d DATA_OFF 0x2400000; TinyGL's textures follow at
+ * 0x2500000), so it lies in soft3D's texture area (0x0C00000-0x23FFFFF), as
+ * it always has, clear of the screen and soft3D's back buffer (rows 1100..,
+ * the screen's stride) and below the video overlay (board 0x06000000) and
+ * core 1's rings (board 0x07100000).  It is mapped at the size the mode
+ * needs, ZZ9K_VT_SMALL (1920x1080x16 and everything smaller: at 0x2000000,
+ * as before pass 2) or ZZ9K_VT_BIG (1920x1200, 2560x1440: at 0x1C00000).
+ * The big mapping is made only when such a mode is set (SETMODE/SETMODEHZ
+ * with the redirect on), so a machine that never uses one spends no more
+ * kernel virtual space (sptmap, inside the kvseg) than before.  The small
+ * mapping is kept after the switch: vt040.c may hold its address until it
+ * next asks zz9000vtinfo; it costs ZZ9K_VT_SMALL of address space once.
+ * If the big mapping cannot be had, the big modes simply have no console
+ * mirror (zz9000vtinfo says no), as before pass 2.
  */
-#define ZZ9K_VT_OFF    0x02000000UL      /* framebuffer offset of the buffer */
-#define ZZ9K_VT_SIZE   0x00400000UL      /* 1920x1080x16 bpp fits */
+#define ZZ9K_VT_END    0x02400000UL      /* framebuffer offset the buffer ends at */
+#define ZZ9K_VT_SMALL  0x00400000UL      /* 1920x1080x16 bpp = 0x3f4800 fits */
+#define ZZ9K_VT_BIG    0x00800000UL      /* 2560x1440x16 bpp = 0x708000 fits */
+#define ZZ9K_VT_SIZE   ZZ9K_VT_BIG       /* the most a mode may need */
 
 static char *zz9k_vt_fb;                 /* kernel mapping of the buffer */
+static unsigned long zz9k_vt_off;        /* its framebuffer offset */
+static unsigned long zz9k_vt_size;       /* its size, 0 = not mapped */
 
 /*
- * Map the console buffer.  Called when the console redirect is switched on
- * (an ioctl: process context), never from vt040.c, whose calls can come
- * from the keyboard interrupt: dev_kvmap goes through sptalloc.
+ * Map the console buffer for the current mode, or a bigger one if the mode
+ * needs it.  Called when the console redirect is switched on and when a mode
+ * is set with the redirect on (ioctls: process context), never from
+ * vt040.c, whose calls can come from the keyboard interrupt: dev_kvmap goes
+ * through sptalloc.
  */
 static void
 zz9k_vt_map(bp)
 struct zz9k_board *bp;
 {
-    if (zz9k_vt_fb || ZZ9K_VT_OFF + ZZ9K_VT_SIZE > bp->fb_size)
+    unsigned long need, size, off;
+    char *p;
+    int s;
+
+    need = (unsigned long)bp->width * bp->height * 2;
+    if (need <= zz9k_vt_size || need > ZZ9K_VT_BIG)
         return;
+    size = need <= ZZ9K_VT_SMALL ? ZZ9K_VT_SMALL : ZZ9K_VT_BIG;
+    if (size <= zz9k_vt_size || ZZ9K_VT_END > bp->fb_size)
+        return;
+    off = ZZ9K_VT_END - size;
 #ifdef ZZ9K_KVMAP
-    zz9k_vt_fb = dev_kvmap((unsigned long)ZZ9K_FBPA(bp) + ZZ9K_VT_OFF,
-        ZZ9K_VT_SIZE, ZZ9K_CM_NC, 0);
+    p = dev_kvmap((unsigned long)ZZ9K_FBPA(bp) + off, size, ZZ9K_CM_NC, 0);
+    if (!p) {
+        printf("zz9000: no kernel space for a 0x%x console buffer\n",
+            (unsigned int)size);
+        return;
+    }
 #else
-    zz9k_vt_fb = bp->fb + ZZ9K_VT_OFF;
+    p = bp->fb + off;
 #endif
+    s = spl6();                          /* the keyboard and the clock see all three */
+    zz9k_vt_fb = p;
+    zz9k_vt_off = off;
+    zz9k_vt_size = size;
+    splx(s);
 }
 
 /*
@@ -1837,7 +1916,7 @@ int *wp, *hp;
     if (!bp || !zz9k_console_redirect)
         return -1;
     if (!zz9k_vt_fb || zz9k_bpp(bp->color_mode) != 2 ||
-        (unsigned long)bp->width * bp->height * 2 > ZZ9K_VT_SIZE)
+        (unsigned long)bp->width * bp->height * 2 > zz9k_vt_size)
         return -1;
     if (!zz9k_vt_on) {
         zz9k_console_cursor(0);
@@ -1865,7 +1944,7 @@ int on;
     zz9k_wr(bp, ZZ9K_R_X1, 0);
     zz9k_wr(bp, ZZ9K_R_Y1, 0);
     zz9k_wr(bp, ZZ9K_R_X2, 0);
-    zz9k_wr32(bp, ZZ9K_R_PAN, on ? ZZ9K_VT_OFF : 0);
+    zz9k_wr32(bp, ZZ9K_R_PAN, on ? zz9k_vt_off : 0);
     ZZ9K_BLIT_FORGET(bp);
 }
 
@@ -2133,6 +2212,116 @@ int *rvalp;
     return 0;
 }
 
+/*
+ * ZZ9KIOC_GETMODES (zz9000.h).  Read-only: nothing on the board changes.
+ */
+static int
+zz9k_getmodes(unit, bp, arg, rvalp)
+int unit;
+struct zz9k_board *bp;
+int arg;
+int *rvalp;
+{
+    struct zz9k_modelist ml;
+    struct zz9k_moderow row;
+    struct zz9k_modetab *m, *f;
+    unsigned long n, frame;
+
+    if (!zz9k_probe(unit))
+        return ENXIO;
+    if (copyin((caddr_t)arg, (caddr_t)&ml, sizeof ml))
+        return EFAULT;
+    if (ml.n > ZZ9K_MODES_MAX)
+        ml.n = ZZ9K_MODES_MAX;
+    for (n = 0, m = bp->bt->modes; m->width; ++m, ++n) {
+        if (n >= ml.n)
+            continue;                   /* count the rest */
+        row.width = m->width;
+        row.height = m->height;
+        row.hz100 = m->hz100;
+        row.id = m->id;
+        row.pixclk = m->pixclk;
+        row.pad = 0;
+        row.flags = 0;
+        for (f = bp->bt->modes; f->width; ++f)
+            if (f->width == m->width && f->height == m->height)
+                break;
+        if (f == m)
+            row.flags |= ZZ9K_MF_FIRST;
+        if (bp->mode == m->id && bp->width == m->width &&
+            bp->height == m->height)
+            row.flags |= ZZ9K_MF_CURRENT;
+        if (m->width == bp->bt->con_width && m->height == bp->bt->con_height &&
+            (row.flags & ZZ9K_MF_FIRST))
+            row.flags |= ZZ9K_MF_CONSOLE;
+        frame = (unsigned long)m->width * m->height * 2;
+        if (frame > ZZ9K_VT_SIZE)
+            row.flags |= ZZ9K_MF_NOVT;
+        if (frame > bp->fb_size)
+            row.flags |= ZZ9K_MF_NOFIT;
+        if (copyout((caddr_t)&row, (caddr_t)(ml.rows + n), sizeof row))
+            return EFAULT;
+    }
+    ml.n = n;
+    if (copyout((caddr_t)&ml, (caddr_t)arg, sizeof ml))
+        return EFAULT;
+    *rvalp = 0;
+    return 0;
+}
+
+/*
+ * ZZ9KIOC_SETMODEHZ (zz9000.h) when hz, else ZZ9KIOC_SETMODE (struct
+ * zz9k_mode, the first row of the size): the same checks and effects as the
+ * switch's old SETMODE case, and with the console redirect on the VT
+ * console buffer is grown to the new mode.
+ */
+static int
+zz9k_setmodehz(unit, bp, arg, rvalp, hz)
+int unit;
+struct zz9k_board *bp;
+int arg;
+int *rvalp;
+int hz;
+{
+    struct zz9k_modehz mh;
+    struct zz9k_mode sm;
+    struct zz9k_modetab *m;
+    unsigned short bpp;
+
+    if (!zz9k_probe(unit))
+        return ENXIO;
+    if (hz) {
+        if (copyin((caddr_t)arg, (caddr_t)&mh, sizeof mh))
+            return EFAULT;
+    } else {
+        if (copyin((caddr_t)arg, (caddr_t)&sm, sizeof sm))
+            return EFAULT;
+        mh.width = sm.width;
+        mh.height = sm.height;
+        mh.hz100 = 0;
+        mh.color_mode = sm.color_mode;
+        mh.scale_mode = sm.scale_mode;
+    }
+    m = zz9k_mode_hz(bp, mh.width, mh.height, mh.hz100);
+    bpp = zz9k_bpp(mh.color_mode);
+    if (!m || bpp == 0)
+        return EINVAL;
+    if ((unsigned long)mh.width * mh.height * bpp > bp->fb_size)
+        return ENOMEM;
+    zz9k_set_mode_hw(bp, m->id, mh.color_mode, mh.scale_mode);
+    bp->width = mh.width;
+    bp->height = mh.height;
+    if (zz9k_console_redirect && zz9k_console_bp == bp)
+        zz9k_vt_map(bp);
+    if (!hz)
+        return 0;
+    mh.hz100 = m->hz100;
+    if (copyout((caddr_t)&mh, (caddr_t)arg, sizeof mh))
+        return EFAULT;
+    *rvalp = m->id;
+    return 0;
+}
+
 int
 zz9000ioctl(dev, cmd, arg, mode, cr, rvalp)
 dev_t dev;
@@ -2233,6 +2422,19 @@ int *rvalp;
         return 0;
     }
 #endif
+    if (cmd == ZZ9KIOC_GETMODES)        /* outside the switch for the same reason */
+        return zz9k_getmodes(unit, bp, arg, rvalp);
+    if (cmd == ZZ9KIOC_SETMODEHZ)       /* outside the switch for the same reason */
+        return zz9k_setmodehz(unit, bp, arg, rvalp, 1);
+    /*
+     * SETMODE is answered here as well, so that it can grow the VT console
+     * buffer; its case in the switch below is no longer reached.  It stays
+     * so that the switch keeps its bytes: changing a case moves the jump
+     * table's offsets, and one once decoded as a 68060-unimplemented movep
+     * (407d379; pass 2 met it again).
+     */
+    if (cmd == ZZ9KIOC_SETMODE)
+        return zz9k_setmodehz(unit, bp, arg, rvalp, 0);
 
     switch (cmd) {
     case ZZ9KIOC_GETAUTOCON:
