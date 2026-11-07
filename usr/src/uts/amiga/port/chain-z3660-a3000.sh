@@ -8,7 +8,12 @@
 #   -> ksegtbl (8 KB kseg table: the stock 32 bytes overflowed into
 #      as_freelist with a kvseg above 4 MB; the 256 MB panic, 2026-11-06)
 #   -> memregions (region table + pfn_valid, docs/MEMORY-REGIONS-PLAN.md step 1)
-#   -> memspan (one page array over the regions below the kernel, step 2)
+#   -> memspan (one page array over the regions below the kernel, step 2;
+#      step 3: also the regions above it, i.e. the Z3 RAM pvmk's z3reloc
+#      moves to 0x20000000, and the RAM counted in anoninfo.ani_max)
+# 512 MB (after z3reloc, boot -m #256): BASE=build/a3k-kv32-ser (the page
+# array grows to ~10 MB) and Z3660_RTG_SRC=<amix-gate>/.../driver/zz9000;
+# built 2026-11-07 as build/z3l/m5-msp.
 # From $BASE, default build/a3k-kv16-ser (relink-040-kvseg.sh KVSEG_MB=16 + relink-040-serkeep.sh
 # on build/unix-040).  The driver sources come from the amix-z3660scsi and
 # amix-z3660net checkouts (branches zs05-amigaux, eth-amigaux-1.0.0-7).

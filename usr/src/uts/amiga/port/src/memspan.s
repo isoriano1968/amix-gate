@@ -23,7 +23,12 @@
 |
 | The page-table plausibility guards' `movel #_start,%dN` become
 | `movel mspan_loaddr,%dN` (patcher), so page tables in motherboard RAM pass.
-| Regions above the kernel region (maxclick) are not used yet (later step).
+| Regions above the kernel region (step 3, 2026-11-07: the Z3660's Zorro III
+| RAM, moved to 0x20000000 by pvmk's z3reloc) widen the array to their end:
+| entries = top - lo, they are freed after the motherboard RAM and before the
+| kernel region (so CPU RAM is handed out first), and maxclick becomes top.
+| The pages between maxclick and such a region are a hole: locked entries,
+| never freed, never managed.
 | Wiring: relink-040-memspan.sh (--globalize-symbol kvm_init, ld -r, patcher).
 | Old gas: '&' immediates, '|' comments, no macros.
 
@@ -36,6 +41,8 @@
 	.globl	mm_hi
 	.globl	mspan_lo
 	.globl	mspan_extra
+	.globl	mspan_above
+	.globl	mspan_top
 	.globl	mspan_sink
 	.globl	mspan_loaddr
 	.globl	pfnchk_d0
@@ -100,8 +107,26 @@ Lmb_lo_cond:
 	bccs	1f
 	movel	%a0,%d0
 1:	movel	%d0,mspan_loaddr
-| entries = maxclick - lo
+| top = the end of the highest RAM region above the kernel's, at least
+| maxclick (step 3)
 	movel	maxclick,%d4
+	lea	memregion,%a2
+	movel	memregion_n,%d2
+	bras	Lmb_top_cond
+Lmb_top_loop:
+	bsr	mb_above		| d0 = base pfn, d1 = end pfn, Z set if not above
+	beqs	Lmb_top_next
+	cmpl	%d4,%d1
+	blss	Lmb_top_next
+	movel	%d1,%d4
+Lmb_top_next:
+	addaw	&12,%a2
+	subql	&1,%d2
+Lmb_top_cond:
+	tstl	%d2
+	bgts	Lmb_top_loop
+	movel	%d4,mspan_top
+| entries = top - lo
 	subl	%d6,%d4
 | page_hashsz: entries / 4 rounded up to a power of two (stock loop)
 	movel	%d4,%d1
@@ -175,6 +200,33 @@ Lmb_fr_next:
 Lmb_fr_cond:
 	tstl	%d2
 	bgts	Lmb_fr_loop
+| then the regions above the kernel's (Z3 RAM), before the kernel region
+	lea	memregion,%a2
+	movel	memregion_n,%d2
+	bras	Lmb_ab_cond
+Lmb_ab_loop:
+	bsr	mb_above
+	beqs	Lmb_ab_next
+	movel	%d0,%d3
+	movel	%d1,%d4
+	movel	%d4,%sp@-
+	movel	%d3,%sp@-
+	jsr	memialloc
+	addqw	&8,%sp
+	movel	%d3,%d0
+	movel	%d4,%d1
+	bsr	mm_add
+	movel	%d4,%d0
+	subl	%d3,%d0
+	addl	%d0,%d5
+	addl	%d0,mspan_extra
+	addl	%d0,mspan_above
+Lmb_ab_next:
+	addaw	&12,%a2
+	subql	&1,%d2
+Lmb_ab_cond:
+	tstl	%d2
+	bgts	Lmb_ab_loop
 	movel	maxclick,%sp@-
 	movel	%d7,%sp@-
 	jsr	memialloc
@@ -186,8 +238,16 @@ Lmb_fr_cond:
 	subl	%d7,%d0
 	addl	%d0,%d5
 	movel	%d5,maxmem
+| SVR4.0's anon_resv also needs anoninfo.ani_max (only swapadd raises it, by
+| the swap size), so without this the processes together could reserve no
+| more anonymous memory than swap, whatever the RAM (6 x 64 MB failed with
+| 200 MB swap and 528 MB RAM, 2026-11-07).  The RAM counts as well, as
+| Solaris' swapfs does; availsmem (RAM + swap, set from maxmem and by
+| swapadd) still bounds the total.
+	addl	%d5,anoninfo
 	movel	mspan_extra,%d0
 	addl	%d0,physmem
+	movel	mspan_top,maxclick	| the array's end (step 3)
 	movel	%d7,%d0
 	moveml	%fp@(-28),%d2-%d7/%a2
 	unlk	%fp
@@ -219,6 +279,31 @@ mb_extra:
 	rts
 Lmx_no:
 	ori	&4,%ccr			| Z set: not extra
+	rts
+
+| mb_above: a2 -> memregion entry.  A region above is MRF_RAM, not
+| MRF_KERNEL, and starts at or above maxclick (the kernel region's end).
+| Out: d0 = base pfn, d1 = end pfn, Z clear if above.  Uses d0/d1 only.
+mb_above:
+	movel	%a2@(8),%d0
+	btst	&1,%d0			| MRF_KERNEL
+	bnes	Lma_no
+	btst	&0,%d0			| MRF_RAM
+	beqs	Lma_no
+	movel	%a2@,%d0
+	lsrl	&8,%d0
+	lsrl	&4,%d0
+	cmpl	maxclick,%d0
+	bcss	Lma_no			| starts below maxclick
+	movel	%a2@(4),%d1
+	lsrl	&8,%d1
+	lsrl	&4,%d1
+	cmpl	%d0,%d1
+	blss	Lma_no
+	andi	&0xfb,%ccr		| Z clear: above
+	rts
+Lma_no:
+	ori	&4,%ccr			| Z set: not above
 	rts
 
 | mm_add: record [d0, d1) as managed.  Uses a0/d0/d1.
@@ -317,4 +402,6 @@ mm_lo:	.space	MM_MAX*4
 mm_hi:	.space	MM_MAX*4
 mspan_lo:	.long	0
 mspan_extra:	.long	0
+mspan_above:	.long	0
+mspan_top:	.long	0
 mspan_loaddr:	.long	0

@@ -194,6 +194,20 @@ Read from the step 1 kernel (mrg-shm). These change the step 2 design below:
   core 1 rings must be checked for buffers in the new regions (core 1 reads 060 RAM
   through its own mapping: the new region must be in that mapping too).
 
+### Step 2b: the Z3 RAM above the kernel (2026-11-07, 528 MB)
+
+pvmk's `z3reloc` (Z3660 firmware AMIX mode) moves the Z3 RAM to 0x20000000 and the RTG to
+0x30000000 and passes the new bases in bootinfo; memregions then sees region 3 as RAM.
+`mspan_build` widens the array to the end of the highest RAM region above the kernel's
+(`mb_above`), frees it after the motherboard RAM and before the kernel region, records it
+as managed, and sets `maxclick` to the array's end. Built on `a3k-kv32-ser` (array ~10 MB).
+Booted on the A3000 (68060-1107-2326): Total 553644032, available 540499968.
+
+SVR4.0's `anon_resv` needs `anoninfo.ani_max` too, which only `swapadd` raises (by the swap
+size): 6 x 64 MB processes failed with 200 MB swap while 515 MB RAM was free. `mspan_build`
+now adds `maxmem` to `ani_max` (RAM counts as reservable, as Solaris' swapfs); `availsmem`
+(RAM + swap) still bounds the total. Built, not yet booted.
+
 ### Step 3: vmemmap only if a hole gets big
 If a future layout has a hole of hundreds of MB inside the span, map the hole part of the
 page array to one shared read-only tile of "reserved" page_t (60 x 4096 bytes repeat
