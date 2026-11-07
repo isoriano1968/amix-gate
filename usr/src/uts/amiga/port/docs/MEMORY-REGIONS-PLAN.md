@@ -1,6 +1,6 @@
 # More RAM for AMIX: non-contiguous memory regions (analysis, 2026-11-06)
 
-Status: analysis only, nothing built. Base kernel: `chain-z3660-a3000.sh` output
+Status: step 1 built and boot-tested 2026-11-07 (relink-040-memregions.sh); steps 2+ not started. Base kernel: `chain-z3660-a3000.sh` output
 (`build/z3l/*-ksg`, /stand/unix since 2026-11-06), which boots at 256 MB after the
 `ksegtbl` fix.
 
@@ -76,6 +76,19 @@ Z3660 DDR map (firmware, see memory notes on the Z3660 firmware):
 | 0x20000000-0x2FFFFFFF | **looks unused, 256 MB** |
 | 0x30000000-0x3FFFFFFF | core 1 (image + heap) |
 | 0x40000000+ | Zorro III boards (AmigaOS allocation), collides with AMIX kernel VA |
+
+Measured 2026-11-07 (step 1 kernel, native boot at 256 MB):
+
+```
+memregion 0: 1000-1FFFFF chip
+memregion 1: 7000000-7FFFFFF RAM, not used yet
+memregion 2: 8000000-17FFFFFF RAM, kernel (MAINSTORE)
+memregion 3: 40000000-4FFFFFFF above 1 GB, not reachable
+```
+
+Region 3 is the Z3660's extra 256 MB, offered to AmigaOS as a Zorro III board
+(manufacturer 5195, product 2) at 0x40000000: exactly the start of AMIX's kernel
+virtual region 1.  Region 1 now meets region 2 without a gap (MemHeader rounding).
 
 So the realistic targets, cheapest first:
 
