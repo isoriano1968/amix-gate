@@ -1,6 +1,6 @@
 # More RAM for AMIX: non-contiguous memory regions (analysis, 2026-11-06)
 
-Status: step 1 built and boot-tested 2026-11-07 (relink-040-memregions.sh); steps 2+ not started. Base kernel: `chain-z3660-a3000.sh` output
+Status: step 1 built and boot-tested 2026-11-07 (relink-040-memregions.sh); step 2 (memspan, 272 MB) built and boot-tested 2026-11-07, not installed; regions above the kernel not yet. Base kernel: `chain-z3660-a3000.sh` output
 (`build/z3l/*-ksg`, /stand/unix since 2026-11-06), which boots at 256 MB after the
 `ksegtbl` fix.
 
@@ -114,7 +114,63 @@ copies `bootinfo.memory[]` into a kernel table `memregion[8] = {base, end, class
 `0xF7C00000`/`0x08000000` fallback (KNOWN-ISSUES, "MAINSTORE fallback").
 Also exports `pfn_valid(pfn)` (table walk, 1-8 entries) for the HAT.
 
-### Step 2: flat array with holes (gets target 1 and 2)
+### Step 2: findings from the kernel (2026-11-07)
+
+Read from the step 1 kernel (mrg-shm). These change the step 2 design below:
+
+- **The array does not start at MAINSTORE.** `kvm_init` (0x48e18-0x48ebc, inline) sizes
+  the array as `(maxclick - ff) * 60` + hash, takes its physical pages at `ff` (the first
+  free page after the kernel, ksegmappt and ksegupt) with `sptalloc(n, 1, ff, 0)`, then
+  `pages_base = ff + n`, `page_init(pp, maxclick - pages_base, pages_base)`,
+  `memialloc(pages_base, maxclick)`. RAM below the kernel can only join if that block
+  is replaced (a `jmp` to our own tail, which returns to 0x48ebc). Extending
+  MAINSTORE/VSIZOFMEM alone does nothing for the array.
+- **The kernel image then falls inside the array** (0x08000000 .. pages_base), and with
+  it the static page tables `ksegmappt`/`ksegupt`. `hat_pt2ptdat` (stock, 18 callers) uses
+  `pages_base <= pfn < pages_end` to tell "VM page holding page tables" from "one of the
+  static kernel tables" (else it panics). With a spanning array the static tables
+  would take the VM-page branch. So **every range check has to become a
+  "managed page" test**: pfn in [region base, region end) for regions that were freed,
+  excluding kernel image, static tables, the array itself and holes. `pfn_valid` from
+  step 1 is "is RAM", not "is managed": step 2 adds `pfn_managed`.
+- **How many range checks** (relocations to pages_base/pages_end, by pattern):
+
+  | code | `cmpl pages_base,%dN; bcs; cmpl pages_end,%dN; bcc/bcs` | other forms |
+  |---|---|---|
+  | stock (13 functions: hat_init, hat_devload, hat_pt2ptdat, hat_ptalloc, hat_sdtfree, hat_swapout, page_numtookpp, page_numtouserpp, prfastmapout, prmapout, segu_softunload) | 14 | 8 base + 8 end (mostly the end compare against %d0, hat_ptalloc 3, hat_swapout 2) |
+  | ours (src/*.s, 12 functions) | 12 | ~8, edited in source |
+
+  The 14 stock pairs can be patched mechanically (20 bytes -> `jsr pfnchk_dN; bcs; nops`,
+  a helper per register that keeps all registers and answers in the carry flag); the 16
+  odd stock sites need reading one by one. The ~48 `subl/addl pages_base` uses are pure
+  pfn<->pp arithmetic and stay.
+- **Whole-array walkers** (stock, via `epages`): setupclock (6), pageout (4), fsflush (2),
+  free_vp_pages, page_* asserts. Kernel-image/hole entries keep page_init's state
+  (p_lock set, no vnode); each walker must be checked to skip such an entry.
+- **Motherboard RAM speed** (`dd` from /dev/mem, 8 MB, kernel time, 5 runs): DDR 1.0 s,
+  motherboard 1.3-1.4 s. Copy-loop bound, so the real gap is larger. Free its pages
+  first in memialloc (page_free with dontneed puts at the head, so the last freed, DDR,
+  is handed out first).
+- **Cost/benefit:** the machinery (kvm_init tail, pfn_managed, ~30 stock patch sites,
+  ~20 source sites, walker checks) is the same for 272 MB (+16 MB slow RAM) and for 512 MB
+  (+256 MB DDR, needs the firmware to place it below 0x40000000). 272 MB is the test
+  vehicle; the payoff is 512 MB.
+
+### Step 2: test results (2026-11-07, msp-shm, native boots over serial)
+
+- `-m #128`: total 150994944 (144 MB = 128 + 16), available 145842176; 4 x 32 MB
+  patterns held and verified (needs motherboard pages), no bus errors, fsck -n clean.
+- `-m #256`: total 285208576 (272 MB), available 278028288; managed ranges read live
+  from /dev/mem: [0x7000,0x8000) and [0x85ef,0x18000), pages_base 0x7000; no leak
+  (maxmem 0x10a11, availrmem 0x103cf, freemem 0xd1d5 after the tests).
+- Parallel pressure (8 python processes) fails with MemoryError at 0-12 MB each while
+  ~160 MB is free; the installed ksg-shm (no memspan) at 256 MB fails the same test the
+  same way, so it is an older limit (ISSUE-39/40 family), investigated separately.
+- Monitors (amixsysmon, sar) read symbol addresses from the /stand kernel with the
+  same build id: test kernels need their own build id (and a copy in /stand) to show
+  right values.
+
+### Step 2: flat array with holes (design as first planned)
 - `kvm_init`/`page_init` already size the array from `maxclick`; with the span in
   `MAINSTORE`/`VSIZOFMEM` it covers the holes automatically. Cost of the 128 MB hole in
   target 2: 32768 x 60 = 1.9 MB of page_t, 0.4 % of 512 MB. kvseg for 512 MB:

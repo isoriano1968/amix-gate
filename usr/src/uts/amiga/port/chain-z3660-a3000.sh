@@ -8,6 +8,7 @@
 #   -> ksegtbl (8 KB kseg table: the stock 32 bytes overflowed into
 #      as_freelist with a kvseg above 4 MB; the 256 MB panic, 2026-11-06)
 #   -> memregions (region table + pfn_valid, docs/MEMORY-REGIONS-PLAN.md step 1)
+#   -> memspan (one page array over the regions below the kernel, step 2)
 # From $BASE, default build/a3k-kv16-ser (relink-040-kvseg.sh KVSEG_MB=16 + relink-040-serkeep.sh
 # on build/unix-040).  The driver sources come from the amix-z3660scsi and
 # amix-z3660net checkouts (branches zs05-amigaux, eth-amigaux-1.0.0-7).
@@ -31,4 +32,5 @@ sh relink-040-random.sh $O/$P-paula2-c1u0 $O/$P-rnd2
 sh relink-040-shm.sh    $O/$P-rnd2 $O/$P-shm
 sh relink-040-ksegtbl.sh $O/$P-shm $O/$P-ksg
 sh relink-040-memregions.sh $O/$P-ksg $O/$P-mrg
-echo "[chain OK] $O/$P-mrg"
+sh relink-040-memspan.sh $O/$P-mrg $O/$P-msp
+echo "[chain OK] $O/$P-msp"
