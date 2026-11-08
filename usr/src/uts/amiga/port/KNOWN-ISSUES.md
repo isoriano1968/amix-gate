@@ -3952,6 +3952,87 @@ afterwards instead of depending on someone watching a screen. Sampling `freemem`
 a burst run would say how close the machine gets to the edge. Neither needs a hardware session of
 its own — they ride along with the next boot.
 
+### ISSUE-39b (2026-11-07, A3000 + Z3660, 256/272 MB): `MemoryError` under parallel load is the SWAP RESERVATION ceiling, not RAM
+
+**Named and measured. Not a kernel defect and not memspan: it is stock SVR4.0 anon accounting, and
+the limit is the size of swap.** It is a separate thing from the `hat_sdtalloc` line above, which
+still occurs for a single 128 MB process (one-page allocation at `freemem = 0`, as measured on
+2026-08-01).
+
+**Symptom (2026-11-07, kernels `ksg-shm` at 256 MB and `msp-shm` at 272 MB alike).** Eight
+`/usr/local/bin/python3` processes started 5 s apart, each allocating 8 × 4 MB `bytearray`s:
+several get `MemoryError` after only 0–16 MB, and sshd prints "exec request failed on channel 0"
+(it cannot fork). At the same moment `freemem` is about 44000 pages, `availsmem` > 73000 and
+`availrmem` about 61500. None of those three is the limit.
+
+**The code path.** `anon_resv` in the linked kernel (`ksg-shm` `.text 0xad69e`) has **two** ways
+to refuse, and only one of them prints anything:
+
+```text
+pages = btopr(size)
+if (availsmem - pages < tune.t_minasmem)  -> nomemmsg("anon_resv", pages)  return 0   <- the LOGGED one
+if (anoninfo.ani_resv + pages > anoninfo.ani_max)                          return 0   <- SILENT
+anoninfo.ani_resv += pages; availsmem -= pages; return 1
+```
+
+`anoninfo` = { `ani_max`, `ani_free`, `ani_resv` }. Only `swapadd`/`swapdel` write `ani_max`,
+`anon_alloc` takes one swap slot (`ani_free--`) for **every anonymous page when it is created**,
+resident or not, and `t_minasmem` (`tune+0x28`) is 25. So the total of all reservations (every
+writable private page: brk, stacks, `MAP_PRIVATE` writable mappings, and a fork's copy of the
+parent's) is capped at the number of swap slots. **RAM adds nothing to it.** The syslog line
+`anon_resv - Insufficient memory to allocate 131690 pages` came from the other (`availsmem`)
+branch, a single 514 MB request whose source is not identified. The failures that matter here
+leave no trace in syslog.
+
+**Live counters** (`/dev/mem`; addresses as pvmk places COMMON, anchor `i39_magic` at `0x811a3ec`
+read `0x49333921`; `ksg-shm`: `anoninfo` `0x81743c8`, `availsmem` `0x816054c`, `freemem`
+`0x8163ef8`, `tune` `0x810a3f0`; `msp-shm`: `anoninfo` `0x8174a40`, `availsmem` `0x8160bc4`):
+
+```text
+idle                         ani_max 51200  ani_free 48629  ani_resv 10177    (swap: one 200 MB slice, c8d0s2)
+one python, 8 x 4 MB          ani_resv +9000 at steady state, transient +3500 at each 4 MB allocation
+8 pythons, 5 s apart, 2 s samples:
+  t=54..76  ani_resv 39890 -> 50596 -> 50599   ani_free 36828 -> 23772
+  result    4 x MemoryError (after 0, 4, 8, 16 MB), 4 x "OK 32MB"
+  t=78      ani_resv 40441   (the failed processes exit and release)
+```
+
+`c8d0s2` measures exactly 200 MB (a raw `dd` returns no data from 200 MiB onward), so a slot is one 4 KB
+page and `swap -l`'s 204800 "blocks" are 1 KB units. There is no 2 KB slot overcommit.
+The ceiling is 51200 pages, 10177 are taken at idle, and that leaves about 41000 pages (160 MB) for
+everything started afterwards. Eight Pythons need 8 × (about 2000 base + 8192 data + 3500
+transient), over 100000 pages, so whichever process asks after about 41000 fails. This also
+explains why 4 × 32 MB succeeded at 144 MB: 4 × about 10200 + 10177 is just under 51200. The
+ceiling would have been just as near on any kernel with this swap. "Swap use still grows" is
+`ani_free` falling as anon pages take their slots.
+
+`ani_free` is the second wall behind the reservation: even without the `ani_resv` check, every anon
+page needs a slot from creation, so anonymous memory is bounded by swap size either way. This
+is the Commodore release note above (programs run out of virtual memory while swap is still free;
+the workaround is more swap). With swap smaller than RAM the machine cannot use its RAM for
+anonymous memory.
+
+**Fix (no kernel change): more swap.** `swapadd` raises `ani_max` and `ani_free` together, so
+`swap -a` of a second area raises the ceiling by its size, 1:1. **Tested 2026-11-07** with a temporary
+32 MB swap file (`swap -a /var/tmp/mlswap 0 65536`): `ani_max` 51200 -> 59392 (+8192 exactly); the
+same 8-Python repro then peaked at `ani_resv` 58812 of 59392 before its `MemoryError`s, at the new
+ceiling and not the old one. The outcome stayed 4 OK / 4 failed (after 8, 8, 12, 16 MB instead of
+0, 4, 8, 16) because 32 MB is less than one Python process needs; `swap -d` then moved the in-use
+pages back to the slice and returned `ani_max` to 51200. A rule of thumb for SVR4.0: swap
+≥ RAM + the expected peak of anonymous memory, so ≥ 512 MB for this 272 MB machine. It cannot go on
+root, which has 242 MB free against the 200 MB minimum. It belongs on the planned second HDF
+(`amix-data-disk-plan`) as a swap slice, or in a larger HDF swap partition, added at boot. There
+is no tunable: `t_minasmem` only governs the logged branch.
+
+**Not proposed: memory-backed reservation** (Solaris-style "virtual swap" = disk + RAM). It is
+not a matter of relaxing the `ani_max` test: `anon_alloc` allocates the swap slot when the page is
+created, so the slot model itself would have to change. That is a large VM change for no gain over
+adding disk swap.
+
+**Cheap diagnostic, optional:** a tail-call wrapper on `anon_resv` that counts the silent branch
+(`anonresv_quota_n`, last `pages`) would make this visible with `kpeek` instead of only as
+userland `ENOMEM`.
+
 ---
 
 ## ✅ ISSUE-41 (2026-08-06): `segvn_faultpage` had no per-page permission check — partial `mprotect` + a denied write PANICKED the kernel
