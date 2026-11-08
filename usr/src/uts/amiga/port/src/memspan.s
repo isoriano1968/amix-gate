@@ -194,6 +194,7 @@ Lmb_fr_loop:
 	subl	%d3,%d0
 	addl	%d0,%d5
 	addl	%d0,mspan_extra
+	orib	&0x10,%a2@(11)		| MRF_PAGED: memregions prints it as used
 Lmb_fr_next:
 	addaw	&12,%a2
 	subql	&1,%d2
@@ -221,6 +222,7 @@ Lmb_ab_loop:
 	addl	%d0,%d5
 	addl	%d0,mspan_extra
 	addl	%d0,mspan_above
+	orib	&0x10,%a2@(11)		| MRF_PAGED
 Lmb_ab_next:
 	addaw	&12,%a2
 	subql	&1,%d2

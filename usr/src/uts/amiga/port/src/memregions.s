@@ -20,6 +20,8 @@
 |     virtual region 1, not reachable 1:1 through ITT0/DTT0
 |   * the rest                            -> MRF_RAM, end clipped to 0x40000000;
 |     MRF_KERNEL on the region holding MAINSTORE
+|   * MRF_PAGED: memspan (step 2/3, inside kvm_init from mlsetup, so before
+|     startup prints the table) gave the region to the page array
 |   * base/end rounded DOWN to 4 KB: the AmigaOS MemHeader at the start of a
 |     region (lower = base + 0x20) is RAM too, and adjacent regions then meet.
 |
@@ -42,6 +44,7 @@ MRF_RAM	=	1
 MRF_KERNEL =	2
 MRF_HIGH =	4
 MRF_CHIP =	8
+MRF_PAGED =	16		| set by memspan (kvm_init) on the regions it frees
 BI_MEM	=	0x440
 MH_ATTR	=	14
 MH_LOWER =	20
@@ -158,10 +161,13 @@ Lst_loop:
 	lea	mr_s_high,%a0
 	btst	&2,%d0
 	bnes	1f
-	lea	mr_s_ram,%a0
-	btst	&1,%d0
-	beqs	1f
 	lea	mr_s_kernel,%a0
+	btst	&1,%d0
+	bnes	1f
+	lea	mr_s_paged,%a0
+	btst	&4,%d0
+	bnes	1f
+	lea	mr_s_ram,%a0
 1:	movel	%a0,%sp@-
 	movel	%a2@(4),%d0
 	subql	&1,%d0
@@ -188,7 +194,8 @@ Lst_cond:
 mr_fmt:	.asciz	"memregion %d: %x-%x %s\n"
 mr_fmt_drop:	.asciz	"memregion: %d more regions dropped (table full)\n"
 mr_s_kernel:	.asciz	"RAM, kernel (MAINSTORE)"
-mr_s_ram:	.asciz	"RAM, not used yet"
+mr_s_ram:	.asciz	"RAM, not used"
+mr_s_paged:	.asciz	"RAM, in the page array (memspan)"
 mr_s_high:	.asciz	"above 1 GB, not reachable"
 mr_s_chip:	.asciz	"chip"
 	.even
