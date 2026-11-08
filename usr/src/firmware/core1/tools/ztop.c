@@ -206,7 +206,7 @@ static char *
 core1_version()
 {
     static char buf[80];
-    static char *parts[] = { "gl", "h264", "crypto", "net", "glbench", "netbench" };
+    static char *parts[] = { "gl", "h264", "crypto", "net", "glbench", "netbench", "uae" };
     unsigned long v = hb[HB_W_VERSION], p = hb[HB_W_PARTS];
     int i, n;
 
@@ -216,7 +216,7 @@ core1_version()
     if (v & 0xff)
         n += sprintf(buf + n, ".%lu", v & 0xff);
     n += sprintf(buf + n, " [");
-    for (i = 0; i < 6; i++)
+    for (i = 0; i < 7; i++)
         if (p & (1UL << i))
             n += sprintf(buf + n, "%s%s", buf[n - 1] == '[' ? "" : " ", parts[i]);
     sprintf(buf + n, "]");

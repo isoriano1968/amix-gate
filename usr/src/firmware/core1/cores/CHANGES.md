@@ -20,6 +20,7 @@ Parts (`HB_PART_*`):
 | net | core 1's own network (lwIP): ffplay/vplay hand it http:// URLs |
 | glbench | the Mesa benchmark (osbench) |
 | netbench | the lwIP benchmark |
+| uae | the Amiga emulator: uae4arm, built in amix-userland emulators/uae4arm (`z3660ARM_Core_uae.bin`) |
 
 When a program changes what it offers or how it behaves, raise its version
 here and in its source (`hb_core_version`).
@@ -59,3 +60,13 @@ Versions 1.0 to 1.3 were named afterwards; those images report no version.
 | version | date | change |
 |---|---|---|
 | 1.0 | 2026-11-06 | first with a version |
+
+## uae — uae
+
+Built in amix-userland `components/emulators/uae4arm` (its own harness in
+`files/core1/core1_main.c`, this directory's `bench.h`), protocol in
+`files/core1/c1uae_board.h`, run by `c1uae`.
+
+| version | date | commit | change |
+|---|---|---|---|
+| 0.1 | 2026-11-08 | (amix-userland) | first image: interpreter, files in memory, overlay, HDMI sound, input ring, CoreMark bench |

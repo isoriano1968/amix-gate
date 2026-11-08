@@ -328,7 +328,7 @@ int main(int argc, char **argv)
         for (i = 0; i < 40; i++)
             printf("%08lx%c", ctl[i], i % 8 == 7 ? '\n' : ' ');
         if (ctl[W_MAGIC] == HB_MAGIC_READY) {
-            static const char *parts[] = { "gl", "h264", "crypto", "net", "glbench", "netbench" };
+            static const char *parts[] = { "gl", "h264", "crypto", "net", "glbench", "netbench", "uae" };
             unsigned long v = ctl[W_VERSION];
             char name[17];
 
@@ -340,7 +340,7 @@ int main(int argc, char **argv)
             name[16] = 0;
             if (v && v <= 0xffffff) {
                 printf("core: %s %lu.%lu.%lu [", name[0] ? name : "h264bench", v >> 16, (v >> 8) & 0xff, v & 0xff);
-                for (i = 0, f = 0; i < 6; i++)
+                for (i = 0, f = 0; i < 7; i++)
                     if (ctl[W_PARTS] & (1UL << i))
                         printf("%s%s", f++ ? " " : "", parts[i]);
                 printf("]\n");
