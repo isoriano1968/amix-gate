@@ -88,13 +88,26 @@ static void copy(void *dst, const void *src, size_t n)
    memcpy(dst, src, n);         /* lib060's (move16) when linked before libc */
 }
 
-/* while core 1 catches up: poll a little, then give the CPU away */
+/* while core 1 catches up: poll a little, then wait in short busy steps,
+   and only then give the CPU away.  AMIX sleeps in whole 16.7 ms clock
+   ticks (usleep(2000) is one tick), so sleeping at once made the 060 idle
+   far longer than core 1 needed: a quarter of a RtCW frame.  The busy
+   steps cover ~20 ms, a typical core 1 frame; then the CPU goes to others
+   (X) as before.  The count starts again after each sleep. */
 static void wait_core1(void)
 {
    static int spins;
 
-   if (++spins < 200)
+   ++spins;
+   if (spins < 200)
       return;
+   if (spins < 200 + 200) {
+      volatile int i;
+
+      for (i = 0; i < 4000; i++)        /* ~100 us on the 060 at 80 MHz */
+         ;
+      return;
+   }
    spins = 0;
    usleep(2000);
 }
