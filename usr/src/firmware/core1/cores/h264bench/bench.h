@@ -96,6 +96,7 @@ enum {
 #define HB_PART_GLBENCH     0x10            /* the Mesa benchmark (osbench) */
 #define HB_PART_NETBENCH    0x20            /* the lwIP benchmark */
 #define HB_PART_UAE         0x40            /* the Amiga emulator (amix-userland emulators/uae4arm) */
+#define HB_PART_GAME        0x80            /* a whole game engine (amix-userland games/ioquake3) */
 
 struct hb_result {
     uint32_t frames, width, height, errors, checksum;

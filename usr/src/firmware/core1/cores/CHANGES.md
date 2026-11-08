@@ -21,6 +21,7 @@ Parts (`HB_PART_*`):
 | glbench | the Mesa benchmark (osbench) |
 | netbench | the lwIP benchmark |
 | uae | the Amiga emulator: uae4arm, built in amix-userland emulators/uae4arm (`z3660ARM_Core_uae.bin`) |
+| game | a whole game engine with its own GL: ioquake3, built in amix-userland games/ioquake3 (`z3660ARM_Core_q3.bin`) |
 
 When a program changes what it offers or how it behaves, raise its version
 here and in its source (`hb_core_version`).
@@ -70,3 +71,14 @@ Built in amix-userland `components/emulators/uae4arm` (its own harness in
 | version | date | commit | change |
 |---|---|---|---|
 | 0.1 | 2026-11-08 | (amix-userland) | first image: interpreter, files in memory, overlay, HDMI sound, input ring, CoreMark bench |
+
+## q3 — game
+
+Built in amix-userland `components/games/ioquake3` (`files/core1`: its own
+harness `core1_main.c` on this directory's `bench.h` and `lscript.ld`, Mesa
+18.3 OSMesa/softpipe from `build/arm/libOSMesa.a` linked in), protocol in
+`files/core1/c1q3_board.h`, run by `c1q3`.
+
+| version | date | commit | change |
+|---|---|---|---|
+| 0.1 | 2026-11-08 | (amix-userland) | first image: the whole engine with cgame/qagame/ui linked in, OSMesa softpipe, files in memory with write-back, overlay, HDMI sound from a 200 Hz timer, input ring |
