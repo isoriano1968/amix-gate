@@ -72,6 +72,8 @@ zzgl_swap(void)
    }
    if (getenv("ZZGL_FRAMES") && frames % 50 == 0)
       fprintf(stderr, "zzgl_direct: %d frames\n", frames);
+   if (getenv("ZZGL_STOP") && frames >= atoi(getenv("ZZGL_STOP")))
+      exit(0);
 }
 
 void zzgl_platform_frame(void) { }

@@ -5,7 +5,9 @@
  * X window (XPutImage).  For testing the marshalling with real programs
  * (ioquake3's PC build) before the board.
  */
+#define _GNU_SOURCE
 #include <stdio.h>
+#include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
 #include <X11/Xlib.h>
@@ -113,8 +115,25 @@ present(const void *rgba, int w, int h)
                fwrite(s + ((size_t)y * w + x) * 4, 1, 3, f);
          fclose(f);
       }
-      if (getenv("ZZGL_STOP") && frames >= atoi(getenv("ZZGL_STOP")))
-         exit(0);
+      if (getenv("ZZGL_STOP")) {
+         const int stop = atoi(getenv("ZZGL_STOP"));
+         /* the fast spans' pixels: covered and past the depth test, as an
+            average of the last 20 frames (sp_fast.c, PC builds only) */
+         static uint64_t *cov, *pass, c0, p0;
+
+         if (!cov) {
+            cov = dlsym(RTLD_DEFAULT, "sp_fast_zcov");
+            pass = dlsym(RTLD_DEFAULT, "sp_fast_zpass");
+         }
+         if (cov && pass && frames == stop - 20)
+            c0 = *cov, p0 = *pass;
+         if (frames >= stop) {
+            if (cov && pass && stop > 20)
+               fprintf(stderr, "zzgl_host: last 20 frames: %.0f pixels covered, %.0f past the depth test a frame\n",
+                       (double)(*cov - c0) / 20, (double)(*pass - p0) / 20);
+            exit(0);
+         }
+      }
       if (getenv("ZZGL_FRAMES") && frames % 50 == 0)
          fprintf(stderr, "zzgl_host: %d frames\n", frames);
    }
