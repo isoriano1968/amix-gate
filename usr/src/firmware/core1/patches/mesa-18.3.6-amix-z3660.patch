@@ -694,10 +694,10 @@ index 6363701..3ae99a6 100644
     for (i = 0; i < sp->num_vertex_buffers; i++) {
 diff --git a/src/gallium/drivers/softpipe/sp_fast.c b/src/gallium/drivers/softpipe/sp_fast.c
 new file mode 100644
-index 0000000..5455343
+index 0000000..750a190
 --- /dev/null
 +++ b/src/gallium/drivers/softpipe/sp_fast.c
-@@ -0,0 +1,2494 @@
+@@ -0,0 +1,2499 @@
 +/*
 + * sp_fast.c -- see sp_fast.h.
 + *
@@ -725,6 +725,8 @@ index 0000000..5455343
 +#ifdef __z3660core__
 +int sp_fast_evt_on;
 +uint64_t sp_fast_prof[16];
++#else
++__attribute__((visibility("default"))) uint64_t sp_fast_zcov, sp_fast_zpass;
 +#endif
 +
 +extern unsigned sp_fast_why[16];
@@ -2688,6 +2690,7 @@ index 0000000..5455343
 +                !test(f->zfunc, z, old))
 +               continue;
 +         }
++         SPF_ZCOUNT(sp_fast_zpass, 1);
 +#ifdef __ARM_NEON
 +         if (NEON) {
 +            /* f->mixed is off, the pixels are RGBA or BGRA, BK is not BLEND_GENERIC */
@@ -2869,6 +2872,7 @@ index 0000000..5455343
 +   /* pixels by path: 9 affine NEON, 10 perspective NEON, 11 the rest */
 +   sp_fast_prof[!f->fixed || !f->neon_span ? 11 : f->tri_affine ? 9 : 10] += x1 - x0;
 +#endif
++   SPF_ZCOUNT(sp_fast_zcov, x1 - x0);
 +   SPF_PROF_ADD(4, 1);
 +   SPF_PROF_ADD(5, x1 - x0);
 +}
@@ -2940,6 +2944,7 @@ index 0000000..5455343
 +            continue;
 +         }
 +      }
++      SPF_ZCOUNT(sp_fast_zpass, 1);
 +
 +      if (tc) {
 +         const float q = tex_oow ? oow : Q;
@@ -3194,10 +3199,10 @@ index 0000000..5455343
 +}
 diff --git a/src/gallium/drivers/softpipe/sp_fast.h b/src/gallium/drivers/softpipe/sp_fast.h
 new file mode 100644
-index 0000000..c057774
+index 0000000..1af93d7
 --- /dev/null
 +++ b/src/gallium/drivers/softpipe/sp_fast.h
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,203 @@
 +/*
 + * sp_fast.h -- a fixed-function fast path for softpipe's triangles.
 + *
@@ -3254,6 +3259,16 @@ index 0000000..c057774
 +#define SPF_PROF_BEGIN(v) (void)0
 +#define SPF_PROF_END(i, v) (void)0
 +#define SPF_PROF_ADD(i, n) (void)0
++#endif
++
++/* the PC test (zzgl_host.c): pixels the fast spans cover and those past the
++   depth test, for overdraw counts; nothing on core 1 */
++#ifndef __z3660core__
++#include <stdint.h>
++extern uint64_t sp_fast_zcov, sp_fast_zpass;
++#define SPF_ZCOUNT(v, n) ((v) += (n))
++#else
++#define SPF_ZCOUNT(v, n) (void)0
 +#endif
 +
 +struct sp_fast_tex {
@@ -4552,7 +4567,7 @@ index da47927..51a8d3a 100644
        /* See comments elsewhere about draw fragment shaders */
  #if 0
 diff --git a/src/gallium/drivers/softpipe/sp_tile_cache.c b/src/gallium/drivers/softpipe/sp_tile_cache.c
-index 998939b..12a42da 100644
+index 998939b..c60944c 100644
 --- a/src/gallium/drivers/softpipe/sp_tile_cache.c
 +++ b/src/gallium/drivers/softpipe/sp_tile_cache.c
 @@ -171,6 +171,7 @@ void
@@ -4563,7 +4578,70 @@ index 998939b..12a42da 100644
     struct pipe_context *pipe = tc->pipe;
     int i;
  
-@@ -517,6 +518,7 @@ struct softpipe_cached_tile *
+@@ -336,6 +337,41 @@ clear_tile(struct softpipe_cached_tile *tile,
+ }
+ 
+ 
++/**
++ * The clear colour into tile (X, Y) of a 32-bit colour surface, as one
++ * packed word: the same value pipe_put_tile_rgba_format() writes (it is
++ * packed by util_format_write_4f() too), without converting the whole
++ * 64x64 float tile pixel by pixel (6 % of a frame of RtCW on the Z3660's
++ * core 1, which clears every frame).
++ */
++static void
++clear_tile_packed32(struct pipe_transfer *pt, ubyte *map, uint x, uint y, uint32_t v)
++{
++   const uint w = MIN2(TILE_SIZE, pt->box.width - x), h = MIN2(TILE_SIZE, pt->box.height - y);
++   uint i, j;
++
++   for (j = 0; j < h; j++) {
++      uint32_t *row = (uint32_t *)(map + (y + j) * pt->stride + x * 4);
++
++      for (i = 0; i < w; i++)
++         row[i] = v;
++   }
++}
++
++static boolean
++packed32_clear_value(const struct softpipe_tile_cache *tc, uint32_t *v)
++{
++   const enum pipe_format fmt = tc->surface->format;
++   const struct util_format_description *desc = util_format_description(fmt);
++
++   if (tc->depth_stencil || !desc || desc->layout != UTIL_FORMAT_LAYOUT_PLAIN ||
++       desc->block.bits != 32 || desc->block.width != 1 || desc->block.height != 1 ||
++       util_format_is_pure_integer(fmt))
++      return FALSE;
++   util_format_write_4f(fmt, tc->clear_color.f, 0, v, 4, 0, 0, 1, 1);
++   return TRUE;
++}
++
+ /**
+  * Actually clear the tiles which were flagged as being in a clear state.
+  */
+@@ -347,6 +383,8 @@ sp_tile_cache_flush_clear(struct softpipe_tile_cache *tc, int layer)
+    const uint h = tc->transfer[layer]->box.height;
+    uint x, y;
+    uint numCleared = 0;
++   uint32_t pv = 0;
++   const boolean packed = packed32_clear_value(tc, &pv);
+ 
+    assert(pt->resource);
+ 
+@@ -364,7 +402,10 @@ sp_tile_cache_flush_clear(struct softpipe_tile_cache *tc, int layer)
+ 
+          if (is_clear_flag_set(tc->clear_flags, addr, tc->clear_flags_size)) {
+             /* write the scratch tile to the surface */
+-            if (tc->depth_stencil) {
++            if (packed) {
++               clear_tile_packed32(pt, tc->transfer_map[layer], x, y, pv);
++            }
++            else if (tc->depth_stencil) {
+                pipe_put_tile_raw(pt, tc->transfer_map[layer],
+                                  x, y, TILE_SIZE, TILE_SIZE,
+                                  tc->tile->data.any, 0/*STRIDE*/);
+@@ -517,6 +558,7 @@ struct softpipe_cached_tile *
  sp_find_cached_tile(struct softpipe_tile_cache *tc, 
                      union tile_address addr )
  {
@@ -4571,7 +4649,7 @@ index 998939b..12a42da 100644
     struct pipe_transfer *pt;
     /* cache pos/entry: */
     const int pos = CACHE_POS(addr.bits.x,
-@@ -640,6 +642,7 @@ sp_tile_cache_clear(struct softpipe_tile_cache *tc,
+@@ -640,6 +682,7 @@ sp_tile_cache_clear(struct softpipe_tile_cache *tc,
     uint pos;
  
     tc->clear_color = *color;
@@ -6833,6 +6911,19 @@ index 1b62afb..88da61b 100644
     winsys = xlib_create_sw_winsys( display );
     if (winsys == NULL)
        return NULL;
+diff --git a/src/gallium/targets/osmesa/osmesa.sym b/src/gallium/targets/osmesa/osmesa.sym
+index 59beab3..98606f6 100644
+--- a/src/gallium/targets/osmesa/osmesa.sym
++++ b/src/gallium/targets/osmesa/osmesa.sym
+@@ -15,6 +15,8 @@
+ 		OSMesaPostprocess;
+ 		gl*;
+ 		mgl*;
++		sp_fast_zcov;
++		sp_fast_zpass;
+ 	local:
+ 		*;
+ };
 diff --git a/src/mapi/glapi/gen/glX_XML.py b/src/mapi/glapi/gen/glX_XML.py
 index ff0011b..f3ee7b2 100644
 --- a/src/mapi/glapi/gen/glX_XML.py
