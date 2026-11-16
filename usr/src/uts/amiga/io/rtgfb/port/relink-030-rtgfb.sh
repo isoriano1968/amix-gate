@@ -16,7 +16,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/tools/build-step.sh"
 IN="$1"; OUT="$2"
 [ -f "$IN" ] && [ -n "$OUT" ] || { echo "usage: $0 stock-030-kernel output"; exit 1; }
-NM=m68k-linux-gnu-nm
+. "$HERE/tools/m68k-binutils.sh"
 echo "[*] base: $IN"
 echo "      sha256 $(sha256sum "$IN" | cut -d' ' -f1)"
 # a 68040/68060 port kernel has cputype (pvmk's kernel_fits test): not this script's base
@@ -33,7 +33,7 @@ CF="$AMIX_KERNEL_CFLAGS -Dsigned=__signed__"
 echo "[*] cross-compiling rtgfb.c for the 68030 kernel"
 (cd "$B" && m68k-cbm-sysv4-gcc $CF -I. -c rtgfb.c -o rtgfb_030.o)
 # the page shift must be the stock one: by 11 (2 KB), never by 12
-D=$(m68k-linux-gnu-objdump -d "$B/rtgfb_030.o")
+D=$($OBJDUMP -d "$B/rtgfb_030.o")
 n11=$(echo "$D" | grep -A1 "moveq #11," | grep -cE "lsrl|asrl" || true)
 n12=$(echo "$D" | grep -A1 "moveq #12," | grep -cE "lsrl|asrl" || true)
 [ "$n12" -eq 0 ] && [ "$n11" -gt 0 ] || { echo "[FAIL] rtgfb_030.o page shifts: $n11 by 11, $n12 by 12 (want only 11)"; exit 1; }
@@ -42,10 +42,10 @@ echo "[OK] $n11 page shift(s), all by 11 (2 KB pages)"
 if echo "$D" | grep -E "\s(move16|cinv[alp]|cpush[alp]|pflushan?|pflushn)\s"; then
 	echo "[FAIL] rtgfb_030.o has 68040/68060 instructions"; exit 1; fi
 # .data of the object padded to 4, so the kernel's .data stays a 4-byte multiple
-ODS=$(( 0x$(m68k-linux-gnu-readelf -SW "$B/rtgfb_030.o" | awk '{gsub(/[][]/,"")} $2==".data"{print $6}') ))
+ODS=$(( 0x$($READELF -SW "$B/rtgfb_030.o" | awk '{gsub(/[][]/,"")} $2==".data"{print $6}') ))
 printf '\t.data\n\t.space %d\n' $(( (4 - ODS % 4) % 4 )) > "$B/rtgfb_pad.s"
 m68k-cbm-sysv4-gcc -c "$B/rtgfb_pad.s" -o "$B/rtgfb_pad.o"
-m68k-linux-gnu-objcopy --set-section-alignment .data=1 "$B/rtgfb_pad.o"
+$OBJCOPY --set-section-alignment .data=1 "$B/rtgfb_pad.o"
 m68k-cbm-sysv4-ld -r -o "$OUT" "$IN" "$B/rtgfb_030.o" "$B/rtgfb_pad.o"
 for s in rtgfbopen rtgfbclose rtgfbioctl rtgfbmmap; do
 	[ "$($NM "$OUT" | grep -cE " T $s\$")" -eq 1 ] || { echo "[FAIL] $s: not exactly one strong definition"; exit 1; }
@@ -54,10 +54,10 @@ LEAK=$($NM "$OUT" | awk '$1=="U" && $2!="edata" && $2!="end" && $2!="etext" {pri
 [ -z "$LEAK" ] || { echo "[FAIL] unresolved:"; echo "$LEAK"; exit 1; }
 echo "[OK] symbols defined, none unresolved"
 run_step 8 python3 "$HERE/src/patch_rtgfb_cdevsw.py" "$OUT"
-CONTIG=$(m68k-linux-gnu-readelf -SW "$OUT" | awk '{gsub(/[][]/,"")} $2==".text"{to=$5;ts=$6} $2==".data"{do_=$5} END{print to, ts, do_}')
+CONTIG=$($READELF -SW "$OUT" | awk '{gsub(/[][]/,"")} $2==".text"{to=$5;ts=$6} $2==".data"{do_=$5} END{print to, ts, do_}')
 set -- $CONTIG; set -- $(( 0x$1 + 0x$2 )) $(( 0x$3 ))
 [ "$1" = "$2" ] && echo "[OK] text/data contiguous." || { echo "[FAIL] text/data NOT contiguous"; exit 1; }
-DSZ=$(( 0x$(m68k-linux-gnu-readelf -SW "$OUT" | awk '{gsub(/[][]/,"")} $2==".data"{print $6}') ))
+DSZ=$(( 0x$($READELF -SW "$OUT" | awk '{gsub(/[][]/,"")} $2==".data"{print $6}') ))
 [ $((DSZ % 4)) -eq 0 ] && echo "[OK] .data 4-aligned" || { echo "[FAIL] .data misaligned"; exit 1; }
 run_step 1 python3 "$HERE/src/check_relink_relocs.py" "$OUT"
 rm -rf "$B"
