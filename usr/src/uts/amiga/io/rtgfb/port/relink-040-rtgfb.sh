@@ -14,7 +14,7 @@ IN="$1"; OUT="$2"
 . "$HERE/tools/m68k-binutils.sh"
 $NM "$IN" | grep -qE " [TDBC] cputype$" || { echo "[FAIL] base is not a 68040/68060 port kernel: use relink-030-rtgfb.sh"; exit 1; }
 $NM "$IN" | grep -qE " T rtgfbopen$" && { echo "[FAIL] base already has rtgfb"; exit 1; }
-for s in autocon getminor copyin copyout bzero printf nodev cdevsw; do
+for s in autocon getminor copyin copyout bzero printf nodev cdevsw io_init parinit; do
 	$NM "$IN" | grep -qE " [TDBC] $s\$" || { echo "[FAIL] base lacks $s"; exit 1; }
 done
 FBNC=
@@ -38,13 +38,15 @@ if $OBJDUMP -d "$HERE/build/rtgfb_040.o" | grep -E "(mul|div)[su]l[.a-z]*\s+[^,]
 	echo "[FAIL] rtgfb_040.o has 64-bit mul/div forms (060 vector 61)"; exit 1; fi
 echo "[OK] no 64-bit mul/div forms"
 m68k-cbm-sysv4-ld -r -o "$OUT" "$IN" "$HERE/build/rtgfb_040.o" "$HERE/build/rtgfb_pad.o"
-for s in rtgfbopen rtgfbclose rtgfbioctl rtgfbmmap; do
+for s in rtgfbinit rtgfbopen rtgfbclose rtgfbioctl rtgfbmmap; do
 	[ "$($NM "$OUT" | grep -cE " T $s\$")" -eq 1 ] || { echo "[FAIL] $s: not exactly one strong definition"; exit 1; }
 done
 LEAK=$($NM "$OUT" | awk '$1=="U" && $2!="edata" && $2!="end" && $2!="etext" {print $2}')
 [ -z "$LEAK" ] || { echo "[FAIL] unresolved:"; echo "$LEAK"; exit 1; }
 echo "[OK] symbols defined, none unresolved"
 run_step 8 python3 "$HERE/src/patch_rtgfb_cdevsw.py" "$OUT"
+# the board named at boot: io_init[0] parinit -> rtgfbinit (which calls parinit)
+run_step 2 python3 "$HERE/src/patch_rtgfb_init.py" "$OUT"
 CONTIG=$($READELF -SW "$OUT" | awk '{gsub(/[][]/,"")} $2==".text"{to=$5;ts=$6} $2==".data"{do_=$5} END{print to, ts, do_}')
 set -- $CONTIG; set -- $(( 0x$1 + 0x$2 )) $(( 0x$3 ))
 [ "$1" = "$2" ] && echo "[OK] text/data contiguous." || { echo "[FAIL] text/data NOT contiguous"; exit 1; }

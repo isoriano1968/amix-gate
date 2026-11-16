@@ -12,8 +12,10 @@
  *   - switches the monitor between the Amiga video and the card
  *     (SVGAIOCSet/GetMonitorSwitch, and back to the Amiga video on the last
  *     close, so a server that dies leaves a usable picture).
- * It looks for its board at the first open, not at boot: a machine without
- * such a board pays nothing but the cdevsw slot.
+ * It looks for its board once, at boot (rtgfbinit, called from io_init[]
+ * ahead of parinit, see src/patch_rtgfb_init.py), and names the board it
+ * finds on the console; without a board it says nothing, and every open is
+ * a cheap ENXIO.  A kernel linked without that hook looks at the first open.
  *
  * Boards (rtgfb_boardtab): the Village Tronic Picasso II and II+ (Cirrus
  * Logic GD5426/GD5428, Zorro II, 1 or 2 MB).  Their AutoConfig numbers are
@@ -48,6 +50,7 @@
 #include "rtgfb.h"
 
 extern int autocon();
+extern int parinit();
 #ifdef RTGFB_FB_NC
 extern int hat_cm_fb_add();
 #endif
@@ -74,6 +77,10 @@ struct rtgfb_boardtab {
 	unsigned long   flags;          /* RTGFB_F_*                           */
 };
 
+/* Picasso II: the chip on the board (CR27 >> 2) names the model */
+#define RTGFB_CL_GD5426 0x24            /* Picasso II  */
+#define RTGFB_CL_GD5428 0x26            /* Picasso II+ */
+
 static struct rtgfb_boardtab rtgfb_boardtab[] = {
 	{ "Picasso II", 2167, 12, 11, 0x10000, 0x100000,
 	  RTGFB_BOARD_PICASSO2, RTGFB_F_MONSW },
@@ -87,7 +94,8 @@ struct rtgfb_board {
 	unsigned long   mem_phys;
 	unsigned long   mem_size;
 	int             monitor;        /* SVGAMONITORSWITCH_*                 */
-	int             missing;        /* looked for at an open, not found    */
+	int             looked;         /* the AutoConfig table was searched   */
+	char           *name;           /* the model found                     */
 };
 
 static struct rtgfb_board rtgfb_boards[RTGFB_MAXBOARDS];
@@ -122,10 +130,32 @@ int which;
 }
 
 /*
+ * The Picasso II's model from its chip id (CR27 bits 7:2): the GD5426 is a
+ * Picasso II, the GD5428 a II+.  Reads only, plus the CRTC index register,
+ * at the CRTC address the chip uses now (Misc Output bit 0: 3Dx or 3Bx).
+ */
+static char *
+rtgfb_p2model(bp)
+struct rtgfb_board *bp;
+{
+	volatile unsigned char *r;
+	int crt, id;
+
+	r = (volatile unsigned char *)bp->reg_phys;
+	crt = (r[0x3cc] & 1) ? 0x3d4 : 0x3b4;
+	r[crt] = 0x27;
+	id = r[crt + 1] >> 2;
+	if (id == RTGFB_CL_GD5426)
+		return "Picasso II (CL-GD5426)";
+	if (id == RTGFB_CL_GD5428)
+		return "Picasso II+ (CL-GD5428)";
+	return bp->bt->name;
+}
+
+/*
  * Find board `unit` of the table: both of its AutoConfig entries, in the
- * Zorro II window, at least as large as the board needs.  Once found it
- * stays attached; a miss is reported once and tried again at the next open
- * (cheap: a walk of 16 table entries).
+ * Zorro II window, at least as large as the board needs.  Searched once
+ * (at boot by rtgfbinit, else at the first open); the result stays.
  */
 static int
 rtgfb_attach(unit)
@@ -141,6 +171,9 @@ int unit;
 	bp = &rtgfb_boards[unit];
 	if (bp->bt)
 		return 1;
+	if (bp->looked)
+		return 0;
+	bp->looked = 1;
 	for (i = 0; i < RTGFB_NBOARDTAB; i++) {
 		bt = &rtgfb_boardtab[i];
 		rs = ms = 0;
@@ -176,23 +209,33 @@ int unit;
 			printf("rtgfb: framebuffer cache class not registered (stays serialised)\n");
 #endif
 		bp->bt = bt;
-		bp->missing = 0;
+		bp->name = bt->name;
+		if (bt->board == RTGFB_BOARD_PICASSO2)
+			bp->name = rtgfb_p2model(bp);
 		printf("rtgfb: %s, registers 0x%x+0x%x, memory 0x%x+0x%x\n",
-		    bt->name, (unsigned int)rb, (unsigned int)rs,
+		    bp->name, (unsigned int)rb, (unsigned int)rs,
 		    (unsigned int)mb, (unsigned int)ms);
 		return 1;
 	}
 	/*
-	 * No board: silent.  The X server probes every card driver it knows, so
-	 * on a ZZ9000 or VA2000 machine this open is normal; each driver reports
-	 * only the hardware it finds (RTGFB_DEBUG keeps the line for bring-up).
+	 * No board: silent.  Each driver reports only the hardware it finds
+	 * (RTGFB_DEBUG keeps the line for bring-up).
 	 */
 #ifdef RTGFB_DEBUG
-	if (!bp->missing)
-		printf("rtgfb: no supported graphics board\n");
+	printf("rtgfb: no supported graphics board\n");
 #endif
-	bp->missing = 1;
 	return 0;
+}
+
+/*
+ * Boot: io_init[] calls this in parinit's place (src/patch_rtgfb_init.py);
+ * parinit runs first, as before, then the one AutoConfig search.
+ */
+void
+rtgfbinit()
+{
+	(void) parinit();
+	(void) rtgfb_attach(0);
 }
 
 int
@@ -255,8 +298,8 @@ int *rvalp;
 		info.mmap_reg = RTGFB_MMAP_REG;
 		info.mmap_mem = RTGFB_MMAP_MEM;
 		info.monitor = bp->monitor;
-		for (i = 0; i < RTGFB_NAMELEN - 1 && bp->bt->name[i]; i++)
-			info.name[i] = bp->bt->name[i];
+		for (i = 0; i < RTGFB_NAMELEN - 1 && bp->name[i]; i++)
+			info.name[i] = bp->name[i];
 		if (copyout((caddr_t)&info, (caddr_t)arg, sizeof info))
 			return EFAULT;
 		return 0;

@@ -18,9 +18,11 @@ section 5). The driver only:
   it switches back to the Amiga video, so an X server that dies leaves a
   usable picture.
 
-It has no mode setting, blitter or console. It looks for its board at the
-first open, not at boot, so a machine without such a board pays only for the
-`cdevsw` slot.
+It has no mode setting, blitter or console. It looks for its board once, at
+boot, and names what it finds on the console, for example
+`rtgfb: Picasso II (CL-GD5426), registers 0xea0000+0x10000, memory 0x200000+0x200000`
+(the chip id tells a Picasso II from a II+). Without a board it prints
+nothing, and the device only answers `ENXIO`.
 
 ## Boards
 
@@ -78,6 +80,10 @@ Each script:
 - links it in with `ld -r`,
 - registers `cdevsw[54]` with `src/patch_rtgfb_cdevsw.py`, by symbol, which
   refuses unless the slot is `nodev`,
+- hooks the boot search into `io_init[]` with `src/patch_rtgfb_init.py`:
+  `io_init` is `{ parinit, 0 }` with no spare slot, so entry 0 is retargeted
+  from `parinit` to `rtgfbinit`, which calls `parinit` first. The script
+  refuses unless entry 0 points at `parinit` and entry 1 is the terminating 0,
 - checks for unresolved symbols, text/data contiguity, `.data` alignment and
   the loader's relocations.
 

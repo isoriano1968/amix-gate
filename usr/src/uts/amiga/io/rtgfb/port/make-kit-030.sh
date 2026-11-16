@@ -8,8 +8,10 @@
 #   rtgfb_030.o             src/rtgfb.c for the stock 2 KB-page 68030 kernel
 #   rtgfb_pad.o             pads the kernel's .data back to a multiple of 4
 #   patch_rtgfb_cdevsw.py   retargets cdevsw[54] (by symbol, asserting nodev)
+#   patch_rtgfb_init.py     retargets io_init[0] parinit -> rtgfbinit (by
+#                           symbol, asserting parinit): the board named at boot
 #   check_relink_relocs.py  the relocation check every relink runs
-#   KIT.sha256              checksums of the four files
+#   KIT.sha256              checksums of the five files
 #
 # The compile and the checks are the ones relink-030-rtgfb.sh runs; the kit is
 # the same objects, built once.  Kernel code is compiled with the gcc 2.7.2.3
@@ -60,9 +62,9 @@ m68k-cbm-sysv4-gcc -c "$B/rtgfb_pad.s" -o "$B/rtgfb_pad.o"
 $OBJCOPY --set-section-alignment .data=1 "$B/rtgfb_pad.o"
 
 cp "$B/rtgfb_030.o" "$B/rtgfb_pad.o" "$OUT/"
-cp "$HERE/src/patch_rtgfb_cdevsw.py" "$RELOCS" "$OUT/"
+cp "$HERE/src/patch_rtgfb_cdevsw.py" "$HERE/src/patch_rtgfb_init.py" "$RELOCS" "$OUT/"
 (cd "$OUT" && sha256sum rtgfb_030.o rtgfb_pad.o patch_rtgfb_cdevsw.py \
-	check_relink_relocs.py > KIT.sha256)
+	patch_rtgfb_init.py check_relink_relocs.py > KIT.sha256)
 rm -rf "$B"
 echo "[OK] rtgfb kit in $OUT"
 cat "$OUT/KIT.sha256"
