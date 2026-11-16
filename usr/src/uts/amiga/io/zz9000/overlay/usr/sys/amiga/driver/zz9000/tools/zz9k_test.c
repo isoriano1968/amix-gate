@@ -420,21 +420,37 @@ char **argv;
     unsigned short test_bpp;
     struct rlimit rl;
     int rwbars;
+    int boot;
+    char *bname;
 
     devname = "/dev/zz9000";
     if (argc > 1)
         devname = argv[1];
 
-    print_z2_expected();
+    /*
+     * "redirect" and "noconsole" run from S99zz9000 at every boot, also on
+     * machines without a ZZ9000/Z3660: there a missing board is not an error
+     * and prints nothing (each driver reports only its own hardware).  The
+     * other commands are diagnostics and explain what they expected.
+     */
+    boot = argc > 2 && (streq(argv[2], "redirect") || streq(argv[2], "mirror") ||
+        streq(argv[2], "noconsole"));
 
     fd = open(devname, O_RDWR);
     if (fd < 0) {
+        if (boot)
+            return 0;
+        print_z2_expected();
         perror(devname);
         printf("Open failed. Check kernel cdevsw major 49 and /dev node.\n");
         return 1;
     }
+    if (boot && ioctl(fd, ZZ9KIOC_PROBE, 0) < 0) {
+        close(fd);
+        return 0;
+    }
 
-    found = print_autocon(fd);
+    found = boot ? 1 : print_autocon(fd);
     if ((found & 1) == 0) {
         if (found & 2)
             printf("Only ZZ9000-Z3/product 4 is present. AMIX driver requires Z2/product 3.\n");
@@ -459,11 +475,12 @@ char **argv;
         return 1;
     }
 
-    printf("zz9000: base 0x%lx board 0x%lx fb 0x%lx+0x%lx hw 0x%x fw 0x%x mode %ux%u color %u\n",
-        info.base, info.board_size, info.fb_offset, info.fb_size,
+    bname = info.zorro == 3 && info.product == 1 ? "Z3660 RTG" : "ZZ9000";
+    printf("%s: base 0x%lx board 0x%lx fb 0x%lx+0x%lx hw 0x%x fw 0x%x mode %ux%u color %u\n",
+        bname, info.base, info.board_size, info.fb_offset, info.fb_size,
         info.hw_version, info.fw_version, info.width, info.height,
         info.color_mode);
-    printf("zz9000: zorro %u product 0x%02x\n", info.zorro, info.product);
+    printf("%s: zorro %u product 0x%02x\n", bname, info.zorro, info.product);
     rc = ioctl(fd, ZZ9KIOC_GETFBINFO, &fbi);
     if (rc == 0) {
         printf("fbinfo: %ux%u depth %u bpp %u stride %u offset 0x%lx size 0x%lx\n",
@@ -529,7 +546,7 @@ char **argv;
             return 1;
         }
         printf("%s console redirect enabled. Native RGB drawing should stop.\n",
-            info.zorro == 3 && info.product == 1 ? "Z3660 RTG" : "ZZ9000");
+            bname);
         printf("Run a command such as 'date' or 'ls -l /' to verify redirected output.\n");
         close(fd);
         return 0;

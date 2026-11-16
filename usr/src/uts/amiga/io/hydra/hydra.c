@@ -1651,7 +1651,11 @@ hydraautoconfig()
 	return;
     }
 
+    /* no board: nothing to say -- a machine without a Hydra is normal, and
+     * each driver reports only the hardware it finds (HYDRA_DEBUG: old note) */
+#ifdef HYDRA_DEBUG
     cmn_err(CE_NOTE, "hydra: no board found");
+#endif
 }
 
 int

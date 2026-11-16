@@ -13,22 +13,16 @@ TEST=/usr/amiga/bin/zz9k_test
 
 case "$1" in
 ''|start)
-	if [ ! -r "$DEV" ]; then
-		echo "ZZ9000 device node $DEV not found"
-		exit 1
-	fi
-
-	if [ -x "$TEST" ]; then
-		echo "Starting ZZ9000 RTG console redirect"
-		"$TEST" "$DEV" redirect >/dev/console 2>&1
-	fi
+	# No device node or no board (another card, or none): nothing to do and
+	# nothing to say.  zz9k_test names the board it found (ZZ9000 or Z3660
+	# RTG) when it switches the console.
+	[ -r "$DEV" ] || exit 0
+	[ -x "$TEST" ] && "$TEST" "$DEV" redirect >/dev/console 2>&1
 	;;
 
 stop)
-	if [ -x "$TEST" ]; then
-		echo "Stopping ZZ9000 RTG console redirect"
-		"$TEST" "$DEV" noconsole >/dev/console 2>&1
-	fi
+	[ -r "$DEV" ] || exit 0
+	[ -x "$TEST" ] && "$TEST" "$DEV" noconsole >/dev/console 2>&1
 	;;
 
 *)
