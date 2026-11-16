@@ -13,11 +13,28 @@
 #
 # The compile and the checks are the ones relink-030-rtgfb.sh runs; the kit is
 # the same objects, built once.  Kernel code is compiled with the gcc 2.7.2.3
-# cross compiler (m68k-cbm-sysv4-gcc) only.  Run it from an
-# amix-040-060-port checkout that has the rtgfb files (install.sh copies them).
+# cross compiler (m68k-cbm-sysv4-gcc) only.
+#
+# Two ways to run it:
+#  - from an amix-040-060-port checkout that has the rtgfb files (install.sh
+#    copies them): its tools/config-load.sh gives AMIX_KERNEL_CFLAGS;
+#  - standalone from amix-gate (the package build): set AMIX_ROOT to an AMIX
+#    2.1c tree with usr/include and usr/sys (github.com/amigaux/amix-system),
+#    and have m68k-cbm-sysv4-gcc (developer/amix/gcc-27) on PATH.
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
-. "$HERE/tools/config-load.sh"
+if [ -f "$HERE/tools/config-load.sh" ]; then
+	. "$HERE/tools/config-load.sh"
+else
+	[ -d "${AMIX_ROOT:-}/usr/sys/amiga/inc" ] || {
+		echo "AMIX_ROOT must name an AMIX 2.1c tree with usr/include and usr/sys" >&2; exit 1; }
+	# the flags of gcc-cross-amix's env.sh, which the port's relinks use
+	AMIX_KERNEL_CFLAGS="-O -traditional -fno-builtin -Dinline=__inline__ -Dvolatile=__volatile__ -Dconst=__const__ -m68020 -D_KERNEL -DSVR40 -DSVR4 -I$AMIX_ROOT/usr/include -I$AMIX_ROOT/usr/sys -I$AMIX_ROOT/usr/sys/amiga/inc"
+fi
+# check_relink_relocs.py: the port's src/, or amix-gate's uts/amiga/port/src
+RELOCS="$HERE/src/check_relink_relocs.py"
+[ -f "$RELOCS" ] || RELOCS="$HERE/../../../port/src/check_relink_relocs.py"
+[ -f "$RELOCS" ] || { echo "check_relink_relocs.py not found" >&2; exit 1; }
 OUT=$1
 [ -n "$OUT" ] || { echo "usage: $0 OUTDIR"; exit 1; }
 . "$HERE/tools/m68k-binutils.sh"
@@ -43,7 +60,7 @@ m68k-cbm-sysv4-gcc -c "$B/rtgfb_pad.s" -o "$B/rtgfb_pad.o"
 $OBJCOPY --set-section-alignment .data=1 "$B/rtgfb_pad.o"
 
 cp "$B/rtgfb_030.o" "$B/rtgfb_pad.o" "$OUT/"
-cp "$HERE/src/patch_rtgfb_cdevsw.py" "$HERE/src/check_relink_relocs.py" "$OUT/"
+cp "$HERE/src/patch_rtgfb_cdevsw.py" "$RELOCS" "$OUT/"
 (cd "$OUT" && sha256sum rtgfb_030.o rtgfb_pad.o patch_rtgfb_cdevsw.py \
 	check_relink_relocs.py > KIT.sha256)
 rm -rf "$B"
