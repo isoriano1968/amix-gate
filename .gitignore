@@ -1,0 +1,4 @@
+
+# non-public files and directories: *.local / *.local.* (never committed)
+*.local
+*.local.*
