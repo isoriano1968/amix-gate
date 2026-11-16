@@ -70,6 +70,7 @@ step above. Check the device numbers in your own `kernel.c` before you add one.
 | `io/z3660net` | Z3660 onboard Ethernet |
 | `io/z3660scsi` | Z3660 SD storage as SCSI |
 | `io/zz9000` | ZZ9000 and Z3660 RTG framebuffer, current version |
+| `io/rtgfb` | Generic RTG framebuffer (Picasso II): board, mmap, monitor switch; also for the stock 68030 kernel |
 | `io/soft3d` | soft3D 3D |
 
 ## 5. Core 1 programs
