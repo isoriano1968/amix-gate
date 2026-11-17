@@ -1,0 +1,482 @@
+z3660rtg: the Z3660's RTG as its own driver, /dev/z3660rtg, major 55
+
+The Z3660 RTG and the MNT ZZ9000 become separate drivers, so a machine with
+both boards has both (people may have more than one graphics card):
+
+- the Z3660 rows only (AutoConfig 0x144B0001 and the fixed window on AGA);
+  ZZ9K_TARGET_Z3660 is implied, the ZZ9000 rows and tables are gone;
+- every global has its own name: z3660rtginit/open/close/read/write/ioctl/
+  mmap, z3660rtgconsoleputc/consolewrite, z3660rtgvtinfo/vtpan/vtdirty,
+  z3660rtg_blit_on/_blit_maxarea; the console lines say "z3660rtg:";
+- the fixed window is probed with one caught bprobe() read first and is
+  silent without a board (an A4000 without a Z3660 has empty Zorro III
+  space there); -DZZ9K_DEBUG prints the old line.
+
+The ioctl ABI (zz9000.h) is unchanged; the device node and major are the
+kit's (cdevsw[55], port/src/patch_z3660rtg_cdevsw.py).
+
+---
+--- a/src/zz9000.c
++++ b/src/zz9000.c
+@@ -1,5 +1,13 @@
+ /*
+- * zz9000.c - MNT ZZ9000 framebuffer/mode driver for Amiga UNIX.
++ * z3660rtg - the Z3660 accelerator's RTG for Amiga UNIX: /dev/z3660rtg,
++ * character major 55 (amix-gate io/z3660rtg).  Built from zz9000.c, the MNT
++ * ZZ9000 framebuffer/mode driver, with the Z3660 rows only: a machine with
++ * a ZZ9000 and a Z3660 has both drivers, each with its own node and major.
++ * The ioctl ABI is zz9000.h's, unchanged, so the zz9000 tools and the X
++ * server's zz9000 card code drive it on /dev/z3660rtg.  It binds only the
++ * Z3660 (AutoConfig 0x144B/0x01, or its fixed window on an AGA machine).
++ *
++ * The text below is the zz9000 driver's:
+  *
+  * Board identity, window layout and register file are data: one row of
+  * zz9k_boardtab[] per supported board (see zz9000.h).  The default rows
+@@ -20,6 +28,9 @@
+ #include "sys/systm.h"
+ #include "../../console/screen.h"
+ #include "../../console/console.h"
++#ifndef ZZ9K_TARGET_Z3660
++#define ZZ9K_TARGET_Z3660       /* the Z3660 rows: this driver's only boards */
++#endif
+ #include "zz9000.h"
+ 
+ #define ZZ9K_MAXBOARDS 1
+@@ -179,6 +190,7 @@
+ static char *zz9k_devphys();
+ static char *zz9k_devpa();
+ static void zz9k_monsw_attach();
++extern int bprobe();
+ 
+ #ifdef ZZ9K_FB_NC
+ /*
+@@ -243,7 +255,7 @@
+ static int zz9k_console_disabled;
+ static int zz9k_vt_on;            /* the port's vt040.c mirrors the consoles */
+ static void zz9k_vt_map();
+-int zz9000vtdirty;                /* bumped per console write; vt040.c clears it */
++int z3660rtgvtdirty;                /* bumped per console write; vt040.c clears it */
+ static int zz9k_console_row;
+ static int zz9k_console_col;
+ static int zz9k_console_cols;
+@@ -278,49 +290,6 @@
+ 
+ static int zz9k_con_w;
+ static int zz9k_con_h;
+-
+-/*
+- * ZZ9000 register file: 16-bit registers, offsets from zz9000.h.
+- */
+-static unsigned short zz9k_regoff_zz9000[ZZ9K_NREG] = {
+-    ZZ9K_REG_HW_VERSION,
+-    ZZ9K_REG_MODE,
+-    ZZ9K_REG_PAN_HI,
+-    ZZ9K_REG_BLITTER_X1,
+-    ZZ9K_REG_BLITTER_Y1,
+-    ZZ9K_REG_BLITTER_X2,
+-    ZZ9K_REG_BLITTER_Y2,
+-    ZZ9K_REG_BLITTER_ROW_PITCH,
+-    ZZ9K_REG_BLITTER_X3,
+-    ZZ9K_REG_BLITTER_Y3,
+-    ZZ9K_REG_BLITTER_RGB_HI,
+-    ZZ9K_REG_BLITTER_OP_FILLRECT,
+-    ZZ9K_REG_BLITTER_OP_COPYRECT,
+-    ZZ9K_REG_BLITTER_SRC_HI,
+-    ZZ9K_REG_BLITTER_DST_HI,
+-    ZZ9K_REG_BLITTER_COLORMODE,
+-    ZZ9K_REG_BLITTER_SPLIT_POS,
+-    ZZ9K_REG_FW_VERSION,
+-    ZZ9K_REG_CX_CAPTURE,
+-    ZZ9K_NOREG
+-};
+-
+-static struct zz9k_modetab zz9k_modes_zz9000[] = {
+-    { 1280, 720, ZZ9K_MODE_1280x720 },
+-    { 800, 600, ZZ9K_MODE_800x600 },
+-    { 640, 480, ZZ9K_MODE_640x480 },
+-    { 1024, 768, ZZ9K_MODE_1024x768 },
+-    { 1280, 1024, ZZ9K_MODE_1280x1024 },
+-    { 1920, 1080, ZZ9K_MODE_1920x1080 },
+-    { 720, 576, ZZ9K_MODE_720x576 },
+-    { 720, 480, ZZ9K_MODE_720x480 },
+-    { 640, 512, ZZ9K_MODE_640x512 },
+-    { 1600, 1200, ZZ9K_MODE_1600x1200 },
+-    { 2560, 1440, ZZ9K_MODE_2560x1440 },
+-    { 640, 400, ZZ9K_MODE_640x400 },
+-    { 1920, 800, ZZ9K_MODE_1920x800 },
+-    { 0, 0, 0 }
+-};
+ 
+ #ifdef ZZ9K_TARGET_Z3660
+ /*
+@@ -401,45 +370,15 @@
+ #endif
+ 
+ /*
+- * Kernel-patchable: zz9k_blit_on 0 turns the blitter off without a relink;
+- * zz9k_blit_maxarea > 0 splits an operation into bands of at most that many
++ * Kernel-patchable: z3660rtg_blit_on 0 turns the blitter off without a relink;
++ * z3660rtg_blit_maxarea > 0 splits an operation into bands of at most that many
+  * pixels, since the CPU sits in the stalled register write for the whole
+  * operation and takes no interrupt meanwhile (0 = no split).
+  */
+-int zz9k_blit_on = 1;
+-long zz9k_blit_maxarea = 0;
++int z3660rtg_blit_on = 1;
++long z3660rtg_blit_maxarea = 0;
+ 
+ static struct zz9k_boardtab zz9k_boardtab[] = {
+-    { "Zorro II board", "",
+-      ZZ9K_PRODUCT_PC_Z2, 0, 0,
+-      ZZ9K_FB_OFFSET, ZZ9K_FB_OFFSET, 0, ZZ9K_Z2_RESERVED_TAIL, ZZ9K_REG_SIZE,
+-      2, zz9k_regoff_zz9000, zz9k_modes_zz9000,
+-      ZZ9K_CON_WIDTH, ZZ9K_CON_HEIGHT,
+-      ZZ9K_FW_VER_MIN, 0, 2, ZZ9K_PRODUCT_Z2, ZZ9K_BT_BLIT_ZZ9000, ZZ9K_CM_ZZ9000 },
+-#ifndef ZZ9K_BENCH_Z3
+-    { "Zorro III product", "configure card as Zorro II product 3 for AMIX",
+-      ZZ9K_PRODUCT_PC_Z3, 0, 0,
+-      ZZ9K_FB_OFFSET, ZZ9K_FB_OFFSET, 0, ZZ9K_Z2_RESERVED_TAIL, ZZ9K_REG_SIZE,
+-      2, zz9k_regoff_zz9000, zz9k_modes_zz9000,
+-      ZZ9K_CON_WIDTH, ZZ9K_CON_HEIGHT,
+-      ZZ9K_FW_VER_MIN, 0, 3, ZZ9K_PRODUCT_Z3, ZZ9K_BT_REJECT, ZZ9K_CM_ZZ9000 }
+-#else
+-    /*
+-     * Bench aid, not a supported configuration: amiberry can place its
+-     * ZZ9000 Zorro III model inside the identity map (z3mapping=uae puts
+-     * it at 0x10000000), which rehearses a 32-bit window before the Z3660
+-     * stand-in exists.  Replaces the product 4 rejection above; same
+-     * register file and layout as the Zorro II row, framebuffer capped so
+-     * the mapping stays small.  The probe still refuses a product 4 that
+-     * lies outside the identity map.
+-     */
+-    { "Zorro III board (bench)", "",
+-      ZZ9K_PRODUCT_PC_Z3, 0, 0,
+-      ZZ9K_FB_OFFSET, ZZ9K_FB_OFFSET, ZZ9K_Z3660_FB_MAX, 0, ZZ9K_REG_SIZE,
+-      2, zz9k_regoff_zz9000, zz9k_modes_zz9000,
+-      ZZ9K_CON_WIDTH, ZZ9K_CON_HEIGHT,
+-      ZZ9K_FW_VER_MIN, 0, 3, ZZ9K_PRODUCT_Z3, ZZ9K_BT_BLIT_ZZ9000, ZZ9K_CM_ZZ9000 }
+-#endif /* ZZ9K_BENCH_Z3 */
+ #ifdef ZZ9K_TARGET_Z3660
+     /*
+      * The combo board as the AutoConfig table lists it.  On real hardware
+@@ -453,7 +392,7 @@
+      * Measured on an A4000 + Z3660, 2026-09-18: rejecting on the entry
+      * alone refused a board the kernel can use.
+      */
+-  , { "Z3660 RTG", "set autoconfig_rtg NO for AMIX",
++    { "Z3660 RTG", "set autoconfig_rtg NO for AMIX",
+       ZZ9K_Z3660_PRODUCT_PC, 0, 0,
+       0, ZZ9K_Z3660_FB_PHYS, ZZ9K_Z3660_FB_MAX, 0,
+       ZZ9K_Z3660_REG_SIZE,
+@@ -643,10 +582,12 @@
+         bp->base = 0;
+         bp->bt = (struct zz9k_boardtab *)0;
+         if (bt->autocon_pc)
+-            printf("zz9000: autocon base 0x%x did not look like ZZ9000 regs\n",
++            printf("z3660rtg: autocon base 0x%x did not look like Z3660 RTG registers\n",
+                 (unsigned int)base);
+-        else
+-            printf("zz9000: no %s at 0x%x\n", bt->name, (unsigned int)base);
++#ifdef ZZ9K_DEBUG
++        else                      /* a fixed window nothing vouches for: quiet */
++            printf("z3660rtg: no %s at 0x%x\n", bt->name, (unsigned int)base);
++#endif
+         return 0;
+     }
+ 
+@@ -690,10 +631,10 @@
+     if (bp->fb_size) {
+         if (hat_cm_fb_add(phystopfn((unsigned long)ZZ9K_FBPA(bp)),
+                           phystopfn((unsigned long)ZZ9K_FBPA(bp) + bp->fb_size)))
+-            printf("zz9000: framebuffer 0x%x+0x%x registered noncacheable-not-serialised\n",
++            printf("z3660rtg: framebuffer 0x%x+0x%x registered noncacheable-not-serialised\n",
+                 (unsigned int)ZZ9K_FBPA(bp), (unsigned int)bp->fb_size);
+         else
+-            printf("zz9000: framebuffer cache class NOT registered (stays serialised)\n");
++            printf("z3660rtg: framebuffer cache class NOT registered (stays serialised)\n");
+     }
+ #endif
+     bp->hw_version = (unsigned short)zz9k_rd(bp, ZZ9K_R_HW_VERSION);
+@@ -704,16 +645,16 @@
+     bp->mode = ZZ9K_MODE_800x600;
+     zz9k_monsw_attach(bp);
+ 
+-    printf("zz9000: %s at 0x%x size 0x%x hw 0x%x fw 0x%x\n", bt->name,
++    printf("z3660rtg: %s at 0x%x size 0x%x hw 0x%x fw 0x%x\n", bt->name,
+         (unsigned int)ZZ9K_PHYS(bp), (unsigned int)bp->board_size,
+         bp->hw_version, bp->fw_version);
+ #ifdef ZZ9K_MAP_BOARD
+     if (bp->map_size > bp->board_size)
+-        printf("zz9000: mmap reaches device offset 0x%x (soft3D)\n",
++        printf("z3660rtg: mmap reaches device offset 0x%x (soft3D)\n",
+             (unsigned int)bp->map_size);
+ #endif
+     if (bt->fw_min && bp->fw_version < bt->fw_min)
+-        printf("zz9000: warning firmware 0x%x is older than 0x%x\n",
++        printf("z3660rtg: warning firmware 0x%x is older than 0x%x\n",
+             bp->fw_version, bt->fw_min);
+     return 1;
+ }
+@@ -778,7 +719,7 @@
+     fb = kmap ? dev_kvmap((unsigned long)base + bt->fb_phys, kmap, ZZ9K_CM_NC, 0)
+         : (char *)0;
+     if (!regs || (kmap && !fb)) {
+-        printf("zz9000: %s at 0x%x: cannot map it into the kernel\n",
++        printf("z3660rtg: %s at 0x%x: cannot map it into the kernel\n",
+             bt->name, (unsigned int)base);
+         if (regs)
+             dev_kvunmap(regs, (unsigned long)rsize);
+@@ -795,7 +736,7 @@
+         return 0;
+     }
+     bp->fb = fb;                  /* zz9k_attach set the physical one */
+-    printf("zz9000: %s mapped: registers 0x%x, framebuffer 0x%x+0x%x\n",
++    printf("z3660rtg: %s mapped: registers 0x%x, framebuffer 0x%x+0x%x\n",
+         bt->name, (unsigned int)regs, (unsigned int)fb, (unsigned int)kmap);
+     return 1;
+ }
+@@ -823,12 +764,12 @@
+             if (!autocon(bt->autocon_pc, unit, &base, &size))
+                 continue;
+             if (bt->flags & ZZ9K_BT_REJECT) {
+-                printf("zz9000: %s at 0x%x size 0x%x unsupported\n",
++                printf("z3660rtg: %s at 0x%x size 0x%x unsupported\n",
+                     bt->name, (unsigned int)base, (unsigned int)size);
+-                printf("zz9000: %s\n", bt->advice);
++                printf("z3660rtg: %s\n", bt->advice);
+                 return 0;
+             }
+-            printf("zz9000: autocon match pc 0x%x base 0x%x size 0x%x\n",
++            printf("z3660rtg: autocon match pc 0x%x base 0x%x size 0x%x\n",
+                 (unsigned int)bt->autocon_pc, (unsigned int)base,
+                 (unsigned int)size);
+         } else {
+@@ -836,6 +777,16 @@
+                 continue;
+             base = (long)bt->fixed_base;
+             size = (long)bt->fixed_size;
++            /*
++             * No AutoConfig entry vouches for this window: on an A4000
++             * without a Z3660 it is empty Zorro III space, and a plain
++             * read there is a bus error.  One caught read of the version
++             * register first (z3660eth does the same); the window is
++             * inside the identity map.
++             */
++            if (bprobe((caddr_t)((char *)base +
++                    bt->regoff[ZZ9K_R_FW_VERSION]), -1))
++                continue;
+         }
+         /*
+          * Kernel code dereferences the window directly: it must lie
+@@ -850,10 +801,10 @@
+                 return 1;
+             continue;
+ #else
+-            printf("zz9000: %s at 0x%x size 0x%x is outside the identity map\n",
++            printf("z3660rtg: %s at 0x%x size 0x%x is outside the identity map\n",
+                 bt->name, (unsigned int)base, (unsigned int)size);
+             if (bt->advice[0])
+-                printf("zz9000: %s\n", bt->advice);
++                printf("z3660rtg: %s\n", bt->advice);
+             continue;
+ #endif
+         }
+@@ -863,14 +814,14 @@
+     }
+ 
+     /*
+-     * No board: say nothing.  zz9000init() probes at every boot, also on
+-     * machines with another card (Picasso II, VA2000) or none, and a line
+-     * about a missing ZZ9000 there only confuses; each driver reports its own
++     * No board: say nothing.  z3660rtginit() probes at every boot, also on
++     * machines with another card (Picasso II, VA2000, ZZ9000) or none, and a
++     * line about a missing Z3660 there only confuses; each driver reports its own
+      * hardware.  -DZZ9K_DEBUG keeps the old line for bring-up.
+      */
+ #ifdef ZZ9K_DEBUG
+-    printf("zz9000: autocon did not find manufacturer 0x%x product %d\n",
+-        ZZ9K_MNT_MANUFACTURER, ZZ9K_PRODUCT_Z2);
++    printf("z3660rtg: autocon did not find 0x%x, no fixed window\n",
++        (unsigned int)ZZ9K_Z3660_PRODUCT_PC);
+ #endif
+     return 0;
+ }
+@@ -1119,7 +1070,7 @@
+ zz9k_can_blit(bp)
+ struct zz9k_board *bp;
+ {
+-    return (bp->bt->flags & ZZ9K_BT_BLITTER) && zz9k_blit_on &&
++    return (bp->bt->flags & ZZ9K_BT_BLITTER) && z3660rtg_blit_on &&
+         bp->color_mode == ZZ9K_COLOR_16BIT565 &&
+         ((bp->width * zz9k_bpp(bp->color_mode)) & 3) == 0;
+ }
+@@ -1136,7 +1087,7 @@
+ 
+ /*
+  * One checked fill (sx < 0) or copy on the blitter, in bands of at most
+- * zz9k_blit_maxarea pixels.  A copy moving down runs its bands bottom-up,
++ * z3660rtg_blit_maxarea pixels.  A copy moving down runs its bands bottom-up,
+  * so no band overwrites a source row a later band still reads; inside a
+  * band the firmware orders rows and columns itself (gfx.c copy_rect_nomask).
+  */
+@@ -1149,8 +1100,8 @@
+     int band, top, n;
+ 
+     band = h;
+-    if (zz9k_blit_maxarea > 0 && (long)w * h > zz9k_blit_maxarea) {
+-        band = (int)(zz9k_blit_maxarea / w);
++    if (z3660rtg_blit_maxarea > 0 && (long)w * h > z3660rtg_blit_maxarea) {
++        band = (int)(z3660rtg_blit_maxarea / w);
+         if (band < 1)
+             band = 1;
+     }
+@@ -1230,7 +1181,7 @@
+         if (bp->bt->regoff[ZZ9K_R_MONSW] != ZZ9K_NOREG) {
+             v = zz9k_rd(bp, ZZ9K_R_MONSW);
+             if (v & ~(unsigned long)MONSW_VALID)
+-                printf("zz9000: monitor_switch 0x%x is not a 1/2/16/32 bit sum; no seed\n",
++                printf("z3660rtg: monitor_switch 0x%x is not a 1/2/16/32 bit sum; no seed\n",
+                     (unsigned int)v);
+             else
+                 seed = (int)v;
+@@ -1633,7 +1584,7 @@
+         /* the stock console draws it; vt040.c mirrors that screen */
+         if (zz9k_old_conputc)
+             (*zz9k_old_conputc)(c);
+-        ++zz9000vtdirty;
++        ++z3660rtgvtdirty;
+         return;
+     }
+     if (!zz9k_console_on || !zz9k_console_bp)
+@@ -1805,7 +1756,7 @@
+ }
+ 
+ int
+-zz9000consoleputc(c)
++z3660rtgconsoleputc(c)
+ unsigned char c;
+ {
+     if (!zz9k_console_redirect)
+@@ -1819,7 +1770,7 @@
+ }
+ 
+ int
+-zz9000consolewrite(p, n)
++z3660rtgconsolewrite(p, n)
+ unsigned char *p;
+ unsigned n;
+ {
+@@ -1856,9 +1807,9 @@
+  * with the redirect on), so a machine that never uses one spends no more
+  * kernel virtual space (sptmap, inside the kvseg) than before.  The small
+  * mapping is kept after the switch: vt040.c may hold its address until it
+- * next asks zz9000vtinfo; it costs ZZ9K_VT_SMALL of address space once.
++ * next asks z3660rtgvtinfo; it costs ZZ9K_VT_SMALL of address space once.
+  * If the big mapping cannot be had, the big modes simply have no console
+- * mirror (zz9000vtinfo says no), as before pass 2.
++ * mirror (z3660rtgvtinfo says no), as before pass 2.
+  */
+ #define ZZ9K_VT_END    0x02400000UL      /* framebuffer offset the buffer ends at */
+ #define ZZ9K_VT_SMALL  0x00400000UL      /* 1920x1080x16 bpp = 0x3f4800 fits */
+@@ -1894,7 +1845,7 @@
+ #ifdef ZZ9K_KVMAP
+     p = dev_kvmap((unsigned long)ZZ9K_FBPA(bp) + off, size, ZZ9K_CM_NC, 0);
+     if (!p) {
+-        printf("zz9000: no kernel space for a 0x%x console buffer\n",
++        printf("z3660rtg: no kernel space for a 0x%x console buffer\n",
+             (unsigned int)size);
+         return;
+     }
+@@ -1915,7 +1866,7 @@
+  * board, redirect off, mode not 16 bpp, or no mapping).
+  */
+ int
+-zz9000vtinfo(fbp, wp, hp)
++z3660rtgvtinfo(fbp, wp, hp)
+ char **fbp;
+ int *wp, *hp;
+ {
+@@ -1942,7 +1893,7 @@
+  * first, and the blitter cache forgets them, as zz9k_set_mode_hw does.
+  */
+ void
+-zz9000vtpan(on)
++z3660rtgvtpan(on)
+ int on;
+ {
+     struct zz9k_board *bp = zz9k_console_bp;
+@@ -2006,13 +1957,13 @@
+ }
+ 
+ void
+-zz9000init()
++z3660rtginit()
+ {
+     (void)zz9k_probe(0);
+ }
+ 
+ int
+-zz9000open(devp, mode, type, cr)
++z3660rtgopen(devp, mode, type, cr)
+ dev_t *devp;
+ int mode;
+ int type;
+@@ -2028,7 +1979,7 @@
+ }
+ 
+ int
+-zz9000close(dev, mode, type, cr)
++z3660rtgclose(dev, mode, type, cr)
+ dev_t dev;
+ int mode;
+ int type;
+@@ -2055,7 +2006,7 @@
+ }
+ 
+ static int
+-zz9000rw(dev, direction, uiop)
++z3660rtgrw(dev, direction, uiop)
+ dev_t dev;
+ uio_rw_t direction;
+ struct uio *uiop;
+@@ -2097,25 +2048,25 @@
+ }
+ 
+ int
+-zz9000read(dev, uiop, cr)
++z3660rtgread(dev, uiop, cr)
+ dev_t dev;
+ struct uio *uiop;
+ struct cred *cr;
+ {
+-    return zz9000rw(dev, UIO_READ, uiop);
++    return z3660rtgrw(dev, UIO_READ, uiop);
+ }
+ 
+ int
+-zz9000write(dev, uiop, cr)
++z3660rtgwrite(dev, uiop, cr)
+ dev_t dev;
+ struct uio *uiop;
+ struct cred *cr;
+ {
+-    return zz9000rw(dev, UIO_WRITE, uiop);
++    return z3660rtgrw(dev, UIO_WRITE, uiop);
+ }
+ 
+ int
+-zz9000mmap(dev, offset, maxprot)
++z3660rtgmmap(dev, offset, maxprot)
+ dev_t dev;
+ off_t offset;
+ int maxprot;
+@@ -2399,7 +2350,7 @@
+ }
+ 
+ int
+-zz9000ioctl(dev, cmd, arg, mode, cr, rvalp)
++z3660rtgioctl(dev, cmd, arg, mode, cr, rvalp)
+ dev_t dev;
+ int cmd;
+ int arg;

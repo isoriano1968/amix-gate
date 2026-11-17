@@ -1,0 +1,31 @@
+ZZ9K_CONSOLE_QUERY: report the console state
+
+isoriano1968, amix-z3660rtg a183fb8.
+
+---
+--- a/src/zz9000.c
++++ b/src/zz9000.c
+@@ -2276,6 +2276,11 @@
+             printf("%s console redirect enabled\n", bp->bt->name);
+             break;
+         }
++        if (arg == ZZ9K_CONSOLE_QUERY) {
++            *rvalp = !zz9k_console_on ? ZZ9K_CONSOLE_DISABLE :
++                zz9k_console_redirect ? ZZ9K_CONSOLE_REDIRECT : ZZ9K_CONSOLE_ENABLE;
++            break;
++        }
+         if (arg == ZZ9K_CONSOLE_TEST) {
+             error = zz9k_console_test(bp);
+             if (error)
+--- a/src/zz9000.h
++++ b/src/zz9000.h
+@@ -126,6 +126,9 @@
+ #define ZZ9K_CONSOLE_TEST      2
+ #define ZZ9K_CONSOLE_REDIRECT  3
+ #define ZZ9K_CONSOLE_MIRROR    ZZ9K_CONSOLE_REDIRECT
++/* ZZ9K_CONSOLE_QUERY changes nothing; the ioctl returns the state as one of
++ * ZZ9K_CONSOLE_DISABLE, _ENABLE or _REDIRECT (startx-z3 restores it after X) */
++#define ZZ9K_CONSOLE_QUERY     4
+ 
+ 
+ struct zz9k_autocon_entry {

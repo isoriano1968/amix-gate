@@ -1,0 +1,24 @@
+Drivers name only hardware that is fitted: no line without a board
+
+amix-gate 02e4e48 (io/zz9000).
+
+---
+--- a/src/zz9000.c
++++ b/src/zz9000.c
+@@ -862,8 +862,16 @@
+         /* attach() said what it saw; a later row may still find it */
+     }
+ 
++    /*
++     * No board: say nothing.  zz9000init() probes at every boot, also on
++     * machines with another card (Picasso II, VA2000) or none, and a line
++     * about a missing ZZ9000 there only confuses; each driver reports its own
++     * hardware.  -DZZ9K_DEBUG keeps the old line for bring-up.
++     */
++#ifdef ZZ9K_DEBUG
+     printf("zz9000: autocon did not find manufacturer 0x%x product %d\n",
+         ZZ9K_MNT_MANUFACTURER, ZZ9K_PRODUCT_Z2);
++#endif
+     return 0;
+ }
+ 

@@ -1,0 +1,33 @@
+amix-z3660rtg
+=============
+
+This repository is a fork of isoriano1968/zz9000-amix
+(https://github.com/isoriano1968/zz9000-amix), MIT licence,
+Copyright (c) 2026 Ignacio Soriano. LICENSE is upstream's, unchanged.
+
+The Z3660 RTG target, the x11/ kit, the bench tools and the documentation
+added in this fork are Copyright (c) 2026 Jussi Alanärä and are released
+under the same MIT licence (see LICENSE).
+
+x11/bench/x11perf-baseline.sh is adapted from Antti Sokero's xrtg-amix
+(https://github.com/asokero/xrtg-amix), MIT licence,
+Copyright (c) 2025-2026 Antti Sokero.
+
+The patches in x11/patches/ modify isoriano1968/x11r6.3-amix
+(https://github.com/isoriano1968/x11r6.3-amix, MIT licence) and the X11R6.3
+sources (X Consortium licence). Each patch is under the licence of the file
+it modifies.
+
+Trademarks
+----------
+
+The wording Amiga Corporation asked us to carry:
+
+This project and its developers are not affiliated with, endorsed by, or sponsored by Amiga Corporation. Amiga is a registered trademark of Amiga Corporation.
+
+This project is likewise not affiliated with, endorsed by, or sponsored by
+Commodore or any other trademark holder. AmigaOS and Amiga UNIX are
+trademarks of their respective owners; UNIX is a registered trademark of
+The Open Group. Amiga UNIX is Commodore's port of AT&T UNIX System V
+Release 4; portions are copyright AT&T, UNIX System Laboratories and their
+successors. This repository ships no Amiga or Amiga UNIX binaries.
