@@ -37,7 +37,7 @@ SRC=$(cd "$HERE/.." && pwd)
 . "$PORT/tools/kit-lib.sh"
 kit_env
 OUT=${1:-$HERE/kit}
-VERSION=0.3
+VERSION=0.4
 
 B="$HERE/build/hydrakit"; rm -rf "$B"; mkdir -p "$B"
 cp "$SRC/hydra.c" "$SRC/hydrauser.h" "$SRC/../dp8390/dp8390.c" "$SRC/../dp8390/dp8390.h" \

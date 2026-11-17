@@ -17,12 +17,30 @@
 # patch_*.py and before patch_io_init.py, with the stub it generated
 # (port/tools/kit-relink.sh does the same).
 #
+# The z3660 variant of the port kernel (amix-kernel-040 --variant z3660,
+# relink-040-z3660intr.sh with Z3660ETH_P2_ALONE=1) has no aenintr entry:
+# slot 4 is the Z3660 ethernet driver's z3660eth_p2, which first calls
+# through the pointer z3660eth_p2_next (there z3660eth_none), then drains
+# its own ring.  Then the chain goes in at that pointer instead: the
+# R_68K_32 relocation of z3660eth_p2_next's initialiser is retargeted to
+# SYMBOL, and the stub's first call -- its `jsr aenintr', the R_68K_32 at
+# SYMBOL+6 after `movel %sp@(4),%sp@-' -- to what z3660eth_p2_next named
+# before.  At run time: int2_tbl[4] -> z3660eth_p2 -> SYMBOL -> (the old
+# z3660eth_p2_next), each kit's intr= in order; then z3660eth_p2's drain,
+# the same order as before with the kits' routines added after the first
+# call.  Two relocations' symbols, nothing else.
+#
 # Asserted, by symbol (no fixed addresses), before anything is written; fails
 # closed otherwise:
 #   - int2_tbl is a .data table of st_size/4 words ending in a 0 without
 #     relocation; every other entry is one R_68K_32 relocation with addend 0;
 #   - exactly one entry goes to aenintr (or, idempotent, none does and
 #     exactly one already goes to SYMBOL: then nothing to do);
+#   - or, without aenintr: exactly one entry goes to z3660eth_p2, none to
+#     SYMBOL; z3660eth_p2_next has exactly one R_68K_32 relocation, addend
+#     0 (idempotent: already SYMBOL, nothing to do); SYMBOL starts with
+#     movel %sp@(4),%sp@- and jsr abs.l whose one R_68K_32 relocation, addend
+#     0, names aenintr;
 #   - SYMBOL and aenintr are defined (not UND) global symbols in .text.
 
 import struct
@@ -30,6 +48,8 @@ import sys
 
 R_68K_32 = 1
 OLD = "aenintr"
+Z3660 = "z3660eth_p2"		# the z3660 variant's slot-4 handler
+Z3660_NEXT = "z3660eth_p2_next"	# the pointer it calls first
 STB_GLOBAL = 1
 
 
@@ -118,6 +138,10 @@ def main():
     print("  int2_tbl: %s" % ", ".join(n for _, _, n in names))
     olds = [(off, o) for off, o, n in names if n == OLD]
     news = [n for _, _, n in names if n == new]
+    if not olds and not news and any(n == Z3660 for _, _, n in names):
+        chain_z3660(b, kernel, new, tgt, [n for _, _, n in names], sh, byname, so, se,
+                    symname, defined)
+        return
     if not olds and len(news) == 1:
         print("  [skip] int2_tbl already -> %s" % new)
         return
@@ -129,6 +153,56 @@ def main():
     open(kernel, "wb").write(b)
     print("  [ok]   int2_tbl[%d] @0x%x  %s -> %s (0x%x)"
           % ((off - tbl) // 4, off, OLD, new, u32(b, so + tgt * se + 4)))
+
+
+def relocs_in(b, sec, lo, hi):
+    """(entry offset, r_offset, symbol index, addend) of every relocation of
+    section `sec` (a dict) with lo <= r_offset < hi"""
+    ro, re_ = sec["offset"], sec["entsize"]
+    out = []
+    for i in range(sec["size"] // re_):
+        o = ro + i * re_; roff = u32(b, o)
+        if lo <= roff < hi:
+            out.append((o, roff, u32(b, o + 4), u32(b, o + 8)))
+    return out
+
+
+def chain_z3660(b, kernel, new, tgt, names, sh, byname, so, se, symname, defined):
+    """the z3660 variant: the chain at z3660eth_p2_next (see the header)"""
+    for need in (".text", ".rela.text"):
+        if need not in byname:
+            raise SystemExit("ABORT: no %s section" % need)
+    if names.count(Z3660) != 1:
+        raise SystemExit("ABORT: int2_tbl has no %s and %d %s entries, expected 1"
+                         % (OLD, names.count(Z3660), Z3660))
+    pi = defined(Z3660_NEXT, ".data")
+    pv = u32(b, so + pi * se + 4)
+    p = [r for r in relocs_in(b, byname[".rela.data"], pv, pv + 4)]
+    if len(p) != 1 or p[0][1] != pv or p[0][2] & 0xff != R_68K_32 or p[0][3] != 0:
+        raise SystemExit("ABORT: %s: %d relocations, expected one R_68K_32 at it, addend 0"
+                         % (Z3660_NEXT, len(p)))
+    pent, _, pinfo, _ = p[0]
+    prev = pinfo >> 8
+    if symname(prev) == new:
+        print("  [skip] %s already -> %s" % (Z3660_NEXT, new))
+        return
+    if symname(prev).startswith("amixdrv_"):
+        raise SystemExit("ABORT: %s -> %s" % (Z3660_NEXT, symname(prev)))
+    # the stub: movel %sp@(4),%sp@- ; jsr <abs.l>, the call's relocation at +6
+    text = byname[".text"]
+    sv = u32(b, so + tgt * se + 4)
+    code = b[text["offset"] + sv - text["addr"]:text["offset"] + sv - text["addr"] + 6]
+    if bytes(code) != b"\x2f\x2f\x00\x04\x4e\xb9":
+        raise SystemExit("ABORT: %s does not start with movel %%sp@(4),%%sp@- ; jsr abs.l" % new)
+    c = relocs_in(b, byname[".rela.text"], sv + 6, sv + 10)
+    if len(c) != 1 or c[0][1] != sv + 6 or c[0][2] & 0xff != R_68K_32 or c[0][3] != 0 \
+            or symname(c[0][2] >> 8) != OLD:
+        raise SystemExit("ABORT: %s+6: expected one R_68K_32 relocation to %s, addend 0" % (new, OLD))
+    struct.pack_into(">I", b, c[0][0] + 4, (prev << 8) | R_68K_32)
+    struct.pack_into(">I", b, pent + 4, (tgt << 8) | R_68K_32)
+    open(kernel, "wb").write(b)
+    print("  [ok]   %s: %s -> %s (0x%x); %s's first call %s -> %s"
+          % (Z3660_NEXT, symname(prev), new, sv, new, OLD, symname(prev)))
 
 
 main()

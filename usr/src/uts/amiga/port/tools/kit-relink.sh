@@ -19,7 +19,9 @@
 #     but not all of them in BASE fails;
 #  4. every kit's patch_*.py in KIT.sha256 order, except patch_io_init.py and
 #     patch_int2.py;
-#  5. patch_int2.py OUT amixdrv_int2, once (when a kit has intr=);
+#  5. patch_int2.py OUT amixdrv_int2, once (when a kit has intr=); in the
+#     z3660 port kernel it hooks in at z3660eth_p2_next and the stub's first
+#     call becomes that pointer's old target (z3660eth_none) instead of aenintr;
 #  6. patch_io_init.py OUT amixdrv_init, once;
 #  7. checks: every KIT.info entries= and provides= symbol, init and intr, and
 #     amixdrv_init/amixdrv_int2, defined exactly once; nothing unresolved; .text and .data

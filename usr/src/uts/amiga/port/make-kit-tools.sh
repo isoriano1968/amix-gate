@@ -12,7 +12,10 @@
 #                           per chosen driver, graphics before network
 #   patch_int2.py           int2_tbl's aenintr entry -> amixdrv_int2, run once
 #                           after every kit's own patch_*.py, before
-#                           patch_io_init.py, when a chosen kit has intr=
+#                           patch_io_init.py, when a chosen kit has intr=;
+#                           in the z3660 port kernel (no aenintr entry) the
+#                           Z3660 ethernet's z3660eth_p2_next -> amixdrv_int2
+#                           and the stub's first call -> its old target
 #   amixdrv_int2.s.in       the level-2 interrupt chain stub: aenintr, then
 #                           @INTRS@ -> per chosen driver with KIT.info intr=,
 #                           in the kits' order:

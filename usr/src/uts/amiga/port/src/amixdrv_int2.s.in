@@ -21,6 +21,10 @@
 | every other register the C convention keeps are kept by the C callees.
 | Every routine must return quickly when its board is absent or quiet: the
 | level-2 line is shared by CIA-A, the SCSI controllers and every Zorro card.
+| In the z3660 port kernel, where int2_tbl has no aenintr (slot 4 is the
+| Z3660 ethernet's z3660eth_p2), patch_int2.py hooks the stub in at
+| z3660eth_p2_next instead and retargets its first call (jsr aenintr) to
+| what that pointer named; nothing here changes.
 | .text stays a multiple of 4 bytes, so the kernel's .data follows it directly.
 
 	.text
