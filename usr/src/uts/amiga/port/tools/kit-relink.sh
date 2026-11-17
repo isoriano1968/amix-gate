@@ -20,7 +20,11 @@
 #     definitions an EARLIER kit's object already brought (va2000-040 and
 #     rtgfb-040 both carry devkvmap040.o): left out when it is the same
 #     object byte for byte (sha256), a different one fails, and so does a
-#     partial overlap;
+#     partial overlap.
+#     A kit whose KIT.info conflicts= names a symbol the base has (of any
+#     binding, local ones included) is refused: the base already drives that
+#     hardware (z3660rtg-040 on the z3660 variant, whose built-in zz9000
+#     driver has the Z3660 rows: conflicts=zz9k_regoff_z3660);
 #  4. every kit's patch_*.py in KIT.sha256 order, except patch_io_init.py and
 #     patch_int2.py;
 #  5. patch_int2.py OUT amixdrv_int2, once (when a kit has intr=); in the
@@ -105,6 +109,10 @@ for K in "$@"; do
 	ENTRIES="$ENTRIES $(info "$K" entries) $PROV $i $r"
 	for e in $(info "$K" entries); do
 		$NM "$BASE" | grep -qE " [TDBC] $e\$" && { echo "[FAIL] base already has $e"; exit 1; }
+	done
+	for c in $(info "$K" conflicts); do
+		$NM "$BASE" | awk '{print $NF}' | grep -qx "$c" &&
+			{ echo "[FAIL] $K: the base already drives this hardware ($c): kit $(info "$K" id) is not for it"; exit 1; }
 	done
 	[ -n "$IOP" ] || [ ! -f "$K/patch_io_init.py" ] || IOP=$K/patch_io_init.py
 	[ -n "$I2P" ] || [ ! -f "$K/patch_int2.py" ] || I2P=$K/patch_int2.py
