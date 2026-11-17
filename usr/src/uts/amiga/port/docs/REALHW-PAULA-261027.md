@@ -17,7 +17,7 @@ then `tools/stamp-rootcard.py --card 1 --unit 0` and CACR `0xa0c08000`. Device n
 - CIA-A timer B at 125 BPM: 709379 × 2.5 / 125 = 14187 E-clock counts per tick, 50 ticks/s.
 - With the queue kept full, no tick finds it empty.
 
-## Measured (`test-tools/paulatest.c`, native `cc`)
+## Measured (`io/paula/port/test-tools/paulatest.c`, native `cc`)
 
 ```text
 /dev/audio while /dev/paula is open: refused, EBUSY (right)

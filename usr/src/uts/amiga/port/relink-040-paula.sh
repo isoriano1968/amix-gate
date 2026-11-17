@@ -1,10 +1,12 @@
 #!/bin/sh
-# relink-040-paula.sh -- add /dev/paula (src/paula.c, major 53) to a 68040/68060
+# relink-040-paula.sh -- add /dev/paula (paula.c, major 53) to a 68040/68060
 # kernel that already carries the patched audio driver (relink-040-audio.sh:
 # it defines paula_busy and audio_nopen).  /dev/paula gives one program
 # Paula's four channels register by register, replayed from CIA-A timer B;
-# src/paula.c explains why and how.  Usage:
-#   sh relink-040-paula.sh IN OUT
+# paula.c explains why and how.  Usage:
+#   [PAULA_SRC=<dir>] sh relink-040-paula.sh IN OUT
+# PAULA_SRC (default ../io/paula/port/src) holds paula.c, paula.h and
+# patch_paula_cdevsw.py.
 # aciaaintr (the level-2 CIA-A handler) is weakened: paula.o's version does
 # the stock keyboard / parallel / clock work and then timer B.
 set -e
@@ -13,6 +15,10 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/tools/build-step.sh"
 IN="$1"; OUT="$2"
 [ -f "$IN" ] && [ -n "$OUT" ] || { echo "usage: $0 base output"; exit 1; }
+PSRC="${PAULA_SRC:-$HERE/../io/paula/port/src}"
+for f in paula.c paula.h patch_paula_cdevsw.py; do
+	[ -f "$PSRC/$f" ] || { echo "ERROR: $f not found in $PSRC (set PAULA_SRC)"; exit 1; }
+done
 NM=m68k-linux-gnu-nm
 $NM "$IN" | grep -qE " [BCD] paula_busy$" || { echo "[FAIL] base has no paula_busy -- relink-040-audio.sh with patch_audio_paula.py first"; exit 1; }
 $NM "$IN" | grep -qE " [BCD] audio_nopen$" || { echo "[FAIL] base has no audio_nopen"; exit 1; }
@@ -25,7 +31,7 @@ echo "[*] base: $(basename "$IN")"
 sh "$HERE/src/mk_modelb_sysroot.sh" | sed 's/^/      /'
 AMIX_SYSROOT="$HERE/build/sysroot-modelb"; export AMIX_SYSROOT
 P="$HERE/build/paulasrc"; rm -rf "$P"; mkdir -p "$P"
-cp "$HERE/src/paula.c" "$HERE/src/paula.h" "$P/"
+cp "$PSRC/paula.c" "$PSRC/paula.h" "$P/"
 # the Amiga memory.h (AllocMem), not libc's <memory.h> that the -I order would find first
 cp "$AMIX_ROOT/usr/sys/amiga/inc/memory.h" "$P/"
 CF=$(echo "$AMIX_KERNEL_CFLAGS" | sed 's/-m68020/-m68040/')
@@ -52,7 +58,7 @@ done
 LEAK=$($NM "$OUT" | awk '$1=="U" && $2!="edata" && $2!="end" && $2!="etext" {print $2}')
 [ -z "$LEAK" ] || { echo "[FAIL] unresolved:"; echo "$LEAK"; exit 1; }
 echo "[OK] symbols defined, none unresolved"
-run_step 8 python3 "$HERE/src/patch_paula_cdevsw.py" "$OUT"
+run_step 8 python3 "$PSRC/patch_paula_cdevsw.py" "$OUT"
 CONTIG=$(m68k-linux-gnu-readelf -SW "$OUT" | awk '{gsub(/[][]/,"")} $2==".text"{to=$5;ts=$6} $2==".data"{do_=$5} END{print to, ts, do_}')
 set -- $CONTIG; set -- $(( 0x$1 + 0x$2 )) $(( 0x$3 ))
 [ "$1" = "$2" ] && echo "[OK] text/data contiguous." || { echo "[FAIL] text/data NOT contiguous"; exit 1; }

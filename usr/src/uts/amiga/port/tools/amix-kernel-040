@@ -17,7 +17,8 @@
 #                       user's /usr/sys).  The driver sources are the io/
 #                       trees beside the port (amix-gate, or the kit):
 #                       io/z3660scsi and io/z3660net src/ with their
-#                       port/patches/ applied in order, io/zz9000's zz9000.c;
+#                       port/patches/ applied in order, io/zz9000's zz9000.c,
+#                       io/paula's port/src (paula.c/.h and its patchers);
 #                       Z3660_SCSI_SRC (z3660.c), Z3660_NET_SRC (dir) and
 #                       Z3660_RTG_SRC (dir) override them.  The console font
 #                       is made from usr/sys amiga/console/sunfont.s
@@ -162,12 +163,13 @@ EOF
 # --- z3660: the driver sources, made from the io/ trees ---------------------
 # $W/drv holds every driver and Commodore source the variant compiles, so its
 # hash goes into the build id: z3660scsi/z3660.c, z3660net/*, zz9000/*,
-# audio/audio.[ch] (usr/sys), sunfont.o (made from usr/sys sunfont.s).
+# paula/* (io/paula/port/src), audio/audio.[ch] (usr/sys), sunfont.o (made
+# from usr/sys sunfont.s).
 DRV=$W/drv DRVSHA=
 if [ "$VARIANT" = z3660 ]; then
 	[ -n "$AMIXSYS" ] || fail "--variant z3660 needs --amix-sys (usr/sys)"
 	[ -n "$IO" ] || { [ -d "$PORT/../io" ] && IO=$(cd "$PORT/../io" && pwd); }
-	mkdir -p "$DRV/z3660scsi/src" "$DRV/z3660net/src" "$DRV/zz9000" "$DRV/audio"
+	mkdir -p "$DRV/z3660scsi/src" "$DRV/z3660net/src" "$DRV/zz9000" "$DRV/audio" "$DRV/paula"
 	patched() {	# dir-with-src/ patches-dir
 		for p in "$2"/*.patch; do
 			[ -f "$p" ] || continue
@@ -190,6 +192,10 @@ if [ "$VARIANT" = z3660 ]; then
 	RTGD=${Z3660_RTG_SRC:-$IO/zz9000/overlay/usr/sys/amiga/driver/zz9000}
 	[ -f "$RTGD/zz9000.c" ] || fail "no zz9000.c in $RTGD (--io, or Z3660_RTG_SRC)"
 	cp "$RTGD/zz9000.c" "$RTGD/zz9000.h" "$DRV/zz9000/"
+	for f in paula.c paula.h patch_audio_paula.py patch_paula_cdevsw.py; do
+		[ -f "$IO/paula/port/src/$f" ] || fail "no io/paula/port/src/$f (--io)"
+		cp "$IO/paula/port/src/$f" "$DRV/paula/"
+	done
 	cp "$AMIXSYS/amiga/driver/audio.c" "$AMIXSYS/amiga/driver/audio.h" "$DRV/audio/" ||
 		fail "no amiga/driver/audio.[ch] in $AMIXSYS"
 	if [ -n "${SUNFONT_O:-}" ]; then cp "$SUNFONT_O" "$DRV/sunfont.o"
@@ -200,7 +206,7 @@ if [ "$VARIANT" = z3660 ]; then
 	fi
 	DRVSHA=$(cd "$DRV" && find . -type f | LC_ALL=C sort | while read -r f; do printf '%s %s\n' "$(sha "$f")" "$f"; done | \
 		{ if command -v sha256sum >/dev/null; then sha256sum; else digest -a sha256; fi; } | cut -d' ' -f1)
-	export Z3660_RTG_SRC="$DRV/zz9000" AUDIO_SRC="$DRV/audio" SUNFONT_O="$DRV/sunfont.o"
+	export Z3660_RTG_SRC="$DRV/zz9000" AUDIO_SRC="$DRV/audio" PAULA_SRC="$DRV/paula" SUNFONT_O="$DRV/sunfont.o"
 	cat >> "$P/config.sh" <<EOF
 Z3660_SCSI_SRC="$DRV/z3660scsi/src/z3660.c"
 Z3660_NET_SRC="$DRV/z3660net/src"

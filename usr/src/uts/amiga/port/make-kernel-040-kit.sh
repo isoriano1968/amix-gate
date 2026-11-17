@@ -15,7 +15,8 @@
 # pinned NetBSD 10.1 syssrc.tgz, never vendored here); for the z3660
 # variant the driver sources beside it, as in amix-gate (all MIT):
 # io/z3660scsi (src/z3660.c, port/patches/), io/z3660net (src/, port/patches/),
-# io/zz9000 (zz9000.c/.h), each with its LICENSE.
+# io/zz9000 (zz9000.c/.h), io/paula (port/src: paula.c/.h, patch_audio_paula.py,
+# patch_paula_cdevsw.py), each with its LICENSE.
 # Never ships: any AMIX/Commodore file (kernel, usr/sys), build/, docs/,
 # private/, local/, config.sh, test-tools/.
 #
@@ -32,7 +33,9 @@ eval "$(grep '^PORT_FILES=' "$HERE/tools/amix-kernel-040")"
 ZZ=zz9000/overlay/usr/sys/amiga/driver/zz9000
 (cd "$HERE/../io" && tar cf - z3660scsi/LICENSE z3660scsi/src/z3660.c z3660scsi/port/patches \
 	z3660net/LICENSE z3660net/src/z3660eth.c z3660net/src/z3660eth.h z3660net/src/z3660ethuser.h \
-	z3660net/port/patches zz9000/LICENSE $ZZ/zz9000.c $ZZ/zz9000.h) | (cd "$OUT/io" && tar xf -)
+	z3660net/port/patches zz9000/LICENSE $ZZ/zz9000.c $ZZ/zz9000.h \
+	paula/LICENSE paula/port/src/paula.c paula/port/src/paula.h \
+	paula/port/src/patch_audio_paula.py paula/port/src/patch_paula_cdevsw.py) | (cd "$OUT/io" && tar xf -)
 cp "$HERE/tools/amix-kernel-040" "$OUT/amix-kernel-040"
 chmod 755 "$OUT/amix-kernel-040" "$OUT/port/tools/amix-kernel-040"
 . "$HERE/tools/netbsd-pin.sh"

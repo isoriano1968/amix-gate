@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """patch_audio_paula.py -- /dev/audio and /dev/paula exclude each other.
 Applied to a build-time copy of the stock AMIX 2.1c audio driver
-(usr/sys/amiga/driver/audio.c).  Usage: patch_audio_paula.py audio.c
+(usr/sys/amiga/driver/audio.c), stock or already carrying the port's
+ISSUE-68 close fix and stereo (port/src/patch_audio_close.py, then
+patch_audio_stereo.py; port/relink-040-audio.sh applies this one after
+them).  Usage: patch_audio_paula.py audio.c
 
 /dev/paula (src/paula.c, major 53) takes Paula's four channels and drives
 their registers directly; /dev/audio feeds the same channels from its own
@@ -28,18 +31,22 @@ reboot.  So audioopen() also refuses a stream that is already open
 The source is Commodore's and is not in this repository, and neither is
 any of its text.  Each place is found by a fingerprint -- the number of
 lines and the SHA-256 of those lines exactly as the stock file has them --
-which must match exactly once; our lines go in after it:
+which must match exactly once; our lines go in after it.  A place may
+have two fingerprints, the stock one and the one of the port's close fix
+(whose audioclose() replaces the stock one); one of them must match, once:
 
   1. the declaration of the client list head      -> the two globals
   2. audioopen(): the refusal of a module open    -> the two EBUSY tests
   3. audioopen(): the client joins the list       -> audio_nopen++
   4. audioclose(): the client leaves the list     -> audio_nopen--
+     (stock, or the close fix's guarded unlink)
 """
 import hashlib
 import sys
 
 PLACES = [
-    # (what, lines, sha256 of those lines, our lines to insert after them)
+    # (what, lines, sha256 of those lines (or a tuple: any one of them),
+    #  our lines to insert after them)
     ("client list declaration", 1,
      "72aeadf245332892dcf256b8d1a10f73e4c795fe7207431a596dd1578e1d1bef",
      ["int paula_busy;\t\t/* /dev/paula holds the channels (src/paula.c) */",
@@ -54,14 +61,16 @@ PLACES = [
      "6d4aa0e4693fbd2dc350b1a03f9053e937b5b6a6acf6ca2637af6d769cd3d446",
      ["    audio_nopen++;"]),
     ("audioclose: client leaves the list", 1,
-     "ad5e45679fcff3091ef7f584a750ca0f81578b1606320bbcf9f6dc868a18bba1",
+     ("ad5e45679fcff3091ef7f584a750ca0f81578b1606320bbcf9f6dc868a18bba1",
+      "5554e66748e994cd1b160eed8812023c8b35b3777bc42cc95a327430583a823e"),
      ["    audio_nopen--;"]),
 ]
 
 
 def find(lines, n, digest, what):
+    digests = digest if isinstance(digest, tuple) else (digest,)
     hits = [i for i in range(len(lines) - n + 1)
-            if hashlib.sha256("".join(lines[i:i + n]).encode("latin-1")).hexdigest() == digest]
+            if hashlib.sha256("".join(lines[i:i + n]).encode("latin-1")).hexdigest() in digests]
     if len(hits) != 1:
         sys.exit(f"[FAIL] audio.c: {what}: fingerprint found {len(hits)} times, expected 1 "
                  "(not the stock AMIX 2.1c audio.c?)")
