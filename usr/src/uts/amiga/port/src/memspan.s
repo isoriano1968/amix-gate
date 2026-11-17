@@ -393,6 +393,7 @@ Lpc_go:
 	.even
 mspan_sink:
 	.space	256
+	.align	4			| .text a multiple of 4: kits link after this stage
 
 	.data
 	.align	4
