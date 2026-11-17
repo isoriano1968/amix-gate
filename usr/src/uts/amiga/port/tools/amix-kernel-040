@@ -58,9 +58,17 @@
 # The result is a 68040/68060 kernel only: it boots natively from pvmk
 # (68040 and 68060), never on a 68030, and the stock kernel is no fallback
 # on a 68040/68060 (it does not run there).
-# Needs: m68k-cbm-sysv4-{gcc,as,ld} (developer/amix/gcc-27), m68k ELF binutils
-# + gcc as assembler (m68k-linux-gnu-* or m68k-elf-*), python3, sha256sum
-# (or digest -a sha256), tar, POSIX sh/awk.  BASE is only read.
+# Needs: m68k-cbm-sysv4-{gcc,as,ld} (developer/amix/gcc-27); a modern GNU m68k
+# ELF toolchain, gcc (as the assembler driver for the Motorola FPSP/ISP
+# packages and the FPSP glue) and binutils as, ld, nm, objcopy, objdump,
+# readelf, size: m68k-elf-* (developer/amix/gcc-14, /opt/m68k-amix/bin: gcc 14,
+# binutils 2.43) or Debian's m68k-linux-gnu-* (binutils 2.44); m68k-elf is
+# taken when both are on PATH.  Either gives the same OUT, byte for byte:
+# m68k-elf gas resolves references to global symbols of the same section at
+# assembly time where m68k-linux-gnu gas keeps relocations (TARGET_OS policy,
+# no option selects it), so every modern-gas assembly goes through
+# tools/m68k-gas.sh, which gives the m68k-linux-gnu object with either.
+# python3, sha256sum (or digest -a sha256), tar, POSIX sh/awk.  BASE is only read.
 set -e
 ME=$(basename "$0")
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -113,11 +121,18 @@ sha() { if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1;
 for t in m68k-cbm-sysv4-gcc m68k-cbm-sysv4-as m68k-cbm-sysv4-ld python3 tar; do
 	command -v $t >/dev/null || fail "$t not on PATH"
 done
+# the modern m68k ELF toolchain: m68k-elf (developer/amix/gcc-14) first, as
+# tools/m68k-gas.sh picks it; the result is the same with either
 GNU=
-for p in m68k-linux-gnu m68k-elf; do
-	command -v $p-objcopy >/dev/null 2>&1 && command -v $p-gcc >/dev/null 2>&1 && { GNU=$p; break; }
+for p in m68k-elf m68k-linux-gnu; do
+	GNU=$p
+	for t in gcc as ld nm objcopy objdump readelf size; do
+		command -v $p-$t >/dev/null 2>&1 || { GNU=; break; }
+	done
+	[ -z "$GNU" ] || break
 done
-[ -n "$GNU" ] || fail "no m68k ELF binutils + gcc (m68k-linux-gnu-* or m68k-elf-*)"
+[ -n "$GNU" ] || fail "no m68k ELF gcc + binutils (m68k-elf-* from developer/amix/gcc-14, or m68k-linux-gnu-*)"
+echo "[OK] m68k ELF toolchain: $GNU-* ($(command -v $GNU-as))"
 
 # --- the base: code-identical to AMIX 2.1c ----------------------------------
 # sha256 of the image with swapfile.nswap (.data swapfile+0x98, 4 bytes) set
@@ -147,7 +162,7 @@ TREE=$(cd "$P" && find . -type f | LC_ALL=C sort | while read -r f; do printf '%
 	{ if command -v sha256sum >/dev/null; then sha256sum; else digest -a sha256; fi; } | cut -d' ' -f1)
 cp "$BASE" "$W/amix/stand/unix"; chmod 644 "$W/amix/stand/unix"
 
-# m68k-linux-gnu-* names the scripts call, onto whichever ELF tools there are
+# m68k-linux-gnu-* names the stage scripts call, onto the ELF tools chosen above
 for t in objcopy nm readelf objdump ld as gcc cpp size; do
 	command -v $GNU-$t >/dev/null 2>&1 && ln -s "$(command -v $GNU-$t)" "$W/bin/m68k-linux-gnu-$t"
 done

@@ -20,7 +20,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 TGZ="${1:-$NETBSD_SYSSRC}"
 WORK="$HERE/build/isp060-work"
 SUB="usr/src/sys/arch/m68k/060sp"
-command -v m68k-linux-gnu-gcc >/dev/null || { echo "ERROR: m68k-linux-gnu-gcc not on PATH"; exit 1; }
+. "$HERE/tools/m68k-gas.sh"
 
 echo "[*] checking $(basename "$TGZ") against the pin"
 netbsd_syssrc_verify "$TGZ"
@@ -29,10 +29,10 @@ tar xzf "$TGZ" -C "$WORK" --exclude='*CVS*' "$SUB/isp.S" "$SUB/copyright.S"
 SP="$WORK/$SUB"
 
 echo "[*] the image alone: size and interface"
-m68k-linux-gnu-gcc -x assembler-with-cpp -m68060 -c "$SP/isp.S" -o "$WORK/isp-image.o"
-TSZ=$(m68k-linux-gnu-readelf -SW "$WORK/isp-image.o" | awk '{gsub(/[][]/,"")} $2==".text"{print $6}')
+m68k_asm "$WORK/isp-image.o" "$SP/isp.S" -m68060
+TSZ=$($M68K_READELF -SW "$WORK/isp-image.o" | awk '{gsub(/[][]/,"")} $2==".text"{print $6}')
 [ "$TSZ" = "001880" ] || { echo "[FAIL] isp image .text 0x$TSZ != 0x001880 (the measured package)"; exit 1; }
-UND=$(m68k-linux-gnu-nm "$WORK/isp-image.o" | grep -c ' U ' || true)
+UND=$($M68K_NM "$WORK/isp-image.o" | grep -c ' U ' || true)
 [ "$UND" = "0" ] || { echo "[FAIL] isp image: expected 0 unresolved symbols, got $UND"; exit 1; }
 echo "      image .text = 0x$TSZ, 0 unresolved symbols (address-based interface)"
 
@@ -40,18 +40,18 @@ PKGSRC="$HERE/build/isp060_pkg.s"
 PKGOBJ="$HERE/build/isp060_pkg.o"
 echo "[*] concatenate head + isp.S + glue -> $(basename "$PKGSRC"); then copyright.S after it"
 cat "$HERE/src/isp060_head.s" "$SP/isp.S" "$HERE/src/isp060_glue.s" > "$PKGSRC"
-m68k-linux-gnu-gcc -x assembler-with-cpp -m68060 -c "$PKGSRC" -o "$WORK/isp060_body.o"
-m68k-linux-gnu-gcc -x assembler-with-cpp -m68060 -c "$SP/copyright.S" -o "$WORK/copyright060.o"
-m68k-linux-gnu-ld -r -o "$PKGOBJ" "$WORK/isp060_body.o" "$WORK/copyright060.o"
+m68k_asm "$WORK/isp060_body.o" "$PKGSRC" -m68060
+m68k_asm "$WORK/copyright060.o" "$SP/copyright.S" -m68060
+$M68K_LD -r -o "$PKGOBJ" "$WORK/isp060_body.o" "$WORK/copyright060.o"
 
-TOP=$(m68k-linux-gnu-nm "$PKGOBJ" | awk '$3=="isp060_top"{print $1}')
-IMG=$(m68k-linux-gnu-nm "$PKGOBJ" | awk '$3=="isp060_image"{print $1}')
+TOP=$($M68K_NM "$PKGOBJ" | awk '$3=="isp060_top"{print $1}')
+IMG=$($M68K_NM "$PKGOBJ" | awk '$3=="isp060_image"{print $1}')
 [ "$TOP" = "00000000" ] || { echo "[FAIL] isp060_top at 0x$TOP, must be 0"; exit 1; }
 [ "$IMG" = "00000080" ] || { echo "[FAIL] isp060_image at 0x$IMG, must be 0x80 (table = 128 B)"; exit 1; }
 echo "      isp060_top = 0x$TOP, isp060_image = 0x$IMG (table is exactly 128 bytes)"
 
 echo "[*] decode the entry-point table THROUGH the call-out section"
-m68k-linux-gnu-objcopy -O binary --only-section=.text "$PKGOBJ" "$WORK/pkg.bin"
+$M68K_OBJCOPY -O binary --only-section=.text "$PKGOBJ" "$WORK/pkg.bin"
 python3 - "$WORK/pkg.bin" "$((0x$TSZ))" <<-'PY'
 	import sys
 	b = open(sys.argv[1], 'rb').read()
@@ -78,13 +78,13 @@ python3 - "$WORK/pkg.bin" "$((0x$TSZ))" <<-'PY'
 	PY
 
 for s in isp060_unimp i60_magic i60_entry_n i60_done_n i60_dbz_n; do
-	m68k-linux-gnu-nm "$PKGOBJ" | grep -qE " [A-Za-z] $s\$" || { echo "[FAIL] $s not defined"; exit 1; }
+	$M68K_NM "$PKGOBJ" | grep -qE " [A-Za-z] $s\$" || { echo "[FAIL] $s not defined"; exit 1; }
 done
-UND=$(m68k-linux-gnu-nm "$PKGOBJ" | awk '$1=="U"{print $2}' | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')
+UND=$($M68K_NM "$PKGOBJ" | awk '$1=="U"{print $2}' | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')
 WANT="copyin copyout cputype nullvect panic sup_cacr ureturn"
 [ "$UND" = "$WANT" ] || { echo "[FAIL] unresolved: $UND"; echo "       want:       $WANT"; exit 1; }
 echo "      unresolved (the kernel supplies these): $UND"
 ( m68k-cbm-sysv4-ld -r -o "$WORK/cbmcheck.o" "$PKGOBJ" ) \
 	&& echo "      m68k-cbm-sysv4-ld -r accepts $(basename "$PKGOBJ")" \
 	|| { echo "[FAIL] m68k-cbm-sysv4-ld rejects $(basename "$PKGOBJ")"; exit 1; }
-echo "[OK] built $PKGOBJ  ($(m68k-linux-gnu-size "$PKGOBJ" | awk 'NR==2{print "text " $1 ", data " $2}'))"
+echo "[OK] built $PKGOBJ  ($($M68K_SIZE "$PKGOBJ" | awk 'NR==2{print "text " $1 ", data " $2}'))"

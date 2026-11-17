@@ -1201,8 +1201,9 @@ if [ "$FPSP" = "1" ]; then
 	[ "$FPSP060" = "1" ] && GLUE060="-DHAVE_FPSP060" || GLUE060=""
 
 	echo "[*] FPSP 2/4: assemble AMIX glue src/fpsp_glue040.s${GLUE060:+ (with 060 branch)}"
-	m68k-linux-gnu-gcc -x assembler-with-cpp -m68040 -I"$FPWORK" $GLUE060 \
-		-c "$HERE/src/fpsp_glue040.s" -o "$HERE/build/fpsp_glue040.o"
+	# m68k-elf or m68k-linux-gnu gas, the same object (tools/m68k-gas.sh)
+	. "$HERE/tools/m68k-gas.sh"
+	m68k_asm "$HERE/build/fpsp_glue040.o" "$HERE/src/fpsp_glue040.s" -m68040 -I"$FPWORK" $GLUE060
 
 	# F3 (2026-08-07/08): Motorola's M68060 FPSP, packaged as ONE unit (128-byte call-out
 	# table + image + AMIX call-outs).  fpsp_vec11 sends cputype == 60 into it instead of

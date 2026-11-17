@@ -18,7 +18,8 @@
 # Toolchain: convert .sa->.s with the NetBSD asm2gas script, assemble with the
 # GNU m68k toolchain (the CBM SysV4 assembler does not accept the generated
 # GNU/MIT syntax), ld -r into one ELF object.  That object IS accepted by
-# m68k-cbm-sysv4-ld -r for the kernel relink (asserted below).
+# m68k-cbm-sysv4-ld -r for the kernel relink (asserted below).  m68k-elf-* or
+# m68k-linux-gnu-* (tools/m68k-gas.sh): the same object with either.
 #
 # Output: build/fpsp040.o  (.text 0x9952 = 39250 bytes)
 set -e
@@ -32,7 +33,7 @@ WORK="$HERE/build/fpsp-work"
 OUT="$HERE/build/fpsp040.o"
 FPSP_SUB="usr/src/sys/arch/m68k/fpsp"
 
-command -v m68k-linux-gnu-gcc >/dev/null || { echo "ERROR: m68k-linux-gnu-gcc not on PATH"; exit 1; }
+. "$HERE/tools/m68k-gas.sh"
 
 # The package body IS this tarball's bytes, so which tarball it is decides what the kernel gets.
 echo "[*] checking $(basename "$TGZ") against the pin"
@@ -55,29 +56,29 @@ SED=sed sh asm2gas fpsp.h > fpsp.defs
 
 echo "[*] asm2gas: .sa -> .s  (+ assemble -x assembler-with-cpp -m68040)"
 OBJS="copyright.o"
-m68k-linux-gnu-gcc -x assembler-with-cpp -m68040 -I. -c copyright.s -o copyright.o
+m68k_asm copyright.o copyright.s -m68040 -I.
 for f in $SA; do
 	SED=sed sh asm2gas $f.sa > $f.s
-	m68k-linux-gnu-gcc -x assembler-with-cpp -m68040 -I. -c $f.s -o $f.o
+	m68k_asm $f.o $f.s -m68040 -I.
 	OBJS="$OBJS $f.o"
 done
 
 echo "[*] ld -r -> $(basename "$OUT")"
-m68k-linux-gnu-ld -r -o "$OUT" $OBJS
+$M68K_LD -r -o "$OUT" $OBJS
 
 # ---- assertions (M1 acceptance) ----
-TSZ=$(m68k-linux-gnu-readelf -SW "$OUT" | awk '{gsub(/[][]/,"")} $2==".text"{print $6}')
+TSZ=$($M68K_READELF -SW "$OUT" | awk '{gsub(/[][]/,"")} $2==".text"{print $6}')
 [ "$TSZ" = "009952" ] || { echo "[FAIL] .text size 0x$TSZ != 0x9952 (39250)"; exit 1; }
 echo "[OK] .text = 0x9952 (39250 bytes)"
 
 for s in fpsp_bsun fpsp_fline fpsp_operr fpsp_ovfl fpsp_snan fpsp_unfl fpsp_unimp fpsp_unsupp; do
-	m68k-linux-gnu-nm "$OUT" | grep -qE " T $s\$" || { echo "[FAIL] entry $s not defined"; exit 1; }
+	$M68K_NM "$OUT" | grep -qE " T $s\$" || { echo "[FAIL] entry $s not defined"; exit 1; }
 done
 echo "[OK] 8 fpsp_* entry points defined"
 
-UND=$(m68k-linux-gnu-nm "$OUT" | grep -c ' U ')
+UND=$($M68K_NM "$OUT" | grep -c ' U ')
 echo "[OK] $UND unresolved OS-glue symbols (expect 12; provided by M2):"
-m68k-linux-gnu-nm "$OUT" | grep ' U ' | sed 's/^/      /'
+$M68K_NM "$OUT" | grep ' U ' | sed 's/^/      /'
 [ "$UND" = "12" ] || { echo "[FAIL] expected 12 unresolved, got $UND"; exit 1; }
 
 # relink compatibility: the kernel's SysV4 ld must accept this object

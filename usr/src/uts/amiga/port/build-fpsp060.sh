@@ -39,7 +39,7 @@ TGZ="${1:-$NETBSD_SYSSRC}"
 WORK="$HERE/build/fpsp060-work"
 SUB="usr/src/sys/arch/m68k/060sp"
 
-command -v m68k-linux-gnu-gcc >/dev/null || { echo "ERROR: m68k-linux-gnu-gcc not on PATH"; exit 1; }
+. "$HERE/tools/m68k-gas.sh"
 
 # The image IS this tarball's bytes, and the entry-point offsets asserted below are only
 # meaningful for the package this port measured.  Which tarball it is has to be checked.
@@ -52,28 +52,28 @@ tar xzf "$TGZ" -C "$WORK" --exclude='*CVS*' "$SUB"
 SP="$WORK/$SUB"
 
 echo "[*] assemble copyright.S (licence notice -- must stay in the object)"
-m68k-linux-gnu-gcc -x assembler-with-cpp -m68060 -c "$SP/copyright.S" -o "$WORK/copyright060.o"
+m68k_asm "$WORK/copyright060.o" "$SP/copyright.S" -m68060
 
 # $1 = source stem, $2 = output object, $3 = expected .text size of the IMAGE alone
 build_one() {
 	_src="$1"; _out="$2"; _expect="$3"
 	echo "[*] assemble $_src.S -> image object"
-	m68k-linux-gnu-gcc -x assembler-with-cpp -m68060 -c "$SP/$_src.S" -o "$WORK/$_src-image.o"
+	m68k_asm "$WORK/$_src-image.o" "$SP/$_src.S" -m68060
 
-	_tsz=$(m68k-linux-gnu-readelf -SW "$WORK/$_src-image.o" | awk '{gsub(/[][]/,"")} $2==".text"{print $6}')
+	_tsz=$($M68K_READELF -SW "$WORK/$_src-image.o" | awk '{gsub(/[][]/,"")} $2==".text"{print $6}')
 	[ "$_tsz" = "$_expect" ] || { echo "[FAIL] $_src image .text 0x$_tsz != 0x$_expect"; exit 1; }
 	echo "      image .text = 0x$_tsz"
 
 	# The package resolves its OS call-outs through the run-time table, not the linker.
-	_und=$(m68k-linux-gnu-nm "$WORK/$_src-image.o" 2>/dev/null | grep -c ' U ' || true)
+	_und=$($M68K_NM "$WORK/$_src-image.o" 2>/dev/null | grep -c ' U ' || true)
 	[ "$_und" = "0" ] || { echo "[FAIL] $_src: expected 0 unresolved symbols, got $_und"; exit 1; }
 	echo "      0 unresolved symbols (address-based interface, as expected)"
 
 	echo "[*] ld -r: IMAGE FIRST, then copyright -- order is load-bearing"
-	m68k-linux-gnu-ld -r -o "$_out" "$WORK/$_src-image.o" "$WORK/copyright060.o"
+	$M68K_LD -r -o "$_out" "$WORK/$_src-image.o" "$WORK/copyright060.o"
 
 	echo "[*] decode the entry-point table from the linked object"
-	m68k-linux-gnu-objcopy -O binary --only-section=.text "$_out" "$WORK/$_src.bin"
+	$M68K_OBJCOPY -O binary --only-section=.text "$_out" "$WORK/$_src.bin"
 	python3 - "$WORK/$_src.bin" <<-'PY'
 	import sys
 	b = open(sys.argv[1], 'rb').read()
@@ -132,16 +132,16 @@ PKGOBJ="$HERE/build/fpsp060_pkg.o"
 echo
 echo "[*] M2a: concatenate head + $VARIANT image + glue -> $(basename "$PKGSRC")"
 cat "$HERE/src/fpsp060_head.s" "$SP/$VARIANT.S" "$HERE/src/fpsp060_glue.s" > "$PKGSRC"
-m68k-linux-gnu-gcc -x assembler-with-cpp -m68060 -c "$PKGSRC" -o "$PKGOBJ"
+m68k_asm "$PKGOBJ" "$PKGSRC" -m68060
 
-TOP=$(m68k-linux-gnu-nm "$PKGOBJ" | awk '$3=="fpsp060_top"{print $1}')
-IMG=$(m68k-linux-gnu-nm "$PKGOBJ" | awk '$3=="fpsp060_image"{print $1}')
+TOP=$($M68K_NM "$PKGOBJ" | awk '$3=="fpsp060_top"{print $1}')
+IMG=$($M68K_NM "$PKGOBJ" | awk '$3=="fpsp060_image"{print $1}')
 [ "$TOP" = "00000000" ] || { echo "[FAIL] fpsp060_top at 0x$TOP, must be 0"; exit 1; }
 [ "$IMG" = "00000080" ] || { echo "[FAIL] fpsp060_image at 0x$IMG, must be 0x80 (table = 128 B)"; exit 1; }
 echo "      fpsp060_top = 0x$TOP, fpsp060_image = 0x$IMG (table is exactly 128 bytes)"
 
 echo "[*] decode the entry-point table THROUGH the call-out section"
-m68k-linux-gnu-objcopy -O binary --only-section=.text "$PKGOBJ" "$WORK/pkg.bin"
+$M68K_OBJCOPY -O binary --only-section=.text "$PKGOBJ" "$WORK/pkg.bin"
 python3 - "$WORK/pkg.bin" <<-'PY'
 	import sys
 	b = open(sys.argv[1], 'rb').read()
@@ -166,10 +166,10 @@ python3 - "$WORK/pkg.bin" <<-'PY'
 	PY
 
 for s in fpsp060_vec11 f60_magic f60_entry_n f60_mem_n f60_real_n f60_access_n f60_done_n; do
-	m68k-linux-gnu-nm "$PKGOBJ" | grep -qE " [A-Za-z] $s\$" || { echo "[FAIL] $s not defined"; exit 1; }
+	$M68K_NM "$PKGOBJ" | grep -qE " [A-Za-z] $s\$" || { echo "[FAIL] $s not defined"; exit 1; }
 done
 echo "      glue symbols defined"
-UND=$(m68k-linux-gnu-nm "$PKGOBJ" | grep ' U ' | awk '{print $2}' | tr '\n' ' ')
+UND=$($M68K_NM "$PKGOBJ" | grep ' U ' | awk '{print $2}' | tr '\n' ' ')
 echo "      unresolved (kernel supplies these): $UND"
 
 echo
