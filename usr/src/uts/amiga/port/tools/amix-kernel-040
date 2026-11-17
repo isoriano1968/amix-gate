@@ -1,0 +1,318 @@
+#!/bin/sh
+# amix-kernel-040 -- our 68040/68060 AMIX kernel in one call, from a stock
+# AMIX 2.1c kernel (the public amigaux/amix-system kernels/2.1c/unix, or the
+# /stand/unix of a 2.1c / 2.1p2a installation: the same code).
+#
+#   amix-kernel-040 [options] BASE OUT
+#
+#   --variant generic   (default) any A3000/A4000 with a 68040/68060 card:
+#                       relink-040.sh -> kvseg 32 MB -> serial console mirror
+#                       -> SysV shm 16 MB -> 8 KB ksegtbl -> memregions ->
+#                       memspan (every RAM region below 0x40000000 in one page
+#                       array: with pvmk, up to the 1 GB 1:1 window)
+#   --variant z3660     the A3000 + Z3660 box line (chain-z3660-a3000.sh):
+#                       generic + Z3660 SCSI/ethernet, ZZ9000-on-Z3660 RTG, VT,
+#                       audio, paula, random, root on the Z3660 card; needs
+#                       --amix-sys (usr/sys of amigaux/amix-system, or the
+#                       user's /usr/sys).  The driver sources are the io/
+#                       trees beside the port (amix-gate, or the kit):
+#                       io/z3660scsi and io/z3660net src/ with their
+#                       port/patches/ applied in order, io/zz9000's zz9000.c;
+#                       Z3660_SCSI_SRC (z3660.c), Z3660_NET_SRC (dir) and
+#                       Z3660_RTG_SRC (dir) override them.  The console font
+#                       is made from usr/sys amiga/console/sunfont.s
+#                       (tools/sunfont-gas.py); SUNFONT_O overrides it.
+#   --no-serial         without the serial console mirror (relink-040-serkeep.sh)
+#   --kvseg MB          kvseg size (default 32: page array for 1 GB fits)
+#   --nswap BLOCKS      swapfile.nswap (512-byte blocks) of the result: the
+#                       user's UNIX_Swap size.  Default: kept from BASE
+#   --buildid ID        9 characters after " 68040-" (default: from the inputs)
+#   --netbsd TGZ        the pinned NetBSD 10.1 syssrc.tgz (default
+#                       $NETBSD_SYSSRC, then the kit's distfiles/)
+#   --port DIR          the port tree (default: this script's ../)
+#   --io DIR            the driver trees (default: the port's ../io)
+#   --amix-sys DIR      an AMIX usr/sys tree (z3660 variant only)
+#   --keep              keep the work directory (printed)
+#
+# Deterministic: the same BASE (code), port tree, variant and options give the
+# same OUT, byte for byte.  The work happens in a fixed-name directory under
+# $TMPDIR (the assembler records source paths), one build at a time.
+#
+# Checks: BASE is code-identical to 2.1c (sha256 with swapfile.nswap masked,
+# tools/kernel-nswap.py, as tools/verify-stock.sh);
+# every stage's own checks (old bytes asserted, check_relink_relocs.py);
+# then on OUT: cputype defined, no amixdrv_init (kits are linked after this),
+# nothing unresolved, .text/.data contiguous, .data a multiple of 4, the
+# loader relocation check, the build-id stamp read back.
+#
+# Writes OUT and OUT.info (key=value: variant, inputs, build id, sha256).
+# The result is a 68040/68060 kernel only: it boots natively from pvmk
+# (68040 and 68060), never on a 68030, and the stock kernel is no fallback
+# on a 68040/68060 (it does not run there).
+# Needs: m68k-cbm-sysv4-{gcc,as,ld} (developer/amix/gcc-27), m68k ELF binutils
+# + gcc as assembler (m68k-linux-gnu-* or m68k-elf-*), python3, sha256sum
+# (or digest -a sha256), tar, POSIX sh/awk.  BASE is only read.
+set -e
+ME=$(basename "$0")
+HERE=$(cd "$(dirname "$0")" && pwd)
+if [ -f "$HERE/port/relink-040.sh" ]; then PORT=$HERE/port; else PORT=$(cd "$HERE/.." && pwd); fi
+VARIANT=generic SERIAL=1 KVSEG=32 NSWAP= BUILDID= TGZ=${NETBSD_SYSSRC:-} AMIXSYS= KEEP=0 IO=
+while [ $# -gt 0 ]; do
+	case $1 in
+	--variant) VARIANT=$2; shift 2 ;;
+	--no-serial) SERIAL=0; shift ;;
+	--kvseg) KVSEG=$2; shift 2 ;;
+	--nswap) NSWAP=$2; shift 2 ;;
+	--buildid) BUILDID=$2; shift 2 ;;
+	--netbsd) TGZ=$2; shift 2 ;;
+	--port) PORT=$(cd "$2" && pwd); shift 2 ;;
+	--amix-sys) AMIXSYS=$(cd "$2" && pwd); shift 2 ;;
+	--io) IO=$(cd "$2" && pwd); shift 2 ;;
+	--keep) KEEP=1; shift ;;
+	-h|--help) sed -n '2,/^set -e/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
+	-*) echo "$ME: unknown option $1" >&2; exit 2 ;;
+	*) break ;;
+	esac
+done
+[ $# -eq 2 ] || { echo "usage: $ME [options] BASE OUT  (--help)" >&2; exit 2; }
+BASE=$1; OUT=$2
+[ -f "$BASE" ] || { echo "$ME: no base kernel $BASE" >&2; exit 1; }
+case $VARIANT in generic|z3660) ;; *) echo "$ME: --variant generic|z3660" >&2; exit 2 ;; esac
+case $KVSEG in ''|*[!0-9]*) echo "$ME: --kvseg MB" >&2; exit 2 ;; esac
+case $NSWAP in *[!0-9]*) echo "$ME: --nswap BLOCKS" >&2; exit 2 ;; esac
+[ -z "$BUILDID" ] || [ ${#BUILDID} -eq 9 ] || { echo "$ME: --buildid takes 9 characters" >&2; exit 2; }
+[ -f "$PORT/relink-040.sh" ] && [ -f "$PORT/relink-040-memspan.sh" ] || {
+	echo "$ME: $PORT is not a port tree with the memspan chain" >&2; exit 1; }
+fail() { echo "[FAIL] $*" >&2; exit 1; }
+sha() { if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1; else digest -a sha256 "$1"; fi; }
+
+# --- tools ------------------------------------------------------------------
+for t in m68k-cbm-sysv4-gcc m68k-cbm-sysv4-as m68k-cbm-sysv4-ld python3 tar; do
+	command -v $t >/dev/null || fail "$t not on PATH"
+done
+GNU=
+for p in m68k-linux-gnu m68k-elf; do
+	command -v $p-objcopy >/dev/null 2>&1 && command -v $p-gcc >/dev/null 2>&1 && { GNU=$p; break; }
+done
+[ -n "$GNU" ] || fail "no m68k ELF binutils + gcc (m68k-linux-gnu-* or m68k-elf-*)"
+
+# --- the base: code-identical to AMIX 2.1c ----------------------------------
+# sha256 of the image with swapfile.nswap (.data swapfile+0x98, 4 bytes) set
+# to 0: the AMIX installation writes the swap size there, nothing else differs
+# (public 2.1c 61440 blocks, the 2.1p2a test disk 409600, the port's pin 7d26...).
+PORT_FILES="relink-040.sh relink-040-kvseg.sh relink-040-serkeep.sh relink-040-shm.sh relink-040-ksegtbl.sh relink-040-memregions.sh relink-040-memspan.sh relink-040-z3660.sh relink-040-zz9000kv.sh relink-040-z3660intr.sh relink-040-vt.sh relink-040-audio.sh relink-040-paula.sh relink-040-random.sh build-fpsp040.sh build-fpsp060.sh build-isp060.sh LICENSE NOTICE THIRD_PARTY_NOTICES include-modelb src tools"
+BASE_NORM_SHA256=fa124e6503eb13131fb470057d355c45ee91ca167865956b1f9e9f10b6bad523
+basecheck() { python3 -I "$PORT/tools/kernel-nswap.py" "$@"; }
+set -- $(basecheck "$BASE") || fail "$BASE: not an AMIX kernel ELF"
+BNORM=$1; BNSWAP=$2
+[ "$BNORM" = "$BASE_NORM_SHA256" ] || fail "$BASE is not AMIX 2.1c code (normalized sha256 $BNORM, want $BASE_NORM_SHA256): AMIX 2.1 needs Patch Disk 1-2a; take the public kernels/2.1c/unix"
+echo "[OK] base: AMIX 2.1c code (swap $BNSWAP blocks), sha256 $(sha "$BASE")"
+
+# --- the work directory: a private copy of the port tree --------------------
+W=${TMPDIR:-/tmp}/amix-kernel-040.work
+LOCK=$W.lock
+mkdir "$LOCK" 2>/dev/null || fail "another $ME runs ($LOCK); remove it if not"
+cleanup() { [ "$KEEP" = 1 ] && echo "[*] work directory kept: $W" || rm -rf "$W"; rmdir "$LOCK" 2>/dev/null || true; }
+trap cleanup EXIT; trap 'exit 130' INT TERM
+rm -rf "$W"; mkdir -p "$W/port" "$W/bin" "$W/amix/stand"
+# only what the chain uses (make-kernel-040-kit.sh ships the same list), so a
+# build from amix-gate and one from the kit hash the same tree: same build id
+(cd "$PORT" && tar cf - --exclude=__pycache__ $PORT_FILES) | (cd "$W/port" && tar xf -)
+P=$W/port
+# the inputs that decide the result: port tree (file names + contents) and options
+TREE=$(cd "$P" && find . -type f | LC_ALL=C sort | while read -r f; do printf '%s %s\n' "$(sha "$f")" "$f"; done | \
+	{ if command -v sha256sum >/dev/null; then sha256sum; else digest -a sha256; fi; } | cut -d' ' -f1)
+cp "$BASE" "$W/amix/stand/unix"; chmod 644 "$W/amix/stand/unix"
+
+# m68k-linux-gnu-* names the scripts call, onto whichever ELF tools there are
+for t in objcopy nm readelf objdump ld as gcc cpp size; do
+	command -v $GNU-$t >/dev/null 2>&1 && ln -s "$(command -v $GNU-$t)" "$W/bin/m68k-linux-gnu-$t"
+done
+CROSS=$(cd "$(dirname "$(command -v m68k-cbm-sysv4-ld)")/.." && pwd)
+# NetBSD 10.1 syssrc.tgz, pinned (tools/netbsd-pin.sh checks it)
+if [ -z "$TGZ" ]; then
+	for c in "$HERE/distfiles/syssrc-10.1.tgz" "$PORT/../distfiles/syssrc-10.1.tgz" \
+	    /usr/share/amix-installer/kernel-040/distfiles/syssrc-10.1.tgz; do
+		[ -f "$c" ] && { TGZ=$c; break; }
+	done
+fi
+[ -n "$TGZ" ] && [ -f "$TGZ" ] || fail "no NetBSD 10.1 syssrc.tgz (--netbsd)"
+KS=${AMIXSYS:-$W/amix/usr/sys}
+cat > "$W/env.sh" <<EOF
+export AMIX_CROSS_TARGET=m68k-cbm-sysv4
+export AMIX_CROSS_PREFIX="$CROSS"
+export PATH="$W/bin:$CROSS/bin:\$PATH"
+export AMIX_SYSROOT="$CROSS/m68k-cbm-sysv4/sysroot"
+export AMIX_KERNEL_CFLAGS="-O -traditional -fno-builtin -Dinline=__inline__ -Dvolatile=__volatile__ -Dconst=__const__ -m68020 -D_KERNEL -DSVR40 -DSVR4 -I$CROSS/m68k-cbm-sysv4/sysroot/usr/include -I$KS -I$KS/amiga/inc"
+EOF
+cat > "$P/config.sh" <<EOF
+AMIX_BUILD="$W"
+AMIX_CROSS="$CROSS"
+GCC_CROSS_ENV="$W/env.sh"
+M68K_GNU_BIN="$W/bin"
+AMIX_ROOT="$W/amix"
+NETBSD_SYSSRC="$TGZ"
+AMIBERRY_BIN=/nonexistent; AMIBERRY_CONF=/nonexistent; AMIBERRY_HDF=/nonexistent
+XSVGA_EXP=/nonexistent; VA2000_SRC=/nonexistent
+Z3660_SCSI_SRC=/nonexistent; Z3660_NET_SRC=/nonexistent
+GHIDRA_HOME=/nonexistent
+EOF
+[ -z "$AMIXSYS" ] || { mkdir -p "$W/amix/usr"; ln -s "$AMIXSYS" "$W/amix/usr/sys"; }
+
+# --- z3660: the driver sources, made from the io/ trees ---------------------
+# $W/drv holds every driver and Commodore source the variant compiles, so its
+# hash goes into the build id: z3660scsi/z3660.c, z3660net/*, zz9000/*,
+# audio/audio.[ch] (usr/sys), sunfont.o (made from usr/sys sunfont.s).
+DRV=$W/drv DRVSHA=
+if [ "$VARIANT" = z3660 ]; then
+	[ -n "$AMIXSYS" ] || fail "--variant z3660 needs --amix-sys (usr/sys)"
+	[ -n "$IO" ] || { [ -d "$PORT/../io" ] && IO=$(cd "$PORT/../io" && pwd); }
+	mkdir -p "$DRV/z3660scsi/src" "$DRV/z3660net/src" "$DRV/zz9000" "$DRV/audio"
+	patched() {	# dir-with-src/ patches-dir
+		for p in "$2"/*.patch; do
+			[ -f "$p" ] || continue
+			(cd "$1" && patch -p1 -s --no-backup-if-mismatch < "$p") || fail "$p does not apply"
+			echo "[OK] $(basename "$(dirname "$(dirname "$2")")"): $(basename "$p")"
+		done
+	}
+	if [ -n "${Z3660_SCSI_SRC:-}" ]; then cp "$Z3660_SCSI_SRC" "$DRV/z3660scsi/src/z3660.c"
+	else
+		[ -f "$IO/z3660scsi/src/z3660.c" ] || fail "no io/z3660scsi/src/z3660.c (--io, or Z3660_SCSI_SRC)"
+		cp "$IO/z3660scsi/src/z3660.c" "$DRV/z3660scsi/src/"
+		patched "$DRV/z3660scsi" "$IO/z3660scsi/port/patches"
+	fi
+	if [ -n "${Z3660_NET_SRC:-}" ]; then cp "$Z3660_NET_SRC"/z3660eth*.[ch] "$DRV/z3660net/src/"
+	else
+		[ -f "$IO/z3660net/src/z3660eth.c" ] || fail "no io/z3660net/src/z3660eth.c (--io, or Z3660_NET_SRC)"
+		cp "$IO/z3660net/src/z3660eth.c" "$IO/z3660net/src/z3660eth.h" "$IO/z3660net/src/z3660ethuser.h" "$DRV/z3660net/src/"
+		patched "$DRV/z3660net" "$IO/z3660net/port/patches"
+	fi
+	RTGD=${Z3660_RTG_SRC:-$IO/zz9000/overlay/usr/sys/amiga/driver/zz9000}
+	[ -f "$RTGD/zz9000.c" ] || fail "no zz9000.c in $RTGD (--io, or Z3660_RTG_SRC)"
+	cp "$RTGD/zz9000.c" "$RTGD/zz9000.h" "$DRV/zz9000/"
+	cp "$AMIXSYS/amiga/driver/audio.c" "$AMIXSYS/amiga/driver/audio.h" "$DRV/audio/" ||
+		fail "no amiga/driver/audio.[ch] in $AMIXSYS"
+	if [ -n "${SUNFONT_O:-}" ]; then cp "$SUNFONT_O" "$DRV/sunfont.o"
+	else
+		[ -f "$AMIXSYS/amiga/console/sunfont.s" ] || fail "no amiga/console/sunfont.s in $AMIXSYS (or SUNFONT_O)"
+		python3 -I "$PORT/tools/sunfont-gas.py" "$AMIXSYS/amiga/console/sunfont.s" "$W/sunfont.s" &&
+			(cd "$W" && m68k-cbm-sysv4-as -o "$DRV/sunfont.o" sunfont.s) || fail "console font"
+	fi
+	DRVSHA=$(cd "$DRV" && find . -type f | LC_ALL=C sort | while read -r f; do printf '%s %s\n' "$(sha "$f")" "$f"; done | \
+		{ if command -v sha256sum >/dev/null; then sha256sum; else digest -a sha256; fi; } | cut -d' ' -f1)
+	export Z3660_RTG_SRC="$DRV/zz9000" AUDIO_SRC="$DRV/audio" SUNFONT_O="$DRV/sunfont.o"
+	cat >> "$P/config.sh" <<EOF
+Z3660_SCSI_SRC="$DRV/z3660scsi/src/z3660.c"
+Z3660_NET_SRC="$DRV/z3660net/src"
+EOF
+	echo "[OK] z3660 driver sources: $DRVSHA"
+fi
+
+# the build id: the stamp of every stage is the one given or made from the inputs
+[ -n "$BUILDID" ] || BUILDID=k$(printf '%s %s %s %s %s %s%s' "$BNORM" "$TREE" "$VARIANT" "$SERIAL" "$KVSEG" "$(sha "$TGZ")" "${DRVSHA:+ $DRVSHA}" | \
+	{ if command -v sha256sum >/dev/null; then sha256sum; else digest -a sha256; fi; } | cut -c1-8)
+cat > "$P/src/stamp_buildid.py" <<'EOF'
+"""stamp_buildid.py (amix-kernel-040): the fixed build id AMIX_K040_BUILDID."""
+import os, struct, subprocess, sys
+field = (" 68040-" + os.environ["AMIX_K040_BUILDID"]).encode()
+assert len(field) == 16
+path = sys.argv[1]
+nm = subprocess.run(["m68k-linux-gnu-nm", path], capture_output=True, text=True, check=True).stdout
+val = [int(l.split()[0], 16) for l in nm.splitlines() if l.endswith(" buildid") and len(l.split()) == 3][0]
+d = open(path, "rb").read()
+shoff = struct.unpack(">I", d[32:36])[0]; shsz, shn, shstr = struct.unpack(">HHH", d[46:52])
+sh = [struct.unpack(">IIIIIIIIII", d[shoff + i * shsz:shoff + i * shsz + 40]) for i in range(shn)]
+so = sh[shstr][4]
+data = [s for s in sh if d[so + s[0]:d.index(b"\0", so + s[0])] == b".data"][0]
+off = data[4] + val
+if not d[off:off + 7] == b" 68040-":
+    sys.exit("stamp_buildid: buildid field not found")
+with open(path, "r+b") as f:
+    f.seek(off); f.write(field)
+print("stamp_buildid: %s: buildid = \"%s\"" % (path, field.decode()))
+EOF
+export AMIX_K040_BUILDID=$BUILDID LC_ALL=C TZ=UTC
+export PATH="$W/bin:$CROSS/bin:$PATH"
+
+# --- the chain --------------------------------------------------------------
+B=$P/build; mkdir -p "$B"
+LOG=$W/build.log; : > "$LOG"
+step() {
+	echo "[*] $*"
+	if ! (cd "$P" && "$@") >> "$LOG" 2>&1; then
+		tail -40 "$LOG" >&2; fail "stage: $*"
+	fi
+}
+T0=$(date +%s)
+step env STOCK="$W/amix/stand/unix" sh relink-040.sh
+step env KVSEG_MB=$KVSEG sh relink-040-kvseg.sh build/unix-040 build/s1-kv
+S=build/s1-kv
+if [ "$SERIAL" = 1 ]; then step sh relink-040-serkeep.sh $S build/s2-ser; S=build/s2-ser; fi
+if [ "$VARIANT" = z3660 ]; then
+	step env Z3660ETH_CFLAGS=-DZ3660ETH_STATIC_INTR sh relink-040-z3660.sh $S build/z1
+	step env ZZ9K_CFLAGS="-DZZ9K_FB_NC -DZZ9K_MAP_BOARD" sh relink-040-zz9000kv.sh build/z1 build/z2
+	step env Z3660ETH_P2_ALONE=1 sh relink-040-z3660intr.sh build/z2 build/z3
+	step sh relink-040-vt.sh build/z3 build/z4
+	step sh relink-040-audio.sh build/z4 build/z5
+	step sh relink-040-paula.sh build/z5 build/z6
+	step python3 tools/stamp-rootcard.py build/z6 build/z7 --card 1 --unit 0
+	step python3 tools/patch-kernel-cacr.py build/z7 build/z8 a0c08000
+	step sh relink-040-random.sh build/z8 build/z9
+	S=build/z9
+fi
+step sh relink-040-shm.sh $S build/s3-shm
+step sh relink-040-ksegtbl.sh build/s3-shm build/s4-ksg
+step sh relink-040-memregions.sh build/s4-ksg build/s5-mrg
+step sh relink-040-memspan.sh build/s5-mrg build/s6-msp
+F=$B/s6-msp
+# memregions/memspan do not stamp: stamp the result (the same id)
+step python3 src/stamp_buildid.py build/s6-msp
+if [ -n "$NSWAP" ]; then basecheck "$F" "$NSWAP" "$F.n" && mv "$F.n" "$F" || fail "--nswap"; fi
+
+# --- checks on the result ---------------------------------------------------
+NM=$W/bin/m68k-linux-gnu-nm; RE=$W/bin/m68k-linux-gnu-readelf
+$NM "$F" | grep -qE " [TDBC] cputype$" || fail "no cputype: not a port kernel"
+! $NM "$F" | grep -qE " T amixdrv_init$" || fail "the result already has a driver chain"
+LEAK=$($NM "$F" | awk '$1=="U" && $2!="edata" && $2!="end" && $2!="etext" {print $2}')
+[ -z "$LEAK" ] || fail "unresolved: $LEAK"
+set -- $($RE -SW "$F" | awk '{gsub(/[][]/,"")} $2==".text"{to=$5;ts=$6} $2==".data"{do_=$5;ds=$6} END{print to, ts, do_, ds}')
+[ $(( 0x$1 + 0x$2 )) -eq $(( 0x$3 )) ] || fail ".text and .data not contiguous"
+[ $(( 0x$4 % 4 )) -eq 0 ] || fail ".data not a multiple of 4"
+for s in kvm_span_tail memregion pfn_valid mspan_build; do
+	$NM "$F" | awk '{print $NF}' | grep -qx $s || fail "memspan/memregions symbol $s missing"
+done
+(cd "$P" && python3 src/check_relink_relocs.py "$F") > "$W/relocs.log" 2>&1 || { cat "$W/relocs.log"; fail "loader relocation check"; }
+RELOC=$(tail -1 "$W/relocs.log")
+echo "$RELOC" | grep -q "complaints: 0" || fail "relocation check: $RELOC"
+GOT=$(python3 -I - "$F" <<'EOF'
+import struct, subprocess, sys
+p = sys.argv[1]; d = open(p, "rb").read()
+v = [int(l.split()[0], 16) for l in subprocess.run(["m68k-linux-gnu-nm", p], capture_output=True, text=True).stdout.splitlines() if l.endswith(" buildid") and len(l.split()) == 3][0]
+shoff = struct.unpack(">I", d[32:36])[0]; shsz, shn, shstr = struct.unpack(">HHH", d[46:52])
+sh = [struct.unpack(">IIIIIIIIII", d[shoff + i * shsz:shoff + i * shsz + 40]) for i in range(shn)]
+so = sh[shstr][4]
+data = [s for s in sh if d[so + s[0]:d.index(b"\0", so + s[0])] == b".data"][0]
+print(d[data[4] + v:data[4] + v + 16].decode())
+EOF
+)
+[ "$GOT" = " 68040-$BUILDID" ] || fail "build id reads '$GOT'"
+set -- $(basecheck "$F")
+FNSWAP=$2
+cp "$F" "$OUT"
+OSHA=$(sha "$OUT")
+cat > "$OUT.info" <<EOF
+variant=$VARIANT
+serial=$SERIAL
+kvseg_mb=$KVSEG
+buildid=68040-$BUILDID
+nswap=$FNSWAP
+base_sha256=$(sha "$BASE")
+base_code_sha256=$BNORM
+port_tree_sha256=$TREE
+netbsd_syssrc_sha256=$(sha "$TGZ")
+drivers_sha256=${DRVSHA:-none}
+size=$(wc -c < "$OUT" | tr -d ' ')
+sha256=$OSHA
+EOF
+echo "[OK] $RELOC; build id 68040-$BUILDID; $(( $(date +%s) - T0 )) s"
+echo "[OK] $OUT  sha256 $OSHA"
