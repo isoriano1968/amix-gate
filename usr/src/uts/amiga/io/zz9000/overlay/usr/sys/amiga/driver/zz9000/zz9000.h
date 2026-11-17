@@ -59,6 +59,19 @@
 #define ZZ9K_COLOR_32BIT       2
 #define ZZ9K_COLOR_15BIT       3
 
+/*
+ * The colour modes a board can show, one bit per ZZ9K_COLOR_* (boardtab
+ * colormodes).  SETMODE and SETMODEHZ refuse any other with EINVAL.  The
+ * ZZ9000 shows all four.  The Z3660's HDMI is a 16-pin bus, RGB565: its
+ * firmware takes 8-bit (CLUT) and 15-bit (src/video.c video_mode_init: size
+ * 1 and 2) but a 32-bit mode shows nothing (tested 2026-11-07).
+ */
+#define ZZ9K_CM(c)             (1 << (c))
+#define ZZ9K_CM_ZZ9000         (ZZ9K_CM(ZZ9K_COLOR_8BIT) | ZZ9K_CM(ZZ9K_COLOR_16BIT565) | \
+                                ZZ9K_CM(ZZ9K_COLOR_32BIT) | ZZ9K_CM(ZZ9K_COLOR_15BIT))
+#define ZZ9K_CM_Z3660          (ZZ9K_CM(ZZ9K_COLOR_8BIT) | ZZ9K_CM(ZZ9K_COLOR_16BIT565) | \
+                                ZZ9K_CM(ZZ9K_COLOR_15BIT))
+
 #define ZZ9K_MODE_1280x720     0
 #define ZZ9K_MODE_800x600      1
 #define ZZ9K_MODE_640x480      2
@@ -485,6 +498,46 @@ struct zz9k_boardtab {
     unsigned short zorro;         /* GETINFO.zorro */
     unsigned short product;       /* GETINFO.product */
     unsigned short flags;         /* ZZ9K_BT_* */
+    unsigned short colormodes;    /* ZZ9K_CM(ZZ9K_COLOR_*) the board can show */
 };
+
+/* RTGIOC_GETCAPS: the RTG drivers' common capabilities ioctl, a byte-for-byte
+ * copy of io/rtgcaps.h's block (amix-gate) */
+/* RTGCAPS BEGIN */
+#ifndef RTGCAPS_H
+#define RTGCAPS_H
+
+#define RTGIOC_GETCAPS          (('R' << 8) | 1)  /* the same number in every RTG driver */
+#define RTGCAPS_VERSION         1
+
+#define RTGCAP_CONSOLE_REDIRECT 0x0001  /* the kernel console can be drawn on the board */
+#define RTGCAP_MONITOR_SWITCH   0x0002  /* the driver switches the monitor Amiga/RTG */
+#define RTGCAP_BLIT_FILL        0x0004  /* solid fills by ioctl (card or kernel) */
+#define RTGCAP_BLIT_COPY        0x0008  /* screen-to-screen copies by ioctl */
+#define RTGCAP_BLIT_PATTERN     0x0010
+#define RTGCAP_HW_CURSOR        0x0020
+#define RTGCAP_CLUT             0x0040  /* a palette the driver loads */
+#define RTGCAP_SOFT3D           0x0080  /* the Z3660 firmware's soft3D */
+#define RTGCAP_MODE_LIST        0x0100  /* a mode list by ioctl */
+#define RTGCAP_REFRESH          0x0200  /* refresh rates known and selectable */
+#define RTGCAP_CARD_BLITTER     0x0400  /* fills/copies run on the card */
+
+/* depths: bit n set = depth n can be shown; 24 is 24-bit colour in a
+ * 32-bit pixel (X depth 24, 32 bpp) */
+#define RTG_DEPTH(n)            (1UL << (n))
+
+struct rtg_caps {
+    unsigned short version;       /* in: caller's; out: the driver's */
+    unsigned short size;          /* in: bytes the caller has; out: bytes filled */
+    char board[24];               /* "Z3660 RTG", "ZZ9000", "Picasso II", NUL-terminated */
+    unsigned long caps;           /* RTGCAP_* */
+    unsigned long depths;         /* RTG_DEPTH(8) | RTG_DEPTH(16) ... */
+    unsigned long fb_size;        /* framebuffer bytes */
+    unsigned long max_width;      /* largest mode in the board's list */
+    unsigned long max_height;
+};
+
+#endif /* RTGCAPS_H */
+/* RTGCAPS END */
 
 #endif /* ZZ9000_H */

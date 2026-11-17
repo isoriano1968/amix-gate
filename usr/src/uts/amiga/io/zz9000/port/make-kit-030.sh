@@ -38,7 +38,7 @@ SRC=$(cd "$HERE/../overlay/usr/sys/amiga/driver/zz9000" && pwd)
 . "$PORT/tools/kit-lib.sh"
 kit_env
 OUT=${1:-$HERE/kit}
-VERSION=0.1
+VERSION=0.2
 [ -f "$AMIX_ROOT/usr/sys/amiga/console/screen.h" ] || {
 	echo "AMIX_ROOT has no usr/sys/amiga/console/screen.h" >&2; exit 1; }
 

@@ -415,14 +415,14 @@ static struct zz9k_boardtab zz9k_boardtab[] = {
       ZZ9K_FB_OFFSET, ZZ9K_FB_OFFSET, 0, ZZ9K_Z2_RESERVED_TAIL, ZZ9K_REG_SIZE,
       2, zz9k_regoff_zz9000, zz9k_modes_zz9000,
       ZZ9K_CON_WIDTH, ZZ9K_CON_HEIGHT,
-      ZZ9K_FW_VER_MIN, 0, 2, ZZ9K_PRODUCT_Z2, ZZ9K_BT_BLIT_ZZ9000 },
+      ZZ9K_FW_VER_MIN, 0, 2, ZZ9K_PRODUCT_Z2, ZZ9K_BT_BLIT_ZZ9000, ZZ9K_CM_ZZ9000 },
 #ifndef ZZ9K_BENCH_Z3
     { "Zorro III product", "configure card as Zorro II product 3 for AMIX",
       ZZ9K_PRODUCT_PC_Z3, 0, 0,
       ZZ9K_FB_OFFSET, ZZ9K_FB_OFFSET, 0, ZZ9K_Z2_RESERVED_TAIL, ZZ9K_REG_SIZE,
       2, zz9k_regoff_zz9000, zz9k_modes_zz9000,
       ZZ9K_CON_WIDTH, ZZ9K_CON_HEIGHT,
-      ZZ9K_FW_VER_MIN, 0, 3, ZZ9K_PRODUCT_Z3, ZZ9K_BT_REJECT }
+      ZZ9K_FW_VER_MIN, 0, 3, ZZ9K_PRODUCT_Z3, ZZ9K_BT_REJECT, ZZ9K_CM_ZZ9000 }
 #else
     /*
      * Bench aid, not a supported configuration: amiberry can place its
@@ -438,7 +438,7 @@ static struct zz9k_boardtab zz9k_boardtab[] = {
       ZZ9K_FB_OFFSET, ZZ9K_FB_OFFSET, ZZ9K_Z3660_FB_MAX, 0, ZZ9K_REG_SIZE,
       2, zz9k_regoff_zz9000, zz9k_modes_zz9000,
       ZZ9K_CON_WIDTH, ZZ9K_CON_HEIGHT,
-      ZZ9K_FW_VER_MIN, 0, 3, ZZ9K_PRODUCT_Z3, ZZ9K_BT_BLIT_ZZ9000 }
+      ZZ9K_FW_VER_MIN, 0, 3, ZZ9K_PRODUCT_Z3, ZZ9K_BT_BLIT_ZZ9000, ZZ9K_CM_ZZ9000 }
 #endif /* ZZ9K_BENCH_Z3 */
 #ifdef ZZ9K_TARGET_Z3660
     /*
@@ -460,7 +460,7 @@ static struct zz9k_boardtab zz9k_boardtab[] = {
       4, zz9k_regoff_z3660, zz9k_modes_z3660,
       ZZ9K_Z3660_CON_W, ZZ9K_Z3660_CON_H,
       ZZ9K_Z3660_FW_MIN, ZZ9K_Z3660_FW_MAJOR, 3, 1,
-      ZZ9K_BT_NOCAPTURE | ZZ9K_BT_BLIT_Z3660 }
+      ZZ9K_BT_NOCAPTURE | ZZ9K_BT_BLIT_Z3660, ZZ9K_CM_Z3660 }
     /*
      * The same board reached by its fixed base, for a machine whose
      * AutoConfig table does not list it.  Device space is the framebuffer
@@ -475,7 +475,7 @@ static struct zz9k_boardtab zz9k_boardtab[] = {
       4, zz9k_regoff_z3660, zz9k_modes_z3660,
       ZZ9K_Z3660_CON_W, ZZ9K_Z3660_CON_H,
       ZZ9K_Z3660_FW_MIN, ZZ9K_Z3660_FW_MAJOR, 3, 1,
-      ZZ9K_BT_AGAGATE | ZZ9K_BT_NOCAPTURE | ZZ9K_BT_BLIT_Z3660 }
+      ZZ9K_BT_AGAGATE | ZZ9K_BT_NOCAPTURE | ZZ9K_BT_BLIT_Z3660, ZZ9K_CM_Z3660 }
 #endif /* ZZ9K_TARGET_Z3660 */
 };
 
@@ -2278,6 +2278,73 @@ int *rvalp;
 }
 
 /*
+ * RTGIOC_GETCAPS (zz9000.h, io/rtgcaps.h): what the board can do, from its
+ * row: the depths of its colour modes, the console, the blitter, the mode
+ * list and, with known rates, refresh selection; soft3D on a -DZZ9K_MAP_BOARD
+ * kernel with a 32-bit register row (the Z3660).  The caller's size bounds
+ * the copy; size and version come back as the driver's.
+ */
+static int
+zz9k_getcaps(unit, bp, arg)
+int unit;
+struct zz9k_board *bp;
+int arg;
+{
+    struct rtg_caps c;
+    struct zz9k_modetab *m;
+    unsigned short n;
+    int i;
+
+    if (copyin((caddr_t)arg, (caddr_t)&c, 4))
+        return EFAULT;
+    if (c.size < 4)
+        return EINVAL;
+    n = c.size < sizeof c ? c.size : sizeof c;
+    if (!zz9k_probe(unit))
+        return ENXIO;
+    for (i = 0; i < sizeof c; ++i)    /* no bzero: the stock kit's imports stay */
+        ((char *)&c)[i] = 0;
+    c.version = RTGCAPS_VERSION;
+    c.size = n;
+    for (i = 0; i < sizeof c.board - 1 && bp->bt->name[i]; ++i)
+        c.board[i] = bp->bt->name[i];
+    c.caps = RTGCAP_CONSOLE_REDIRECT | RTGCAP_BLIT_FILL | RTGCAP_BLIT_COPY |
+        RTGCAP_MODE_LIST;
+    if (zz9k_can_blit(bp))
+        c.caps |= RTGCAP_CARD_BLITTER;
+#ifdef ZZ9K_MONSW
+    c.caps |= RTGCAP_MONITOR_SWITCH;
+#else
+    if (!(bp->bt->flags & ZZ9K_BT_NOCAPTURE))
+        c.caps |= RTGCAP_MONITOR_SWITCH;
+#endif
+#ifdef ZZ9K_MAP_BOARD
+    if (bp->bt->regw == 4)
+        c.caps |= RTGCAP_SOFT3D;
+#endif
+    if (bp->bt->colormodes & ZZ9K_CM(ZZ9K_COLOR_8BIT))
+        c.depths |= RTG_DEPTH(8);
+    if (bp->bt->colormodes & ZZ9K_CM(ZZ9K_COLOR_15BIT))
+        c.depths |= RTG_DEPTH(15);
+    if (bp->bt->colormodes & ZZ9K_CM(ZZ9K_COLOR_16BIT565))
+        c.depths |= RTG_DEPTH(16);
+    if (bp->bt->colormodes & ZZ9K_CM(ZZ9K_COLOR_32BIT))
+        c.depths |= RTG_DEPTH(24);
+    c.fb_size = bp->fb_size;
+    for (m = bp->bt->modes; m->width; ++m) {
+        if (m->hz100)
+            c.caps |= RTGCAP_REFRESH;
+        if (m->width > c.max_width)
+            c.max_width = m->width;
+        if (m->height > c.max_height)
+            c.max_height = m->height;
+    }
+    if (copyout((caddr_t)&c, (caddr_t)arg, n))
+        return EFAULT;
+    return 0;
+}
+
+/*
  * ZZ9KIOC_SETMODEHZ (zz9000.h) when hz, else ZZ9KIOC_SETMODE (struct
  * zz9k_mode, the first row of the size): the same checks and effects as the
  * switch's old SETMODE case, and with the console redirect on the VT
@@ -2312,7 +2379,8 @@ int hz;
     }
     m = zz9k_mode_hz(bp, mh.width, mh.height, mh.hz100);
     bpp = zz9k_bpp(mh.color_mode);
-    if (!m || bpp == 0)
+    /* only a colour mode the board can show (the Z3660: no 32-bit) */
+    if (!m || bpp == 0 || !(bp->bt->colormodes & ZZ9K_CM(mh.color_mode)))
         return EINVAL;
     if ((unsigned long)mh.width * mh.height * bpp > bp->fb_size)
         return ENOMEM;
@@ -2430,6 +2498,8 @@ int *rvalp;
         return 0;
     }
 #endif
+    if (cmd == RTGIOC_GETCAPS)          /* outside the switch for the same reason */
+        return zz9k_getcaps(unit, bp, arg);
     if (cmd == ZZ9KIOC_GETMODES)        /* outside the switch for the same reason */
         return zz9k_getmodes(unit, bp, arg, rvalp);
     if (cmd == ZZ9KIOC_SETMODEHZ)       /* outside the switch for the same reason */
@@ -2489,7 +2559,7 @@ int *rvalp;
             return EFAULT;
         id = zz9k_mode_id(bp, sm.width, sm.height);
         bpp = zz9k_bpp(sm.color_mode);
-        if (id == 0xffff || bpp == 0)
+        if (id == 0xffff || bpp == 0 || !(bp->bt->colormodes & ZZ9K_CM(sm.color_mode)))
             return EINVAL;
         if ((unsigned long)sm.width * sm.height * bpp > bp->fb_size)
             return ENOMEM;
