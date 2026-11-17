@@ -1,0 +1,969 @@
+ZS-05: armed mailbox register accesses (the driver of the A3000 + Z3660 kernel)
+
+src/z3660.c of the amigaux/amix kernel/drivers/z3660scsi (ZS-05,
+2026-10-26) with the dev_kvmap mapping of 518d246 kept: every mailbox
+write is issued right after a read of an offset covering it, in one asm
+block at IPL 7, and each address-triple cell is read back before the
+doorbell (the Z3660 FPGA samples rising address bits of back-to-back
+060 cycles too early and delivers a write at the AND of the two
+addresses).  Also: before the fixed window's first signature write it
+must lie outside the boot's memory regions and answer a read-only
+bprobe (z3660_fixed_gate); a unit with no drive mapped answers INQUIRY
+with peripheral qualifier 3, type 0x1F; the -DZ3660SCSI_MODULE form
+(not built here).  This is commit e71d683 of the amix-z3660scsi
+checkout (branch zs05-amigaux) that relink-040-z3660.sh compiles for
+/stand/unix on the box (unix.z3-vt2 since 2026-11-04, m6-msp since
+2026-11-08).
+
+---
+diff --git a/src/z3660.c b/src/z3660.c
+index 072d36c..df8ed38 100644
+--- a/src/z3660.c
++++ b/src/z3660.c
+@@ -12,15 +12,17 @@
+  * never autoconfigured at all.  On the stock 030 boot2 the bootinfo autocon table
+  * is also unreliable on real metal (see grimoire-amix: hydra detection).  That is
+  * the stock 030 boot2 only: boot2-040 hands the Z3660's ConfigDev over on metal
+- * (amix-z3660rtg, A4000D, 2026-09-18), and the 2026-09-27 MD-3a run on a real
++ * (amix-z3660rtg, A4000D, 2026-09-18), and the 2026-09-27 run on a real
+  * 68060 attached autocon-first -- the 040/060 line registers this card only via
+- * sd.c's autocon() loop, so rooting on it proves the hand-over (internal
+- * bench report).  So detection
++ * sd.c's autocon() loop, so rooting on it proves the hand-over (bench
++ * run).  So detection
+  * is multi-method, like the Hydra driver: try autocon() first, then -- only on
+  * an AGA machine (VPOSR >= 0x22; the ECS build box must never touch it) -- probe
+  * the fixed base directly.  Either way the mailbox must answer a signature the
+  * open bus cannot fake (ZS-02, see z3660_sig()) before a single unit is trusted;
+- * on the fixed base no signature means no board.
++ * on the fixed base no signature means no board, and before the signature's
++ * first write the fixed window must lie outside the boot's memory regions and
++ * answer a read-only bprobe (z3660_fixed_gate()).
+  *
+  * BOTH windows this driver maps are BOARD apertures, not kernel RAM -- including
+  * the "bounce buffer", which is the FIRMWARE's own staging area seen through the
+@@ -52,10 +54,14 @@
+  *   bus cycle and finishes the whole transfer before the write returns.  After a
+  *   READ, read USED_DMA(0x9C): if nonzero the data is in the bounce buffer, copy it
+  *   out.  Before a WRITE, if the buffer is < 0x08000000 copy it into the bounce.
++ *   Since ZS-05 (2026-10-26) every one of those writes is ARMED by a read of an
++ *   offset covering it, and each address-triple cell is read back before the
++ *   command register is written -- see the ZS-05 block below WRLONG/RDLONG.
+  *
+  *   INQUIRY / READ_CAPACITY / MODE_SENSE / TEST_UNIT_READY are interpreted *here*
+  *   (the firmware only does block read/write + geometry queries) -- mirroring
+- *   piscsi_scsi() in z3660_scsi.c.
++ *   piscsi_scsi() in z3660_scsi.c.  A unit with no drive mapped answers INQUIRY
++ *   with the SCSI "no device" byte (peripheral qualifier 3, type 0x1F).
+  *
+  * z3660queue() plugs into Amix sd.c exactly like a4091queue(): sd.c gives us a CDB
+  * in cp->cdb, target in cp->unit, buffer in cp->addr, length in cp->nbyte; we run
+@@ -68,8 +74,15 @@
+  * docs/BLIZZARD-F3.md) is still owed.  With no board, autocon() returns 0 and the
+  * I/O fails gracefully, just like the A4091 driver when no A4091 is present.
+  *
++ * Built with -DZ3660SCSI_MODULE the same source is the root-class loadable
++ * module z3660scsi (kernel/dlm contracts C4-1, C4-2; the section at the end of
++ * this file): _load probes the board polled in the root pass and registers it
++ * with sd_register(); the sd.c probe hook z3660present() and the empty
++ * z3660intr() are not in the module.  Without the switch this file is the
++ * static driver, byte for byte.
++ *
+  * Refs: repo/z3660-drivers/scsi/{z3660_scsi.c,z3660_scsi_enums.h},
+- *       repo/KNOWN_ISSUES.md, ../amix-a4091/src/a4091-wr.c (Amix framework).
++ *       repo/KNOWN_ISSUES.md, ../a4091/src/a4091-wr.c (Amix framework).
+  */
+ #include	"sys/types.h"
+ #include	"sys/immu.h"		/* PG_V, phystopfn, paddr_t */
+@@ -80,6 +93,10 @@
+ 					 * resolves to test/host/stubs/sys/inline.h. */
+ #include	"rico.h"
+ #include	"sd.h"
++#if	defined(Z3660SCSI_MODULE) && !defined(HOST_TEST)
++#include	"sys/moddefs.h"		/* the ABI kit's wrapper (kernel/dlm C3-1, C4-2) */
++#include	"sys/amixddi.h"		/* the kit's DDI: sd_register (C4-1) */
++#endif
+ 
+ #define	Z3660_PROD	0x144B0001	/* autocon pc = (manufacturer<<16)|product */
+ #define	Z3660_FIXED	0x10000000	/* combo window base when not autoconfigured */
+@@ -139,6 +156,17 @@
+ #define	P_WRITE_ADDR3	0x248
+ #define	P_BLOCKSIZE0	0x200		/* + unit*4, units 0..7 */
+ #define	P_BLOCKS0	0x220		/* + unit*4, units 0..7 */
++
++/*
++ * ZS-05: each doorbell is armed by its set's ADDR2, and USED_DMA by P_UDMA_ARM
++ * -- undefined in the fork, in stock firmware and in amiberry (each read
++ * handler's default: 0, no side effect); a future firmware must keep it so.
++ */
++#define	P_UDMA_ARM	0xBC
++#if	(P_WRITE & ~P_WRITE_ADDR2) != 0 || (P_READ & ~P_READ_ADDR2) != 0 || \
++	(P_USED_DMA & ~P_UDMA_ARM) != 0
++#error	"z3660: an offset has a bit its arming register lacks (ZS-05)"
++#endif
+ /*
+  * Depth of the piscsi per-unit register arrays, and so of this driver's per-unit
+  * geometry cache (see z3660_geom[] below): P_BLOCKSIZE0..+0x1C and
+@@ -257,9 +285,95 @@ static long		board_phys;
+ #define	WRLONG(cmd,val)	(*(volatile ulong *)(regs + (cmd)) = (ulong)(val))
+ #define	RDLONG(cmd)	(*(volatile ulong *)(regs + (cmd)))
+ #define	RDVPOSR()	(*(volatile ushort *)VPOSR)
++/*
++ * The boot's memory regions: the stock kernel's struct bootinfo
++ * (amiga/kernel/support.c) is 16 ConfigDev of 68 bytes, then 16 MemHeader of
++ * 32 bytes with mh_Lower at +20 and mh_Upper at +24 -- the regions config()
++ * builds main memory from.  Read by offset: the kit has no MemHeader.
++ */
++extern uchar	bootinfo[];
++#define	BI_MEM(i,o)	(*(ulong *)(bootinfo + 16 * 68 + (i) * 32 + (o)))
++#define	BI_MEMLO(i)	BI_MEM(i, 20)
++#define	BI_MEMHI(i)	BI_MEM(i, 24)
+ #endif	/* !HOST_TEST: the host harness force-includes its own WRLONG/RDLONG/
+-	 * RDVPOSR (test/host/mock_regs.h) that drive a mock piscsi mailbox and a
+-	 * mock Agnus/Alice id instead of real MMIO.  Inert for the kernel build. */
++	 * RDVPOSR/BI_MEMLO/BI_MEMHI (test/host/mock_regs.h) that drive a mock
++	 * piscsi mailbox, a mock Agnus/Alice id and mock memory regions instead
++	 * of real MMIO.  Inert for the kernel build. */
++extern int	bprobe();	/* (caddr_t addr, int v): 1 = bus error */
++
++/*
++ * ZS-05 -- the address-capture rule (Z3660 FPGA, real-CPU path; 2026-10-26).
++ *
++ * The FPGA captures a register access's address for the ARM (REG1, rtg.c
++ * rtg_thread(): zaddr = gpio & 0x1FFFFF) and on back-to-back 060 cycles it
++ * samples RISING address bits too early: the access is delivered at
++ * (previous address AND this address), silently, and the ARM services it
++ * there with whatever its DDR mirror holds for that cell.  Seen on both boxes
++ * as "[!!!PISCSI] Unhandled register write to 00000200" ($240 delivered at
++ * $200) and in the ZZ window ($104 delivered at $100).  rtg.c's comment above
++ * piscsi_reg_value() (same-clock event vs AXI write) is about the DATA; this
++ * is the ADDRESS, and no firmware re-read can see it.  A phantom that lands on
++ * a handled register is invisible to the firmware's "unhandled" print: a
++ * descriptor write landing on $000/$004 is a WRITE/READ doorbell with stale
++ * descriptors, a lost ADDR1 is a write to the previous request's LBA (DI-1's
++ * picture), a lost doorbell is a request that reports GOOD and moved nothing.
++ *
++ * RULE: every mailbox write is issued right after a read of an offset that has
++ * no bit the write's offset lacks, with nothing in between -- then the AND is
++ * the write's own address.  The macros below are the only way this driver
++ * writes the mailbox; each is ONE asm block (no stack or other bus cycle can
++ * sit between the arming read and the write) run with the IPL raised to 7 for
++ * its two or three cycles, so no interrupt handler's board access (z3660eth's
++ * INT6 at level 6 is the live one) or exception stacking can land in between.
++ *
++ *   Z3660_WRA(cmd, val)       read cmd, write cmd
++ *   Z3660_WRV(cmd, val, rb)   read cmd, write cmd, nop, read cmd back -> rb
++ *   Z3660_RING(arm, cmd, val) read arm, write cmd (arm a superset of cmd)
++ *   Z3660_RDX(arm, cmd, v)    read arm (discarded), read cmd -> v
++ *   Z3660_RDA(cmd, v)         RDX with arm == cmd
++ *
++ * The arming read of the register itself is side-effect free for every
++ * register armed this way (the descriptor cells return their latch; DRVNUMX
++ * has no read case and returns 0; BLOCKSIZE0/BLOCKS0+4n re-select the same
++ * unit) in the fork, in stock firmware and in the amiberry model.  RDA is for
++ * the attach-time reads, whose predecessors are arbitrary.  USED_DMA cannot
++ * arm itself (reading it consumes it), so it is armed by P_UDMA_ARM, an
++ * offset no firmware defines (read: 0, no side effect).  NOTES.md 2026-10-26.
++ */
++#ifndef	HOST_TEST
++#define	Z3660_WRA(cmd,val) do { ulong z_sr_, z_x_;				\
++	__asm__ __volatile__( "mov.w %%sr,%0\n\tor.w &0x700,%%sr\n\t"		\
++	    "mov.l (%2),%1\n\tmov.l %3,(%2)\n\tmov.w %0,%%sr"			\
++	    : "=&d" (z_sr_), "=&d" (z_x_)					\
++	    : "a" (regs + (cmd)), "d" ((ulong)(val)) : "memory"); } while (0)
++#define	Z3660_WRV(cmd,val,rb) do { ulong z_sr_, z_x_;				\
++	__asm__ __volatile__( "mov.w %%sr,%0\n\tor.w &0x700,%%sr\n\t"		\
++	    "mov.l (%2),%1\n\tmov.l %3,(%2)\n\tnop\n\tmov.l (%2),%1\n\t"		\
++	    "mov.w %0,%%sr"							\
++	    : "=&d" (z_sr_), "=&d" (z_x_)					\
++	    : "a" (regs + (cmd)), "d" ((ulong)(val)) : "memory");		\
++	(rb) = z_x_; } while (0)
++#define	Z3660_RING(arm,cmd,val) do { ulong z_sr_, z_x_;			\
++	__asm__ __volatile__( "mov.w %%sr,%0\n\tor.w &0x700,%%sr\n\t"		\
++	    "mov.l (%2),%1\n\tmov.l %4,(%3)\n\tmov.w %0,%%sr"			\
++	    : "=&d" (z_sr_), "=&d" (z_x_)					\
++	    : "a" (regs + (arm)), "a" (regs + (cmd)), "d" ((ulong)(val))	\
++	    : "memory"); } while (0)
++#define	Z3660_RDX(arm,cmd,v) do { ulong z_sr_, z_x_;				\
++	__asm__ __volatile__( "mov.w %%sr,%0\n\tor.w &0x700,%%sr\n\t"		\
++	    "mov.l (%2),%1\n\tmov.l (%3),%1\n\tmov.w %0,%%sr"			\
++	    : "=&d" (z_sr_), "=&d" (z_x_)					\
++	    : "a" (regs + (arm)), "a" (regs + (cmd)) : "memory");		\
++	(v) = z_x_; } while (0)
++#define	Z3660_RDA(cmd,v)	Z3660_RDX(cmd,cmd,v)
++#else	/* the harness sees the same access sequence through the mock seam */
++#define	Z3660_WRA(cmd,val)	do { (void)RDLONG(cmd); WRLONG(cmd,val); } while (0)
++#define	Z3660_WRV(cmd,val,rb)	do { (void)RDLONG(cmd); WRLONG(cmd,val);	\
++				     (rb) = RDLONG(cmd); } while (0)
++#define	Z3660_RING(arm,cmd,val)	do { (void)RDLONG(arm); WRLONG(cmd,val); } while (0)
++#define	Z3660_RDX(arm,cmd,v)	do { (void)RDLONG(arm); (v) = RDLONG(cmd); } while (0)
++#define	Z3660_RDA(cmd,v)	Z3660_RDX(cmd,cmd,v)
++#endif
+ 
+ /* last-transaction diagnostics (read via /dev/mem or a probe tool) */
+ ulong	z3660_lastblock, z3660_lastlen, z3660_blocks0, z3660_dma;
+@@ -537,6 +651,14 @@ ulong	z3660_bounce_rd_n;			/* READ came back via the bounce       */
+ ulong	z3660_pagecross_n;			/* chunks spanning a page boundary     */
+ ulong	z3660_range_ovf;			/* impossible range refused            */
+ 
++#ifdef	Z3660_DIAG
++/*
++ * Z3660_DIAG -- the DI-1 diagnostics below (the page-cross ring and the fault
++ * knob) are compiled only with -DZ3660_DIAG, for a diagnostic cut.  The
++ * shipped object has neither: no ring memory, no knob, no test on the I/O
++ * path.  z3660_pagecross_n, the census counter, stays in every build.
++ */
++
+ /*
+  * PAGE-CROSS RING (DI-1 diagnostic, read-only).  z3660_pagecross_n says HOW MANY
+  * chunks crossed a page edge; this says WHICH.  Every crossing the census counts
+@@ -643,42 +765,7 @@ ulong	z3660_fault_lba   = 0;			/* 0 = off; else the WRITE LBA */
+ ulong	z3660_fault_mode  = 0;			/* 0 REFUSE, 1 SHIFT           */
+ ulong	z3660_fault_n     = 0;			/* times fired                 */
+ long	z3660_fault_shift = 4;			/* SHIFT: blocks added, signed */
+-
+-/*
+- * REGISTER-RACE CHECK (DI-1, 2026-11-04).  The firmware takes a register write
+- * from an FPGA event and reads the value out of the board cell; the FPGA raises
+- * that event in the same clock it starts the AXI write of the value
+- * (docs/DI-1-misplaced-write.md §4.1).  The fork firmware re-reads the cell
+- * until two reads 1 us apart agree (rtg.c piscsi_reg_value), so a value that
+- * lands later than that is latched STALE: the previous request's block number,
+- * and the 2 KiB piece goes 4 blocks low.  On the A3000 with core 1 loading the
+- * DDR this put 48+13 inodes over their neighbours on 2026-11-03.
+- *
+- * The check: after the ADDR1/2/3 triple, read each register back.  A read of a
+- * piscsi register is answered by core 0 from the value it LATCHED
+- * (scsi.c handle_piscsi_read: piscsi_u32_read/_write[i]), not from the cell,
+- * and every write is acknowledged only after core 0 handled it -- so the read
+- * shows exactly what the doorbell will use.  On a mismatch the register is
+- * written again (the cell holds the new value by then, so even a stale re-read
+- * gives it) and read again, up to Z3660_REGRACE_TRIES times; then the chunk is
+- * refused (status 0xff, okay FALSE, no doorbell) rather than sent to the wrong
+- * LBA.  Explicitly initialized, so the cells sit in .data at fixed offsets and
+- * can be read off a running kernel through /dev/kmem.
+- *
+- *   z3660_regrace_on    1 = check (default); 0 = off, for timing comparisons
+- *   z3660_regrace_n     mismatches seen (each one rewritten)
+- *   z3660_regrace_fail  chunks refused after Z3660_REGRACE_TRIES rewrites
+- *   z3660_regrace_reg   last mismatch: register offset, value written, value
+- *   z3660_regrace_want  read back
+- *   z3660_regrace_got
+- */
+-#define	Z3660_REGRACE_TRIES	4
+-ulong	z3660_regrace_on   = 1;
+-ulong	z3660_regrace_n    = 0;
+-ulong	z3660_regrace_fail = 0;
+-ulong	z3660_regrace_reg  = 0;
+-ulong	z3660_regrace_want = 0;
+-ulong	z3660_regrace_got  = 0;
++#endif	/* Z3660_DIAG */
+ 
+ #ifndef	HOST_TEST
+ #define	Z3660_CPUSHL(p)	__asm__ __volatile__( ".word 0xf468" : : "a" (p) : "memory")
+@@ -805,7 +892,7 @@ int	s;
+ /*
+  * ZS-02 -- the mailbox signature.  Detection may only claim a board whose
+  * mailbox answers something the OPEN BUS cannot produce.  The old test,
+- * DRVTYPE in {0,1}, is passed by a bus that reads all-zero (the P6.2 hole).
++ * DRVTYPE in {0,1}, is passed by a bus that reads all-zero (the all-zero hole).
+  *
+  * The piscsi protocol has no version or magic register (z3660_scsi_enums.h,
+  * fork and stock alike), so the signature is built from what every firmware
+@@ -847,15 +934,15 @@ int	leave;
+ 	ulong	p;
+ 
+ 	p = (ulong)(leave ^ 1);
+-	WRLONG( P_READ_ADDR2,  Z3660_SIG_K1);
+-	WRLONG( P_WRITE_ADDR2, Z3660_SIG_K2);
+-	z3660_sig_rd[0] = RDLONG( P_READ_ADDR2);	/* first written, read first */
+-	z3660_sig_rd[1] = RDLONG( P_WRITE_ADDR2);
+-	WRLONG( P_DRVNUMX, p);
+-	z3660_sig_rd[2] = RDLONG( P_DRVNUM);
+-	WRLONG( P_DRVNUMX, leave);
+-	z3660_sig_rd[3] = RDLONG( P_DRVNUM);
+-	z3660_sig_rd[4] = RDLONG( P_DRVTYPE);		/* firmware returns 0 or 1 */
++	Z3660_WRA( P_READ_ADDR2,  Z3660_SIG_K1);	/* ZS-05: every access armed */
++	Z3660_WRA( P_WRITE_ADDR2, Z3660_SIG_K2);
++	Z3660_RDA( P_READ_ADDR2, z3660_sig_rd[0]);	/* first written, read first */
++	Z3660_RDA( P_WRITE_ADDR2, z3660_sig_rd[1]);
++	Z3660_WRA( P_DRVNUMX, p);
++	Z3660_RDA( P_DRVNUM, z3660_sig_rd[2]);
++	Z3660_WRA( P_DRVNUMX, leave);
++	Z3660_RDA( P_DRVNUM, z3660_sig_rd[3]);
++	Z3660_RDA( P_DRVTYPE, z3660_sig_rd[4]);	/* firmware returns 0 or 1 */
+ 	if (z3660_sig_rd[0] == Z3660_SIG_K1 && z3660_sig_rd[1] == Z3660_SIG_K2 &&
+ 	    z3660_sig_rd[2] == p && z3660_sig_rd[3] == (ulong)leave &&
+ 	    z3660_sig_rd[4] <= 1) {
+@@ -866,6 +953,42 @@ int	leave;
+ 	return 0;
+ }
+ 
++/*
++ * The fixed base before its first access.  Nothing has proved a board there:
++ * on an AGA box without a Z3660 the address is empty Zorro III space (where
++ * the access ends in a bus error) or something else's memory (the
++ * signature's writes would land in it).  So, with no access at all, refuse a window that
++ * overlaps a memory region the boot handed the kernel; then read one byte of
++ * the first signature cell with bus errors caught (bprobe, read-only), the
++ * cell z3660_sig()'s first arming read takes next.  0 = go on to the
++ * signature; ENXIO = no board, the window is never written.
++ */
++ulong	z3660_fixed_ram;	/* fixed window refused: overlaps a memory region */
++ulong	z3660_fixed_berr;	/* fixed window refused: the probe read faulted   */
++
++static int
++z3660_fixed_gate()
++{
++	ulong	lo, hi, b, t;
++	int	i;
++
++	b = (ulong)Z3660_FIXED;
++	t = b + (ulong)Z3660_WINDOW_TOP;
++	for (i = 0; i < 16; i++) {
++		lo = BI_MEMLO( i);
++		hi = BI_MEMHI( i);
++		if (lo < hi && lo < t && hi > b) {
++			z3660_fixed_ram++;
++			return ENXIO;
++		}
++	}
++	if (bprobe( (caddr_t)(b + PISCSI_OFFSET + P_READ_ADDR2), -1)) {
++		z3660_fixed_berr++;
++		return ENXIO;
++	}
++	return 0;
++}
++
+ /*
+  * Map the register window and the bounce buffer into kernel VA and verify the
+  * mailbox answers.  0 on success; ENXIO when no Z3660 is present.
+@@ -885,6 +1008,9 @@ int	leave;
+  *   2. only when autocon() finds nothing, and only on AGA (VPOSR >= 0x22):
+  *      the fixed base 0x10000000.  Here nothing but the signature says a Z3660
+  *      is present, so no signature means ENXIO and the window is dropped.
++ *      Before the signature's first write, z3660_fixed_gate(): ENXIO when
++ *      the window overlaps a boot memory region (no access), or when a
++ *      read-only bprobe of the first signature cell takes a bus error.
+  *
+  * MAPPING STRATEGY -- why the metal box needs no sptalloc() at all.
+  *
+@@ -954,7 +1080,7 @@ int	leave;
+  *   for a USER (hat_devload) gets Lcm_dev, unconditionally NCS on the r13 /
+  *   candidate-2 / candidate-3 kernels, which have no hat_cm_fb table, and NCS on
+  *   the driver-line base unless a registered framebuffer range makes it NC
+- *   (bench evidence, not published).  But this arm is a
++ *   (measured on the bench).  But this arm is a
+  *   KERNEL mapping that never reaches Lcm_sel: sptalloc() ignores its mode and
+  *   segkmem_mapin copies a CM=00 template, i.e. WRITETHROUGH CACHEABLE (port
+  *   src/devkvmap040.s header).  A cacheable mailbox is still a broken one, so
+@@ -1006,6 +1132,10 @@ z3660map()
+ 			return ENXIO;	/* ECS/OCS machine -- no Z3660 here */
+ 		}
+ 		base = Z3660_FIXED;	/* AGA: probe the fixed combo window */
++		if (z3660_fixed_gate()) {
++			z3660_present = 0;
++			return ENXIO;	/* memory there, or nothing answers */
++		}
+ 	}
+ 	board_phys = base;
+ 	bp = (ulong)base;
+@@ -1044,8 +1174,10 @@ z3660map()
+ 		unless (found) {
+ 			regs = 0;		/* fixed base: open bus, not a piscsi window */
+ 			z3660_present = 0;
++#ifndef	Z3660SCSI_MODULE	/* the module's ENXIO is silent (C4-2 section 2) */
+ 			if (z3660_sig_fails == 1)
+ 				printf( "z3660: no piscsi mailbox at 0x%x\n", (int)bp);
++#endif
+ 			return ENXIO;
+ 		}
+ 		/* AutoConfig found it; the mailbox is not answering yet */
+@@ -1080,6 +1212,7 @@ z3660map()
+ 	return 0;
+ }
+ 
++#ifndef	Z3660SCSI_MODULE	/* the module registers from z3660scsi_load */
+ /*
+  * sd.c probe hook (see templates/sd.c.in @DRIVER_PROBES@): register the card
+  * even when autocon() knows nothing about it.  Returns 1 and the board base
+@@ -1099,6 +1232,7 @@ char	**ap;
+ 	*ap = (char *)board_phys;
+ 	return 1;
+ }
++#endif	/* !Z3660SCSI_MODULE */
+ 
+ /*
+  * ---------------------------------------------------------------------------
+@@ -1216,10 +1350,14 @@ static struct z3660_unitgeom	z3660_geom_absent = { 512, 0, 0x00, 0 };
+  * answer (bs 512, 0 blocks, pdt 0 -- byte-identical to what the fork firmware's
+  * 0-block unit always produced), and every data command to it is refused
+  * before a doorbell.  A valid block size with a 0 block count is skipped the
+- * same way.  Each skipped unit is named on the console once per boot.
++ * same way.  Each skipped unit is named on the console once per boot: the
++ * units with no drive mapped (block size 0) together on one line after the
++ * sweep, "z3660: units 1-5,7: no drive mapped"; a bad geometry on a line of
++ * its own.
+  */
+ ulong	z3660_skipmask;		/* bit n: unit n was skipped (and reported)   */
+ ulong	z3660_skip_msgs;	/* console lines emitted by the skip path     */
++static ulong	z3660_nodrv_new;	/* units skipped as unmapped, not yet named */
+ ulong	z3660_skip_recovered;	/* skipped units that later answered valid    */
+ 
+ /* the only block sizes a real piscsi unit reports: 512 (disk) .. 2048 (CD) */
+@@ -1242,13 +1380,53 @@ ulong	bs, nb;
+ 	z3660_geom[unit].valid   = 0;
+ 	if ((z3660_skipmask & (1UL << unit)) == 0) {
+ 		z3660_skipmask |= 1UL << unit;
++		if (bs == 0) {
++			z3660_nodrv_new |= 1UL << unit;	/* named by z3660_nodrv_say() */
++			return;
++		}
+ 		z3660_skip_msgs++;
+-		if (bs == 0)
+-			printf( "z3660: unit %d: no drive mapped, skipped\n", unit);
+-		else
+-			printf( "z3660: unit %d: bad geometry (blocksize 0x%x, blocks 0x%x), skipped\n",
+-				unit, (int)bs, (int)nb);
++		printf( "z3660: unit %d: bad geometry (blocksize 0x%x, blocks 0x%x), skipped\n",
++			unit, (int)bs, (int)nb);
++	}
++}
++
++/*
++ * Name the units newly skipped with no drive mapped, on one line: runs of
++ * three or more as a range ("units 1-5,7", "unit 3").  Unit numbers are one
++ * digit (Z3660_NUNITS 8), so the line is built in place without sprintf.
++ */
++static void
++z3660_nodrv_say()
++{
++	char	b[2 * Z3660_NUNITS + 1];
++	int	i, j, n, k;
++
++	if (z3660_nodrv_new == 0)
++		return;
++	n = k = 0;
++	for (i = 0; i < Z3660_NUNITS; i = j) {
++		if ((z3660_nodrv_new & (1UL << i)) == 0) {
++			j = i + 1;
++			continue;
++		}
++		for (j = i + 1; j < Z3660_NUNITS && (z3660_nodrv_new & (1UL << j)); ++j)
++			;
++		if (k)
++			b[k++] = ',';
++		b[k++] = '0' + i;
++		n += j - i;
++		if (j - i >= 3) {
++			b[k++] = '-';
++			b[k++] = '0' + (j - 1);
++		} else if (j - i == 2) {
++			b[k++] = ',';
++			b[k++] = '0' + (j - 1);
++		}
+ 	}
++	b[k] = 0;
++	z3660_nodrv_new = 0;
++	z3660_skip_msgs++;
++	printf( "z3660: unit%s %s: no drive mapped\n", n > 1 ? "s" : "", b);
+ }
+ 
+ /*
+@@ -1264,18 +1442,21 @@ int	unit;
+ {
+ 	ulong	bs, nb;
+ 
+-	bs = RDLONG( P_BLOCKSIZE0 + unit * 4);	/* no divide in any firmware */
++	ulong	pdt;
++
++	Z3660_RDA( P_BLOCKSIZE0 + unit * 4, bs);	/* no divide in any firmware */
+ 	if (!z3660_bs_ok( bs)) {
+ 		z3660_geom_skip( unit, bs, 0UL);
+ 		return;
+ 	}
+-	nb = RDLONG( P_BLOCKS0 + unit * 4);	/* safe: block_size != 0 here */
++	Z3660_RDA( P_BLOCKS0 + unit * 4, nb);	/* safe: block_size != 0 here */
+ 	if (nb == 0) {
+ 		z3660_geom_skip( unit, bs, nb);
+ 		return;
+ 	}
+-	WRLONG( P_DRVNUMX, unit);
+-	z3660_geom[unit].pdt     = RDLONG( P_PDT);
++	Z3660_WRA( P_DRVNUMX, unit);
++	Z3660_RDA( P_PDT, pdt);
++	z3660_geom[unit].pdt     = pdt;
+ 	z3660_geom[unit].bs      = bs;
+ 	z3660_geom[unit].nblocks = nb;
+ 	z3660_geom[unit].valid   = 1;		/* unmapped units stay re-readable */
+@@ -1300,6 +1481,7 @@ z3660_geom_sweep()
+ 
+ 	for (i = 0; i < Z3660_NUNITS; ++i)
+ 		z3660_geom_fill( i);
++	z3660_nodrv_say();
+ }
+ 
+ /*
+@@ -1326,10 +1508,11 @@ int	unit;
+ 			unless (z3660_sig( unit))
+ 				return &z3660_geom_absent;
+ 			z3660_geom_sweep();
+-			WRLONG( P_DRVNUMX, unit);
++			Z3660_WRA( P_DRVNUMX, unit);
+ 			return &z3660_geom[unit];
+ 		}
+ 		z3660_geom_fill( unit);
++		z3660_nodrv_say();
+ 	}
+ 	return &z3660_geom[unit];
+ }
+@@ -1354,8 +1537,11 @@ z3660_test_unmap()
+ 	z3660_sig_deferred = 0;
+ 	z3660_skipmask = 0;
+ 	z3660_skip_msgs = 0;
++	z3660_nodrv_new = 0;
+ 	z3660_skip_recovered = 0;
+ 	z3660_map_fails = 0;
++	z3660_fixed_ram = 0;
++	z3660_fixed_berr = 0;
+ 	for (i = 0; i < Z3660_NUNITS; ++i) {
+ 		z3660_geom[i].bs = 512;
+ 		z3660_geom[i].nblocks = 0;
+@@ -1366,59 +1552,60 @@ z3660_test_unmap()
+ #endif	/* HOST_TEST */
+ 
+ /*
+- * One register of a READ/WRITE triple, as the firmware latched it (see the
+- * REGISTER-RACE CHECK above): read back, rewrite on a mismatch.  0 = latched
+- * right, -1 = still wrong after Z3660_REGRACE_TRIES rewrites.
++ * ZS-05 descriptor read-back.  Each descriptor cell is written armed and read
++ * straight back (Z3660_WRV); the read handler returns the ARM's own latch
++ * (piscsi_u32_read/write[i], scsi.c handle_piscsi_read(), fork and stock), so
++ * a write the ARM did not take -- an address-capture phantom outside the
++ * arming rule, or the data race of docs/DI-1-misplaced-write.md 4.1 -- shows
++ * as a mismatch.  A mismatch is rewritten once; a second one fails the request
++ * before its doorbell (EIO), so no transfer runs on a descriptor the ARM does
++ * not hold.  The counters and the last mismatch are kmem-readable.
+  */
++ulong	z3660_rb_retry;		/* descriptor mismatches rewritten              */
++ulong	z3660_rb_fail;		/* requests failed: mismatch survived a rewrite */
++ulong	z3660_rb_last[3];	/* last mismatch: offset, written, read back    */
++
+ static int
+-z3660_regcheck( reg, val)
+-ulong	reg, val;
++z3660_set( cmd, val)
++int	cmd;
++ulong	val;
+ {
+-	ulong	got;
+-	int	i;
++	ulong	rb;
+ 
+-	for (i = 0; ; ++i) {
+-		got = RDLONG( reg);
+-		if (got == val)
+-			return 0;
+-		z3660_regrace_n++;
+-		z3660_regrace_reg  = reg;
+-		z3660_regrace_want = val;
+-		z3660_regrace_got  = got;
+-		if (i == Z3660_REGRACE_TRIES)
+-			break;
+-		WRLONG( reg, val);
+-	}
+-	z3660_regrace_fail++;
+-	return -1;
++	Z3660_WRV( cmd, val, rb);
++	if (rb == val)
++		return 0;
++	z3660_rb_last[0] = (ulong)cmd;
++	z3660_rb_last[1] = val;
++	z3660_rb_last[2] = rb;
++	if (z3660_rb_retry++ == 0)
++		printf( "z3660: mailbox 0x%x read back 0x%x, wrote 0x%x; rewritten\n",
++			cmd, (int)rb, (int)val);
++	Z3660_WRV( cmd, val, rb);
++	if (rb == val)
++		return 0;
++	if (z3660_rb_fail++ == 0)
++		printf( "z3660: mailbox 0x%x will not latch 0x%x; request failed\n",
++			cmd, (int)val);
++	return 1;
+ }
+ 
+-/*
+- * Load a READ or WRITE triple: ADDR1 = block, ADDR2 = byte length, ADDR3 =
+- * buffer address, at a1 = P_READ_ADDR1 or P_WRITE_ADDR1.  0 = all three
+- * latched as written, -1 = refuse this chunk.
+- */
++/* the descriptor triple at a1 (READ_ADDR1 or WRITE_ADDR1); 0 = all latched */
+ static int
+-z3660_triple( a1, block, len, pa)
+-ulong	a1, block, len, pa;
++z3660_desc( a1, block, len, pa)
++int	a1;
++ulong	block, len, pa;
+ {
+-	WRLONG( a1,     block);
+-	WRLONG( a1 + 4, len);
+-	WRLONG( a1 + 8, pa);
+-	if (!z3660_regrace_on)
+-		return 0;
+-	z3660_sync();			/* as S4: the writes precede the read-backs */
+-	if (z3660_regcheck( a1, block) || z3660_regcheck( a1 + 4, len)
+-	    || z3660_regcheck( a1 + 8, pa))
+-		return -1;
++	if (z3660_set( a1, block) || z3660_set( a1 + 4, len) ||
++	    z3660_set( a1 + 8, pa))
++		return EIO;
+ 	return 0;
+ }
+ 
+ /*
+  * Run one block READ or WRITE through the piscsi mailbox, chunked to <=64KB.
+  * block = starting LBA, blocks = block count, bs = block size, data = buffer.
+- * 0 = done; -1 = a chunk's registers did not latch (the register-race check):
+- * that chunk and the rest were not transferred.
++ * 0, or EIO when a descriptor would not latch (no doorbell for that chunk).
+  */
+ static int
+ z3660_rw( unit, write, block, blocks, bs, data)
+@@ -1426,10 +1613,13 @@ int	unit, write;
+ ulong	block, blocks, bs;
+ uchar	*data;
+ {
+-	ulong	chunk, len, i, perchunk, pa, req, reqlen;
++	ulong	chunk, len, i, perchunk, pa;
++#ifdef	Z3660_DIAG
++	ulong	req, reqlen;
+ 
+ 	req    = (ulong)data;			/* page-cross ring context only */
+ 	reqlen = blocks * bs;
++#endif
+ 	perchunk = MAXXFER / bs;
+ 	if (perchunk == 0)
+ 		perchunk = 1;
+@@ -1455,13 +1645,15 @@ uchar	*data;
+ 		 * The counter decides, in either direction: 0 across a boot and an
+ 		 * install makes the guard a permanent refusal; non-zero means the
+ 		 * shipping path needs the chunk SPLIT at the page boundary, not
+-		 * refused.  Each counted crossing is also copied into
+-		 * z3660_pagecross_ring (record only), so the addresses behind a
+-		 * non-zero count can be read off a running kernel.
++		 * refused.  With Z3660_DIAG each counted crossing is also copied
++		 * into z3660_pagecross_ring (record only), so the addresses
++		 * behind a non-zero count can be read off a running kernel.
+ 		 */
+ 		if ((pa & (ulong)(NBPP - 1)) + len > (ulong)NBPP) {
+ 			z3660_pagecross_n++;
++#ifdef	Z3660_DIAG
+ 			z3660_pcr_note( unit, write, block, len, pa, req, reqlen);
++#endif
+ 		}
+ 
+ 		if (write) {
+@@ -1476,9 +1668,9 @@ uchar	*data;
+ 				z3660_bounce_wr_n++;	/* unreachable on AMIX RAM */
+ 				bcopy( (caddr_t)data, (caddr_t)bounce, (int)len);
+ 			}
+-			if (z3660_triple( (ulong)P_WRITE_ADDR1, block, len, pa))
+-				return -1;		/* not latched: no doorbell */
+-			WRLONG( P_WRITE, unit);			/* trigger (sync) */
++			if (z3660_desc( P_WRITE_ADDR1, block, len, pa))
++				return EIO;
++			Z3660_RING( P_WRITE_ADDR2, P_WRITE, unit);	/* trigger (sync) */
+ 			/* no completion op: TO_DEVICE never invalidates */
+ 		} else {
+ 			/*
+@@ -1487,11 +1679,11 @@ uchar	*data;
+ 			 * valid line may survive to be read instead of them.
+ 			 */
+ 			z3660_push( pa, len);
+-			if (z3660_triple( (ulong)P_READ_ADDR1, block, len, pa))
+-				return -1;		/* not latched: no doorbell */
+-			WRLONG( P_READ, unit);			/* trigger (sync) */
++			if (z3660_desc( P_READ_ADDR1, block, len, pa))
++				return EIO;
++			Z3660_RING( P_READ_ADDR2, P_READ, unit);	/* trigger (sync) */
+ 			z3660_sync();		/* S4: doorbell must precede the readback */
+-			z3660_dma = RDLONG( P_USED_DMA);
++			Z3660_RDX( P_UDMA_ARM, P_USED_DMA, z3660_dma);
+ 			if (z3660_dma != 0) {
+ 				/*
+ 				 * BOUNCE arm -- the CPU writes `data`, through the
+@@ -1557,7 +1749,7 @@ struct sdcom	*cp;
+  * switched out), and a per-process kernel-stack VA (~0x40001xxx, the u-area
+  * window) then resolves into a DIFFERENT process's stack -- so z3660done reads a
+  * garbage cp->intr (run-to-run "variable garbage", varying pid) and jumps
+- * through it.  That is the T2.P3 mount panic: the corrupting completion is always
++ * through it.  That is the CD mount panic: the corrupting completion is always
+  * a CD READ(10) (lastcmd=0x28) with cp on the stack, while every disk completion
+  * (persistent cp=0x80FDxxx) stays healthy.  depth==0/hits==0 -- not reentrancy,
+  * not a DMA scribble: a pointer-lifetime bug in the deferred completion.
+@@ -1657,7 +1849,7 @@ struct sdcom	*cp;
+ 	 * a hit); before that cache existed these three facts cost four further
+ 	 * round trips on every single CDB.
+ 	 */
+-	WRLONG( P_DRVNUMX, unit);
++	Z3660_WRA( P_DRVNUMX, unit);	/* ZS-05: armed, like every mailbox write */
+ 	g   = z3660_geom_get( unit);
+ 	bs  = g->bs;
+ 	pdt = g->pdt;			/* 0x00 disk, 0x05 CD-ROM (sole device-type source) */
+@@ -1721,7 +1913,22 @@ struct sdcom	*cp;
+ 	case C_INQUIRY:
+ 		if (data) {
+ 			for (i = 0; i < (int)cp->nbyte; ++i) data[i] = 0;
+-			if (pdt == 0x05) {
++			if (!g->valid) {
++				/*
++				 * No drive mapped (or no signature yet): the
++				 * SCSI "no device" answer, peripheral qualifier
++				 * 3 / type 0x1F, completed GOOD.  A failed
++				 * command would copy no data out through
++				 * /dev/scsi, and a caller that reads the
++				 * buffer anyway sees a disk.
++				 */
++				if (cp->nbyte >= 5) {
++					data[0] = 0x7F;		/* PQ 3, type 0x1F        */
++					data[2] = 0x02;		/* SCSI-2                 */
++					data[3] = 0x02;		/* response data format 2 */
++					data[4] = 0x1F;		/* additional length (36) */
++				}
++			} else if (pdt == 0x05) {
+ 				/*
+ 				 * CD-ROM -- byte-match the a3000_scsi Path B
+ 				 * mirror: 05 80 02 02 1F 00 00 00, vendor
+@@ -1865,6 +2072,7 @@ struct sdcom	*cp;
+ 			cp->status = 0xff; cp->okay = FALSE;
+ 			break;
+ 		}
++#ifdef	Z3660_DIAG
+ 		/* DI-1 fault knob, diagnostic cuts only (see z3660_fault_lba) */
+ 		if (z3660_fault_lba != 0 && write && block == z3660_fault_lba) {
+ 			long	to;
+@@ -1882,9 +2090,9 @@ struct sdcom	*cp;
+ 			cp->status = 0xff; cp->okay = FALSE;	/* as a map failure */
+ 			break;
+ 		}
+-		/* a refused chunk (register-race check) fails the request: EIO */
++#endif
+ 		if (z3660_rw( unit, write, block, blocks, bs, data)) {
+-			cp->status = 0xff; cp->okay = FALSE;
++			cp->status = 0xff; cp->okay = FALSE;	/* ZS-05: EIO */
+ 		}
+ 		break;
+ 
+@@ -1899,7 +2107,212 @@ struct sdcom	*cp;
+ 	return TRUE;
+ }
+ 
++#ifndef	Z3660SCSI_MODULE
+ void
+ z3660intr()
+ {
+ }
++#endif
++
++#ifdef	Z3660SCSI_MODULE
++/* ----------------------------------------------------------------------------
++ * The root-class module form (kernel/dlm docs/contracts/C4-2-root-class-driver.md
++ * version 1, C4-1 version 2).  Built with -DZ3660SCSI_MODULE once per kernel
++ * line (k30, k46); module/Master gives the .moddata keys: class=root,
++ * match=zorro:144b:01,mobo:z3660-window, rank=z3660, unload=never, no majors
++ * (sd owns the disk majors, C4-2 section 1).
++ *
++ * _load runs in marc_root: process 0, inside rth1_mountroot, before the root
++ * is mounted, at LEVEL 7 WITH THE CLOCK STOPPED (C4-2 section 2).  What it
++ * does there is z3660present()'s work and nothing more: z3660map() -- autocon()
++ * first, the fixed base 0x10000000 only on AGA and only past its gate (no boot
++ * memory region over it, a read-only bprobe that does not fault), the ZS-02
++ * signature, the attach-time unit sweep -- all of it polled register reads
++ * and writes, every write armed (ZS-05), then one sd_register().  It
++ * allocates no memory (the driver's state is its own .data/.bss), sleeps on
++ * nothing, sets no timeout, waits for no interrupt and opens no file.  It
++ * does NOT take the mailbox
++ * bracket (z3660_enter()): spl6 is an absolute move to IPL 4, and here it
++ * would LOWER the level from 7; at level 7 no clock callout can nest a
++ * transaction, which is all the bracket is for.  The board has no interrupt
++ * (the piscsi mailbox is synchronous), so root_defer() is not called.
++ *
++ * One board at most: the Z3660 is the CPU card, and the driver's state (regs,
++ * bounce, the geometry cache) is single-instance, so c is always 0.
++ * Returns 0 linked; ENXIO with no board, silently (no console line: an ECS or
++ * OCS machine, or an AGA one whose fixed window has no piscsi mailbox);
++ * ENOMEM when the high window cannot be mapped (z3660map names it), ENXIO from
++ * the cache-inhibit assertion (z3660_cache 40/60 with z3660_ci_enforce set
++ * only), or sd_register()'s
++ * errno (EBUSY, EINVAL, ENOSPC), which the core prints.  An AutoConfig board
++ * whose mailbox does not answer the signature yet is registered with the
++ * sweep deferred, as the static driver attaches it.
++ *
++ * Before z3660map() _load sets the cache arm, z3660_cache (ZS-06, C4-2
++ * section 1.1): the static k46 driver gets 60 stamped by the port's f4arms
++ * `--cache 60` pass, which a module kernel does not run, so the module sets
++ * it itself from cputype and the `cache=` parameter (z3660_arm() below).
++ *
++ * What the root pass cannot do and this module therefore never does there:
++ * sleep, timeout(), delay(), a KM_SLEEP allocation, an interrupt self-test,
++ * file I/O.  After _load, sd's first open (rth1_apply, still in the root pass)
++ * calls z3660queue(), whose spl6 bracket moves the level to 4 and back for each
++ * transaction, exactly as the static driver does at the same point.
++ * ------------------------------------------------------------------------- */
++
++#define	Z3660SCSI_RANK	1	/* C4-1 section 4: class 1 z3660 = .moddata rank=z3660 */
++
++extern int	sd_register();	/* (bool (*)(), uint, char *, char *, uint) */
++
++ulong	z3660_halted;		/* kmem-readable: the halt pass ran (count)        */
++ulong	z3660_halt_busy;	/* halt pass found a transaction in flight (never) */
++
++/*
++ * ZS-06 -- the cache arm, set at _load (C4-2 section 1.1).
++ *
++ * The static k46 kernels get z3660_cache = 60 stamped into the linked image
++ * by the port's f4arms pass (patch_z3660_cache.py --set 60).  A module kernel
++ * has no static driver for that pass to find, and the module's own .data word
++ * (-fno-common) stayed 0: on the real 68060 no line op ran, a dirty copyback
++ * line was written back over the data the ARM had just put in DDR, and the
++ * first directory lookup failed (swapconf panic; the mechanism of August's metal A/B).
++ *
++ * So _load decides it, before z3660map() (whose cache-inhibit check reads it):
++ *   - cputype 30: 0, always -- cpushl/cinvl are line F on the 030, and the
++ *     Z3660's UAE_030 emulates no 030 data cache;
++ *   - cache= absent or -1: by cputype (40 -> 40, 60 -> 60, anything else 0);
++ *   - cache=0, 40 or 60: as given, but refused (0, one line) when cputype is
++ *     not 40 or 60;
++ *   - anything else (out of range, not a number): by cputype, one line.
++ * z3660_cache_src says which: 0 = by cputype, 1 = the parameter.
++ * module/Master: $param cache:int:-1:-1:60.
++ */
++#ifdef	HOST_TEST
++extern long	cputype;		/* the harness's: 30, 40, 60 */
++#define	DDI_CPUTYPE	cputype
++#endif
++
++long	z3660_cache_src;	/* kmem: 0 = z3660_cache from cputype, 1 = cache= */
++ulong	z3660_cache_bad;	/* kmem: cache= refused or not understood (count) */
++
++/*
++ * The `cache` parameter in the string the core passes to _load: the
++ * manifest's "name=value ..." records, or 0 (C3-6 section 1.1); C3-1's int
++ * form, decimal with an optional '-' (kernel/modules monsw_param's shape).
++ * Returns 0 if absent, 1 with *vp set if a decimal (saturating above
++ * 100000), -1 if present but not a decimal.
++ */
++static int
++z3660_param( params, vp)
++char	*params;
++long	*vp;
++{
++	static char	name[] = "cache=";
++	char	*p, *n;
++	long	v;
++	int	neg, nd;
++
++	if ((p = params) == 0)
++		return 0;
++	for (;;) {
++		while (*p == ' ')
++			p++;
++		if (*p == 0)
++			return 0;
++		for (n = name; *n && *p == *n; n++, p++)
++			;
++		if (*n == 0)
++			break;
++		while (*p && *p != ' ')
++			p++;
++	}
++	neg = 0;
++	if (*p == '-') {
++		neg = 1;
++		p++;
++	}
++	for (v = 0, nd = 0; *p >= '0' && *p <= '9'; p++, nd++)
++		v = v < 100000 ? v * 10 + (*p - '0') : 100000;
++	if (nd == 0 || (*p != 0 && *p != ' '))
++		return -1;
++	*vp = neg ? -v : v;
++	return 1;
++}
++
++static void
++z3660_arm( params)
++char	*params;
++{
++	long	cpu, v, bycpu;
++	int	r;
++
++	cpu = DDI_CPUTYPE;
++	bycpu = (cpu == 40 || cpu == 60) ? cpu : 0;
++	z3660_cache = bycpu;
++	z3660_cache_src = 0;
++	r = z3660_param( params, &v);
++	if (r == 0 || (r == 1 && v == -1))
++		return;
++	if (r == 1 && (v == 0 || v == 40 || v == 60)) {
++		if (v != 0 && bycpu == 0) {
++			z3660_cache_bad++;
++			printf( "z3660: cache=%d refused on cputype %d; no cache maintenance\n",
++				(int)v, (int)cpu);
++			return;
++		}
++		z3660_cache = v;
++		z3660_cache_src = 1;
++		return;
++	}
++	z3660_cache_bad++;
++	if (r == 1)
++		printf( "z3660: cache=%d is not 0, 40 or 60; cache %d from cputype %d\n",
++			(int)v, (int)bycpu, (int)cpu);
++	else
++		printf( "z3660: cache= is not a number; cache %d from cputype %d\n",
++			(int)bycpu, (int)cpu);
++}
++
++int
++z3660scsi_load( params)
++char	*params;
++{
++	int	e;
++
++	z3660_arm( params);		/* ZS-06: before z3660map()'s ci_check */
++	z3660_nest_hits += (z3660_nest_depth != 0);
++	z3660_nest_depth++;		/* the accounting of z3660_enter(), no spl */
++	e = z3660map();
++	z3660_nest_depth--;
++	if (e)
++		return e;
++	e = sd_register( z3660queue, 0, (char *)board_phys, "Z3660 SCSI",
++	    Z3660SCSI_RANK);
++	if (e) {
++		printf( "z3660: sd_register failed (errno %d)\n", e);
++		return e;
++	}
++	return 0;
++}
++
++/*
++ * _halt (C4-2 section 5): leave the mailbox idle.  Every transaction completes
++ * inside z3660queue() under its bracket before it returns -- the doorbell write
++ * is the completion -- so from uadmin's halt pass there is never a command in
++ * flight and nothing to stop.  It therefore touches no register (each access
++ * would be one more mailbox event, ZS-05) and only records that it ran.
++ */
++void
++z3660scsi_halt()
++{
++	z3660_halted++;
++	if (z3660_nest_depth != 0)
++		z3660_halt_busy++;
++}
++
++#ifndef	HOST_TEST
++/* no _unload: unload=never, a root-class module is pinned (C4-2 section 1) */
++MOD_HDRV_WRAPPER(z3660scsi, z3660scsi_load, 0, z3660scsi_halt,
++		"Z3660 SCSI (piscsi mailbox)");
++#endif
++#endif	/* Z3660SCSI_MODULE */
