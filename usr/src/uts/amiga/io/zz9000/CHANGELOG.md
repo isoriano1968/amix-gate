@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased - 2026-11-17 (colour modes, caps, 040 kit, z3660rtg split)
+
+- Each board row lists the colour modes its board can show
+  (`ZZ9K_CM_ZZ9000`: 8/15/16/32 bit; `ZZ9K_CM_Z3660`: 8/15/16 bit, the
+  Z3660's HDMI is RGB565 only). `ZZ9KIOC_SETMODE`/`SETMODEHZ` return
+  `EINVAL` for any other: a 32-bit mode on the Z3660 was accepted and showed
+  nothing.
+- `RTGIOC_GETCAPS` (`('R'<<8)|1`, io/rtgcaps.h): board name, depths,
+  framebuffer size, largest mode, `RTGCAP_*` flags.
+- `port/make-kit-040.sh`: the zz9000-040 kit (ZZ9000 rows, `ZZ9K_FB_NC`);
+  the 030 kit is 0.2 (the ioctl and mode check above).
+- The Z3660 RTG has its own driver, `../z3660rtg` (`/dev/z3660rtg`, major
+  55). The z3660 kernel variant keeps the built-in Z3660 rows here for now;
+  built after this change it is no longer byte-identical to the box's.
+
 ## Unreleased - 2026-11-07 (Display panel pass 2)
 
 - `ZZ9KIOC_GETMODES` (19): the mode table with refresh (1/100 Hz) and pixel

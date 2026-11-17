@@ -53,3 +53,31 @@ driver for the Zorro II ZZ9000 without any target or port switch (no
 `zz9000init` booted through the driver chain `amixdrv_init` (amix-gate's
 `port/src/amixdrv_init.s.in` and `patch_io_init.py`). The kit lands in
 `port/kit` (gitignored).
+
+`port/make-kit-040.sh` builds the 68040/68060 kit (`port/kit-040`, line=040)
+for a generic-variant port kernel (`port/tools/amix-kernel-040`): the same
+ZZ9000 rows, `-m68040` against the Model-B headers, with `ZZ9K_FB_NC` (the
+framebuffer registered noncacheable-not-serialised through `hat_cm_fb_add`,
+as rtgfb-040 does) and `ZZ9K_NO_BUILTINFONT`; no `dev_kvmap` (a Zorro II
+board is in the identity map). The z3660 kernel variant has this driver built
+in, so `kit-relink.sh` refuses the kit there (`zz9000init` is in the base).
+
+## The Z3660 RTG is its own driver
+
+The Z3660's RTG now has its own driver and kit, `../z3660rtg`
+(`/dev/z3660rtg`, major 55), built from amix-z3660rtg's pristine source plus
+patches that end in this directory's `zz9000.c`/`zz9000.h` and then split
+the Z3660 rows off (see its README). Every change made here must be carried
+there as a patch: its kit build compares the two and stops on a difference.
+The `-DZZ9K_TARGET_Z3660` rows stay here for the z3660 kernel variant (major
+49, as the box runs it) until that variant moves to `/dev/z3660rtg`.
+
+## Colour modes and RTGIOC_GETCAPS
+
+Each board row lists the colour modes its board can show; `ZZ9KIOC_SETMODE`
+and `ZZ9KIOC_SETMODEHZ` return `EINVAL` for any other. The ZZ9000 shows 8,
+15, 16 and 32 bit; the Z3660 8, 15 and 16 bit (its HDMI is RGB565 on a
+16-pin bus: a 32-bit mode shows nothing). `RTGIOC_GETCAPS` (`../rtgcaps.h`,
+copied into `zz9000.h` between the `RTGCAPS BEGIN`/`END` lines) reports the
+board, its depths, framebuffer size, largest mode and `RTGCAP_*` flags, so
+the X server and the CDE display panel offer only what the board can show.
