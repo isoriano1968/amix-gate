@@ -1576,6 +1576,15 @@ hydraautoconfig()
 	}
     }
 
+#ifdef HYDRA_RAW_PROBE
+    /*
+     * Methods 2 and 3 read raw Zorro II space and take any 6 bytes that are
+     * not all 0x00/0xFF/equal for a MAC address: on a machine without a
+     * Hydra they can take another board's RAM (an A2065's buffers, a Picasso
+     * II framebuffer) for one, and an empty slot may not answer at all.  So
+     * only AutoConfig (method 1) counts; -DHYDRA_RAW_PROBE keeps the old
+     * scan for bring-up of a board AutoConfig does not list.
+     */
     /* Method 2: Direct PROM probe at Zorro II I/O slots (0xE90000-0xEFFFFF) */
     n = 0;
     for (slot = 0; slot < 7; slot++)
@@ -1650,6 +1659,7 @@ hydraautoconfig()
     {
 	return;
     }
+#endif /* HYDRA_RAW_PROBE */
 
     /* no board: nothing to say -- a machine without a Hydra is normal, and
      * each driver reports only the hardware it finds (HYDRA_DEBUG: old note) */
