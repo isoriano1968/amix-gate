@@ -19,7 +19,8 @@ section 5). The driver only:
   usable picture.
 
 It has no mode setting, blitter or console. It looks for its board once, at
-boot, and names what it finds on the console, for example
+boot (`rtgfbinit`, called by the kernel's driver chain `amixdrv_init` after
+`parinit`), and names what it finds on the console, for example
 `rtgfb: Picasso II (CL-GD5426), registers 0xea0000+0x10000, memory 0x200000+0x200000`
 (the chip id tells a Picasso II from a II+). Without a board it prints
 nothing, and the device only answers `ENXIO`.
@@ -52,7 +53,9 @@ board with `graphics_card = picasso-ii`.
 
 ## Building the kernel
 
-Copy the files into your amix-040-060-port checkout:
+Copy the files into your amix-040-060-port checkout (with them the shared
+`src/patch_io_init.py`, `src/amixdrv_init.s.in` and `tools/kit-lib.sh` of
+amix-gate's port tree):
 
 ```sh
 ./install.sh /path/to/amix-040-060-port
@@ -80,12 +83,37 @@ Each script:
 - links it in with `ld -r`,
 - registers `cdevsw[54]` with `src/patch_rtgfb_cdevsw.py`, by symbol, which
   refuses unless the slot is `nodev`,
-- hooks the boot search into `io_init[]` with `src/patch_rtgfb_init.py`:
-  `io_init` is `{ parinit, 0 }` with no spare slot, so entry 0 is retargeted
-  from `parinit` to `rtgfbinit`, which calls `parinit` first. The script
-  refuses unless entry 0 points at `parinit` and entry 1 is the terminating 0,
+- hooks the boot search into `io_init[]`: `io_init` is `{ parinit, 0 }` with
+  no spare slot, so the script assembles the driver chain `amixdrv_init` from
+  `src/amixdrv_init.s.in` (`jsr parinit`, `jsr rtgfbinit`, `rts`) and
+  `src/patch_io_init.py` retargets entry 0 from `parinit` to it. The script
+  refuses unless entry 0 points at `parinit` and entry 1 is the terminating 0.
+  `rtgfbinit` itself only searches for the board; it does not call `parinit`.
+  On a port kernel, run `relink-040-rtgfb.sh` as the last step that touches
+  `io_init`,
 - checks for unresolved symbols, text/data contiguity, `.data` alignment and
   the loader's relocations.
+
+## The AMIX Installer's kit
+
+The AMIX Installer links rtgfb into the user's own stock `/stand/unix` on the
+host (the stock kernel is Commodore's and cannot be shipped). It takes the
+pieces from a kit:
+
+```sh
+AMIX_ROOT=/path/to/amix-2.1c sh port/make-kit-030.sh     # -> port/kit (gitignored)
+```
+
+The kit (version 0.2) holds `rtgfb_030.o`, `rtgfb_pad.o`,
+`patch_rtgfb_cdevsw.py`, `patch_io_init.py`, `check_relink_relocs.py`,
+`KIT.info` (`id`, `version`, `major`, `node`, `line`, `init`, `entries`,
+`streams`) and `KIT.sha256` over all of them, in link and run order. The
+installer writes one chain stub for all the drivers chosen, from
+`port/src/amixdrv_init.s.in` in amix-gate's port tree, and runs
+`patch_io_init.py KERNEL amixdrv_init` once, after every kit's own
+`patch_*.py`. `port/tools/kit-relink.sh BASE OUT KIT...` does the same steps
+from the shell, for tests. The same holds for the zz9000, hydra and va2000
+kits (`io/<driver>/port/make-kit-030.sh`).
 
 ## On the machine
 

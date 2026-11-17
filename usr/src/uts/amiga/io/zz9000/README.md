@@ -41,3 +41,15 @@ For X11 use, the optional console hook and init script are not required. The X
 server communicates directly with `/dev/zz9000`.
 
 See [INSTALL.md](INSTALL.md) for the complete procedure.
+
+## AMIX Installer kit
+
+`port/make-kit-030.sh` (with `AMIX_ROOT` set to an AMIX 2.1c tree) builds the
+kit the AMIX Installer links into a user's stock 68030 `/stand/unix`: the
+driver for the Zorro II ZZ9000 without any target or port switch (no
+`dev_kvmap`, `hat_cm_fb_add` or `monsw` needed) and with
+`ZZ9K_NO_BUILTINFONT` (the stock kernel has no `builtinfont[]`),
+`cdevsw[49]` registered by `port/src/patch_zz9000_cdevsw.py`, and
+`zz9000init` booted through the driver chain `amixdrv_init` (amix-gate's
+`port/src/amixdrv_init.s.in` and `patch_io_init.py`). The kit lands in
+`port/kit` (gitignored).

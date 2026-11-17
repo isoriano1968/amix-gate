@@ -3,7 +3,9 @@
 # port kernel, as one more step of the relink chain (after random, like any
 # driver).  On a kernel with the cache-class selector (hat_cm_fb_add) the
 # framebuffer is registered noncacheable-not-serialised (-DRTGFB_FB_NC); the
-# registers stay serialised.  Usage:
+# registers stay serialised.  The board is named at boot through the driver
+# chain amixdrv_init (src/amixdrv_init.s.in + src/patch_io_init.py), which
+# takes io_init[0]: run this as the last io_init step of a chain.  Usage:
 #   sh relink-040-rtgfb.sh IN OUT
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -14,6 +16,7 @@ IN="$1"; OUT="$2"
 . "$HERE/tools/m68k-binutils.sh"
 $NM "$IN" | grep -qE " [TDBC] cputype$" || { echo "[FAIL] base is not a 68040/68060 port kernel: use relink-030-rtgfb.sh"; exit 1; }
 $NM "$IN" | grep -qE " T rtgfbopen$" && { echo "[FAIL] base already has rtgfb"; exit 1; }
+$NM "$IN" | grep -qE " T amixdrv_init$" && { echo "[FAIL] base already has a driver chain (amixdrv_init): io_init[0] is taken"; exit 1; }
 for s in autocon getminor copyin copyout bzero printf nodev cdevsw io_init parinit; do
 	$NM "$IN" | grep -qE " [TDBC] $s\$" || { echo "[FAIL] base lacks $s"; exit 1; }
 done
@@ -37,16 +40,19 @@ sh "$HERE/src/check_page_geometry.sh" "$HERE/build/rtgfb_040.o" | sed 's/^/     
 if $OBJDUMP -d "$HERE/build/rtgfb_040.o" | grep -E "(mul|div)[su]l[.a-z]*\s+[^,]*,%d[0-7]:%d[0-7]"; then
 	echo "[FAIL] rtgfb_040.o has 64-bit mul/div forms (060 vector 61)"; exit 1; fi
 echo "[OK] no 64-bit mul/div forms"
-m68k-cbm-sysv4-ld -r -o "$OUT" "$IN" "$HERE/build/rtgfb_040.o" "$HERE/build/rtgfb_pad.o"
-for s in rtgfbinit rtgfbopen rtgfbclose rtgfbioctl rtgfbmmap; do
+# the boot chain amixdrv_init (src/amixdrv_init.s.in): jsr parinit, jsr rtgfbinit
+sed 's/^@INITS@$/\tjsr\trtgfbinit/' "$HERE/src/amixdrv_init.s.in" > "$HERE/build/amixdrv_init.s"
+m68k-cbm-sysv4-as -o "$HERE/build/amixdrv_init.o" "$HERE/build/amixdrv_init.s"
+m68k-cbm-sysv4-ld -r -o "$OUT" "$IN" "$HERE/build/rtgfb_040.o" "$HERE/build/rtgfb_pad.o" "$HERE/build/amixdrv_init.o"
+for s in rtgfbinit rtgfbopen rtgfbclose rtgfbioctl rtgfbmmap amixdrv_init; do
 	[ "$($NM "$OUT" | grep -cE " T $s\$")" -eq 1 ] || { echo "[FAIL] $s: not exactly one strong definition"; exit 1; }
 done
 LEAK=$($NM "$OUT" | awk '$1=="U" && $2!="edata" && $2!="end" && $2!="etext" {print $2}')
 [ -z "$LEAK" ] || { echo "[FAIL] unresolved:"; echo "$LEAK"; exit 1; }
 echo "[OK] symbols defined, none unresolved"
 run_step 8 python3 "$HERE/src/patch_rtgfb_cdevsw.py" "$OUT"
-# the board named at boot: io_init[0] parinit -> rtgfbinit (which calls parinit)
-run_step 2 python3 "$HERE/src/patch_rtgfb_init.py" "$OUT"
+# the board named at boot: io_init[0] parinit -> amixdrv_init (parinit, rtgfbinit)
+run_step 2 python3 "$HERE/src/patch_io_init.py" "$OUT" amixdrv_init
 CONTIG=$($READELF -SW "$OUT" | awk '{gsub(/[][]/,"")} $2==".text"{to=$5;ts=$6} $2==".data"{do_=$5} END{print to, ts, do_}')
 set -- $CONTIG; set -- $(( 0x$1 + 0x$2 )) $(( 0x$3 ))
 [ "$1" = "$2" ] && echo "[OK] text/data contiguous." || { echo "[FAIL] text/data NOT contiguous"; exit 1; }

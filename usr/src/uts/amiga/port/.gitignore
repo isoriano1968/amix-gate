@@ -61,3 +61,6 @@ local/muistiinpanot.txt
 
 # Transfer bundles for the guest -- regenerated on demand, never committed
 test-tools/*-bundle.tar
+
+# AMIX Installer kit tools (make-kit-tools.sh output)
+kit-tools/

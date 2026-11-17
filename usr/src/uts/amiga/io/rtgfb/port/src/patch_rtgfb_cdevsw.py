@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
-# patch_rtgfb_cdevsw.py -- register /dev/rtgfb (src/rtgfb.c) as cdevsw[54] after
-# rtgfb.o has been ld -r'd into the kernel (relink-030-rtgfb.sh on a stock 68030
-# kernel, relink-040-rtgfb.sh on a 68040/68060 port kernel).  The same
-# relocation-retarget mechanism as patch_random_cdevsw.py: d_open, d_close,
-# d_ioctl and d_mmap of slot 54 carry R_68K_32 relocations to `nodev` and are
-# retargeted to rtgfbopen/rtgfbclose/rtgfbioctl/rtgfbmmap; d_read and d_write
-# stay nodev (the device has no read/write).
-# Major 54 is nodev in stock AMIX 2.1c and 2.1p2a and in the port kernels
-# (48 random, 49 zz9000, 51 zen0, 53 paula, 67 Xsvga, 68 VA2000 are taken).
+# patch_rtgfb_cdevsw.py KERNEL -- register /dev/rtgfb (src/rtgfb.c) as cdevsw[54]
+# after rtgfb.o has been ld -r'd into the kernel (relink-030-rtgfb.sh on a stock
+# 68030 kernel, relink-040-rtgfb.sh on a 68040/68060 port kernel, the AMIX
+# Installer's rtgfb kit).  The same relocation-retarget mechanism as
+# patch_random_cdevsw.py: d_open, d_close, d_ioctl and d_mmap of slot 54 carry
+# R_68K_32 relocations to `nodev` and are retargeted to
+# rtgfbopen/rtgfbclose/rtgfbioctl/rtgfbmmap; d_read and d_write stay nodev (the
+# device has no read/write).
+# Major 54 is nodev in stock AMIX 2.1 and 2.1p2a and in the port kernels
+# (47 Hydra, 48 random, 49 zz9000, 51 zen0, 53 paula, 67 Xsvga, 68 VA2000).
 #
-# The slot offset is DERIVED from the cdevsw symbol (cdevsw + 54*52) and
-# asserted against cdevsw at .data 0x9dd4 (the same in the stock 2.1c/2.1p2a
-# kernels and every port kernel), so a layout drift aborts instead of patching
-# the wrong slot.  Idempotent; fails closed on any mismatch.
+# The slot is DERIVED from the cdevsw symbol (cdevsw + 54*52): cdevsw sits at
+# .data 0x9dd4 in 2.1p2a and the port kernels, at 0x9dd0 in the 2.1 kernel of
+# the installer's test disk.  What is asserted instead of an address: cdevsw is
+# a whole number of 52-byte entries and has slot 54, and every field this
+# retargets is an R_68K_32 relocation to `nodev` (or already ours).  Idempotent;
+# fails closed on any mismatch, all four fields or none.
 
 import struct, sys
 
 KERNEL = sys.argv[1]
 R_68K_32 = 1
 CDEVSW_MAJOR = 54
-EXPECT_SLOT_OFF = 0x9dd4 + 54 * 52
 ENTSIZE = 52                     # sizeof(struct cdevsw) on this kernel
 
 # (field index within the 52-byte entry, entry point): d_open, d_close, d_ioctl, d_mmap
@@ -53,26 +55,26 @@ def main():
 
     def sym_index(name):
         for i in range(sn):
-            if symname(i) == name:
+            if symname(i) == name and u16(b, so + i * se + 14) != 0:
                 return i
-        raise SystemExit("ABORT: symbol %s not found (was rtgfb.o ld -r'd in?)" % name)
+        raise SystemExit("ABORT: symbol %s not defined (was rtgfb.o ld -r'd in?)" % name)
 
     def sym_value(name):
         return u32(b, so + sym_index(name) * se + 4)
 
-    cdevsw = sym_value("cdevsw")
+    ci = sym_index("cdevsw")
+    cdevsw, csize = u32(b, so + ci * se + 4), u32(b, so + ci * se + 8)
+    if csize % ENTSIZE or csize < (CDEVSW_MAJOR + 1) * ENTSIZE:
+        raise SystemExit("ABORT: cdevsw is %d bytes: not whole %d-byte entries up to major %d"
+                         % (csize, ENTSIZE, CDEVSW_MAJOR))
     slot_off = cdevsw + CDEVSW_MAJOR * ENTSIZE
-    if slot_off != EXPECT_SLOT_OFF:
-        raise SystemExit("ABORT: computed cdevsw[%d] offset 0x%x != expected 0x%x "
-                          "-- cdevsw layout drifted, re-verify before patching"
-                          % (CDEVSW_MAJOR, slot_off, EXPECT_SLOT_OFF))
 
     rela = byname[".rela.data"]
     ro, re_ = rela["offset"], rela["entsize"]; rn = rela["size"] // re_
     reloc_at = {}
     for i in range(rn):
         o = ro + i * re_; roff = u32(b, o)
-        if slot_off <= roff < slot_off + 4 * 6:
+        if slot_off <= roff < slot_off + ENTSIZE:
             reloc_at[roff] = o
 
     done = skip = 0

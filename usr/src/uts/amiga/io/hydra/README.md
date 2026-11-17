@@ -146,6 +146,22 @@ Add to `/etc/inet/network-config` (sourced by `/etc/rc2.d/S69inet`):
 
 The `hya -S` line silently exits the script if no Hydra board is detected, preventing the boot script from hanging on `slink`.
 
+### AMIX Installer kit
+
+`port/make-kit-030.sh` (with `AMIX_ROOT` set to an AMIX 2.1c tree) builds the
+kit the AMIX Installer links into a user's stock 68030 `/stand/unix`, which
+has neither slot 47 nor `hydraintr` in its tables:
+
+- `cdevsw[47].d_str` -> `hydrainfo` (`port/src/patch_hydra_cdevsw.py`): the
+  slot's `d_xhalt` relocation (to `nodev`, read by no kernel code) is moved to
+  `d_str`, by symbol;
+- `int2_tbl[]`'s `aenintr` entry -> `hydra_int2` (`port/src/hydra_int2.s`,
+  `patch_hydra_int2.py`), which calls `aenintr` and then `hydraintr`;
+- `hydrainit` booted through the driver chain `amixdrv_init` (amix-gate's
+  `port/src/amixdrv_init.s.in` and `patch_io_init.py`).
+
+The kit lands in `port/kit` (gitignored).
+
 ## hya Control Utility
 
 The `hya` tool (in `usr/sys/amiga/driver/hydra/hya/`) is a user-space utility for checking Hydra board presence and reading configuration. It is modeled after the `aen` tool for the A2065 card.

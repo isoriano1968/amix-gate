@@ -1,0 +1,36 @@
+--- a/src/va2000.c
++++ b/src/va2000.c
+@@ -186,7 +186,19 @@
+         printf("va2000: framebuffer cache class NOT registered\n");
+ #else
+     /* Vanilla 68030 kernel: the board is in transparently translated space, and
+-     * there is no cache-class selector to register a framebuffer with. */
++     * there is no cache-class selector to register a framebuffer with.  That
++     * holds for the Zorro II space only (0x200000-0xa00000, 0xe80000-0xf00000):
++     * a Zorro III board sits at 0x40000000 or above, inside this kernel's own
++     * virtual space, where a dereference silently hits kernel memory.  Such a
++     * board is named and left alone (it needs the 68040/68060 kernel's KVA). */
++    if (!(((unsigned long)va2000_boards[dev] >= 0x00200000UL &&
++           (unsigned long)va2000_boards[dev] < 0x00a00000UL) ||
++          ((unsigned long)va2000_boards[dev] >= 0x00e80000UL &&
++           (unsigned long)va2000_boards[dev] < 0x00f00000UL))) {
++        printf("va2000: board at 0x%x is outside Zorro II: not usable with this kernel\n",
++               va2000_boards[dev]);
++        return 0;
++    }
+     va2000_regs[dev] = va2000_boards[dev];
+ #endif
+     return va2000_regs[dev] ? 1 : 0;
+@@ -321,7 +333,12 @@
+ 
+     size = 0;
+     if (!autocon(VA2000_PRODUCT, 0, &va2000_boards[0], &size)) {
++        /* No board: silent.  The kernel may carry several card drivers, and
++         * each reports only the hardware it finds (VA2000_DEBUG: the line). */
++#ifdef VA2000_DEBUG
+         printf("va2000: no board found\n");
++#endif
++        va2000_boards[0] = 0;
+         return;
+     }
+ 

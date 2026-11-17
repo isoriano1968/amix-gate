@@ -1,0 +1,23 @@
+| amixdrv_init.s -- the boot chain of the drivers linked into this kernel.
+|
+| Generated from amixdrv_init.s.in (amix-gate uts/amiga/port/src) by the AMIX
+| Installer, or by a relink script, for the drivers chosen: the line
+| @INITS@ becomes one `jsr <init>` per driver that has one (KIT.info init=),
+| graphics before network.  Assemble with m68k-cbm-sysv4-as, link it after the
+| driver objects, then run `patch_io_init.py KERNEL amixdrv_init`.
+|
+| AMIX's main() walks io_init[] = { parinit, 0 } once at boot; the table has
+| no spare slot, so patch_io_init.py retargets its one relocation from parinit
+| to amixdrv_init.  parinit (the parallel port, by symbol: whatever parinit is
+| in this kernel) runs first, exactly as before, then each driver's probe.
+| io_init[] routines take no arguments and their return values are not used;
+| each init is C and keeps the registers the C calling convention keeps.
+| .text stays a multiple of 4 bytes, so the kernel's .data follows it directly.
+
+	.text
+	.globl	amixdrv_init
+amixdrv_init:
+	jsr	parinit
+@INITS@
+	rts
+	.align	4

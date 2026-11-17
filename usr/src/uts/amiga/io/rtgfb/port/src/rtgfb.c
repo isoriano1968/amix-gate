@@ -12,10 +12,11 @@
  *   - switches the monitor between the Amiga video and the card
  *     (SVGAIOCSet/GetMonitorSwitch, and back to the Amiga video on the last
  *     close, so a server that dies leaves a usable picture).
- * It looks for its board once, at boot (rtgfbinit, called from io_init[]
- * ahead of parinit, see src/patch_rtgfb_init.py), and names the board it
- * finds on the console; without a board it says nothing, and every open is
- * a cheap ENXIO.  A kernel linked without that hook looks at the first open.
+ * It looks for its board once, at boot (rtgfbinit, called after parinit by
+ * the kernel's driver chain amixdrv_init, see port/src/amixdrv_init.s.in and
+ * patch_io_init.py), and names the board it finds on the console; without a
+ * board it says nothing, and every open is a cheap ENXIO.  A kernel linked
+ * without the chain looks at the first open.
  *
  * Boards (rtgfb_boardtab): the Village Tronic Picasso II and II+ (Cirrus
  * Logic GD5426/GD5428, Zorro II, 1 or 2 MB).  Their AutoConfig numbers are
@@ -50,7 +51,6 @@
 #include "rtgfb.h"
 
 extern int autocon();
-extern int parinit();
 #ifdef RTGFB_FB_NC
 extern int hat_cm_fb_add();
 #endif
@@ -228,13 +228,13 @@ int unit;
 }
 
 /*
- * Boot: io_init[] calls this in parinit's place (src/patch_rtgfb_init.py);
- * parinit runs first, as before, then the one AutoConfig search.
+ * Boot: the driver chain amixdrv_init (io_init[0], after parinit) calls this
+ * once: the one AutoConfig search, the board named on the console, silent
+ * without one.  It does not call parinit: the chain does, first.
  */
 void
 rtgfbinit()
 {
-	(void) parinit();
 	(void) rtgfb_attach(0);
 }
 
