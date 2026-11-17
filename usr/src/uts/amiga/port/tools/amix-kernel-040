@@ -58,7 +58,8 @@
 # The result is a 68040/68060 kernel only: it boots natively from pvmk
 # (68040 and 68060), never on a 68030, and the stock kernel is no fallback
 # on a 68040/68060 (it does not run there).
-# Needs: m68k-cbm-sysv4-{gcc,as,ld} (developer/amix/gcc-27); a modern GNU m68k
+# Needs: GNU tar (gtar or /usr/gnu/bin/tar on illumos: archiver/gnu-tar),
+# python3, m4 (z3660), patch; m68k-cbm-sysv4-{gcc,as,ld} (developer/amix/gcc-27); a modern GNU m68k
 # ELF toolchain, gcc (as the assembler driver for the Motorola FPSP/ISP
 # packages and the FPSP glue) and binutils as, ld, nm, objcopy, objdump,
 # readelf, size: m68k-elf-* (developer/amix/gcc-14, /opt/m68k-amix/bin: gcc 14,
@@ -155,7 +156,11 @@ trap cleanup EXIT; trap 'exit 130' INT TERM
 rm -rf "$W"; mkdir -p "$W/port" "$W/bin" "$W/amix/stand"
 # only what the chain uses (make-kernel-040-kit.sh ships the same list), so a
 # build from amix-gate and one from the kit hash the same tree: same build id
-(cd "$PORT" && tar cf - --exclude=__pycache__ $PORT_FILES) | (cd "$W/port" && tar xf -)
+# plain tar (Solaris tar has no --exclude); then no __pycache__, and
+# writable: the kit is installed read-only (IPS 0444), the stages edit files
+(cd "$PORT" && tar cf - $PORT_FILES) | (cd "$W/port" && tar xf -)
+find "$W/port" -name __pycache__ -type d -prune -exec rm -rf {} +
+chmod -R u+w "$W/port"
 P=$W/port
 # the inputs that decide the result: port tree (file names + contents) and options
 TREE=$(cd "$P" && find . -type f | LC_ALL=C sort | while read -r f; do printf '%s %s\n' "$(sha "$f")" "$f"; done | \
@@ -166,6 +171,14 @@ cp "$BASE" "$W/amix/stand/unix"; chmod 644 "$W/amix/stand/unix"
 for t in objcopy nm readelf objdump ld as gcc cpp size; do
 	command -v $GNU-$t >/dev/null 2>&1 && ln -s "$(command -v $GNU-$t)" "$W/bin/m68k-linux-gnu-$t"
 done
+# GNU tar for the NetBSD extraction (xzf -C --exclude, build-fpsp*.sh,
+# build-isp060.sh): gtar or /usr/gnu/bin/tar on illumos, tar on Linux
+GTAR=
+for t in gtar /usr/gnu/bin/tar tar; do
+	command -v $t >/dev/null 2>&1 && $t --version 2>/dev/null | grep -q "GNU tar" && { GTAR=$(command -v $t); break; }
+done
+[ -n "$GTAR" ] || fail "GNU tar needed (OpenIndiana: archiver/gnu-tar; Debian: tar)"
+[ "$GTAR" = "$(command -v tar)" ] || ln -s "$GTAR" "$W/bin/tar"
 CROSS=$(cd "$(dirname "$(command -v m68k-cbm-sysv4-ld)")/.." && pwd)
 # NetBSD 10.1 syssrc.tgz, pinned (tools/netbsd-pin.sh checks it)
 if [ -z "$TGZ" ]; then

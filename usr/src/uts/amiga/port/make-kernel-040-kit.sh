@@ -29,7 +29,9 @@ OUT=${1:-$HERE/kernel-040-kit}
 VERSION=0.1
 rm -rf "$OUT"; mkdir -p "$OUT/port" "$OUT/io"
 eval "$(grep '^PORT_FILES=' "$HERE/tools/amix-kernel-040")"
-(cd "$HERE" && tar cf - --exclude=__pycache__ $PORT_FILES) | (cd "$OUT/port" && tar xf -)
+# plain tar (Solaris tar has no --exclude), then drop any __pycache__
+(cd "$HERE" && tar cf - $PORT_FILES) | (cd "$OUT/port" && tar xf -)
+find "$OUT/port" -name __pycache__ -type d -prune -exec rm -rf {} +
 ZZ=zz9000/overlay/usr/sys/amiga/driver/zz9000
 (cd "$HERE/../io" && tar cf - z3660scsi/LICENSE z3660scsi/src/z3660.c z3660scsi/port/patches \
 	z3660net/LICENSE z3660net/src/z3660eth.c z3660net/src/z3660eth.h z3660net/src/z3660ethuser.h \
