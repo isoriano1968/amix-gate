@@ -1,0 +1,7 @@
+zz9000eth -- trademark and third-party notice
+
+This project and its developers are not affiliated with, endorsed by, or sponsored by Amiga Corporation. Amiga is a registered trademark of Amiga Corporation.
+
+This directory is source code only and ships no Amiga or Amiga UNIX binaries; AmigaOS and Amiga UNIX are trademarks of their respective owners, and UNIX is a registered trademark of The Open Group. ZZ9000 is a product of MNT Research GmbH; this driver is not affiliated with or endorsed by MNT Research.
+
+The driver is derived from z3660eth by Jussi Alanärä (MIT, ../z3660net). The ZZ9000 interface it uses was read from MNT Research's ZZ9000 firmware and ZZ9000Net.device sources (GPL-3.0-or-later); no code was taken from them.

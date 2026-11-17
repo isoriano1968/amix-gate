@@ -34,32 +34,14 @@ VERSION=0.1
 
 B="$HERE/build/va2000kit040"; rm -rf "$B"; mkdir -p "$B"
 va2000_fetch "$B"
-# the Model-B header set: the cross compiler's sysroot mirrored, with sys/immu.h
-# and sys/param.h from port/include-modelb (as src/mk_modelb_sysroot.sh does)
-GCC=$(command -v m68k-cbm-sysv4-gcc)
-REAL=$(cd "$(dirname "$GCC")/.." && pwd)/m68k-cbm-sysv4/sysroot
-[ -d "$REAL/usr/include/sys" ] || { echo "no cross sysroot at $REAL" >&2; exit 1; }
-SR="$B/sysroot-modelb"; mkdir -p "$SR/usr/include/sys"
-for e in "$REAL"/usr/*; do [ "$(basename "$e")" = include ] || ln -s "$e" "$SR/usr/"; done
-for e in "$REAL"/usr/include/*; do [ "$(basename "$e")" = sys ] || ln -s "$e" "$SR/usr/include/"; done
-for e in "$REAL"/usr/include/sys/*; do ln -s "$e" "$SR/usr/include/sys/"; done
-for h in immu param; do
-	rm -f "$SR/usr/include/sys/$h.h"
-	ln -s "$REAL/usr/include/sys/$h.h" "$SR/usr/include/sys/${h}_stock.h"
-	cp "$PORT/include-modelb/sys/$h.h" "$SR/usr/include/sys/"
-done
-CF=$(echo "$AMIX_KERNEL_CFLAGS" | sed 's/-m68020/-m68040/')
-AMIX_SYSROOT="$SR" m68k-cbm-sysv4-gcc $CF -c "$PORT/src/modelb_geom_probe.c" -o "$B/probe.o" || {
-	echo "[FAIL] the Model-B geometry probe does not compile through $SR"; exit 1; }
-if AMIX_SYSROOT="$REAL" m68k-cbm-sysv4-gcc $CF -c "$PORT/src/modelb_geom_probe.c" -o /dev/null 2>/dev/null; then
-	echo "[FAIL] the geometry probe compiles against the stock sysroot too: it proves nothing"; exit 1; fi
-echo "[OK] Model-B headers (port/include-modelb) in the compile"
+# the Model-B header set (port/tools/kit-lib.sh): KIT_SYSROOT, KIT_CF040
+kit_modelb_sysroot "$B"
 # va2000_modelb.py writes PORT/build/va2000_040.c (+ va2000.h): the port's own step
 mkdir -p "$PORT/build"
 VA2000_SRC="$VA2000_TREE/src/va2000.c" python3 "$PORT/src/va2000_modelb.py"
 mv "$PORT/build/va2000_040.c" "$PORT/build/va2000.h" "$B/"
 va2000_patch "$B/va2000_040.c"
-(cd "$B" && AMIX_SYSROOT="$SR" m68k-cbm-sysv4-gcc $CF -Dsigned=__signed__ -DVA2000_KVA -I. \
+(cd "$B" && AMIX_SYSROOT="$KIT_SYSROOT" m68k-cbm-sysv4-gcc $KIT_CF040 -Dsigned=__signed__ -DVA2000_KVA -I. \
 	-c va2000_040.c -o va2000_040.o)
 OBJDUMP=$OBJDUMP sh "$PORT/src/check_page_geometry.sh" "$B/va2000_040.o"
 if $OBJDUMP -d "$B/va2000_040.o" | grep -E "(mul|div)[su]l[.a-z]*\s+[^,]*,%d[0-7]:%d[0-7]"; then
