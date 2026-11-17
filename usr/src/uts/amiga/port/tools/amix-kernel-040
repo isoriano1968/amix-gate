@@ -23,6 +23,14 @@
 #                       Z3660_RTG_SRC (dir) override them.  The console font
 #                       is made from usr/sys amiga/console/sunfont.s
 #                       (tools/sunfont-gas.py); SUNFONT_O overrides it.
+#   --root-card N --root-unit U
+#                       stamp root (slice 1) and swap (slice 2) on dd/sd
+#                       card N unit U (tools/stamp-rootcard.py): c<(N<<3)|U>d0
+#                       in hex, e.g. card 1 unit 6 = ced0s1.  Default: the
+#                       z3660 variant card 1 unit 0 (c8d0s1, the box), the
+#                       generic variant the stock c6d0s1
+#   --root-stock        leave rootdev and swap at the stock c6d0s1/c6d0s2
+#                       (the caller stamps them)
 #   --no-serial         without the serial console mirror (relink-040-serkeep.sh)
 #   --kvseg MB          kvseg size (default 32: page array for 1 GB fits)
 #   --nswap BLOCKS      swapfile.nswap (512-byte blocks) of the result: the
@@ -57,13 +65,16 @@ set -e
 ME=$(basename "$0")
 HERE=$(cd "$(dirname "$0")" && pwd)
 if [ -f "$HERE/port/relink-040.sh" ]; then PORT=$HERE/port; else PORT=$(cd "$HERE/.." && pwd); fi
-VARIANT=generic SERIAL=1 KVSEG=32 NSWAP= BUILDID= TGZ=${NETBSD_SYSSRC:-} AMIXSYS= KEEP=0 IO=
+VARIANT=generic SERIAL=1 KVSEG=32 NSWAP= ROOTCARD= ROOTUNIT= ROOTSTOCK=0 BUILDID= TGZ=${NETBSD_SYSSRC:-} AMIXSYS= KEEP=0 IO=
 while [ $# -gt 0 ]; do
 	case $1 in
 	--variant) VARIANT=$2; shift 2 ;;
 	--no-serial) SERIAL=0; shift ;;
 	--kvseg) KVSEG=$2; shift 2 ;;
 	--nswap) NSWAP=$2; shift 2 ;;
+	--root-card) ROOTCARD=$2; shift 2 ;;
+	--root-unit) ROOTUNIT=$2; shift 2 ;;
+	--root-stock) ROOTSTOCK=1; shift ;;
 	--buildid) BUILDID=$2; shift 2 ;;
 	--netbsd) TGZ=$2; shift 2 ;;
 	--port) PORT=$(cd "$2" && pwd); shift 2 ;;
@@ -81,6 +92,17 @@ BASE=$1; OUT=$2
 case $VARIANT in generic|z3660) ;; *) echo "$ME: --variant generic|z3660" >&2; exit 2 ;; esac
 case $KVSEG in ''|*[!0-9]*) echo "$ME: --kvseg MB" >&2; exit 2 ;; esac
 case $NSWAP in *[!0-9]*) echo "$ME: --nswap BLOCKS" >&2; exit 2 ;; esac
+case $ROOTCARD$ROOTUNIT in *[!0-9]*) echo "$ME: --root-card/--root-unit take numbers" >&2; exit 2 ;; esac
+if [ -n "$ROOTCARD$ROOTUNIT" ]; then
+	[ -n "$ROOTCARD" ] && [ -n "$ROOTUNIT" ] || { echo "$ME: give --root-card and --root-unit together" >&2; exit 2; }
+	[ "$ROOTSTOCK" = 0 ] || { echo "$ME: --root-stock or --root-card/--root-unit, not both" >&2; exit 2; }
+	[ "$ROOTCARD" -le 1 ] && [ "$ROOTUNIT" -le 7 ] || { echo "$ME: card 0..1 (SDCARDS=2), unit 0..7" >&2; exit 2; }
+elif [ "$ROOTSTOCK" = 0 ] && [ "$VARIANT" = z3660 ]; then
+	ROOTCARD=1 ROOTUNIT=0
+fi
+# card 0 unit 6 is the stock rootdev: nothing to stamp
+[ "$ROOTCARD.$ROOTUNIT" = 0.6 ] && ROOTCARD= ROOTUNIT=
+ROOT=stock; [ -n "$ROOTCARD" ] && ROOT=c$(printf %x $(( (ROOTCARD << 3) | ROOTUNIT )))d0
 [ -z "$BUILDID" ] || [ ${#BUILDID} -eq 9 ] || { echo "$ME: --buildid takes 9 characters" >&2; exit 2; }
 [ -f "$PORT/relink-040.sh" ] && [ -f "$PORT/relink-040-memspan.sh" ] || {
 	echo "$ME: $PORT is not a port tree with the memspan chain" >&2; exit 1; }
@@ -261,10 +283,17 @@ if [ "$VARIANT" = z3660 ]; then
 	step sh relink-040-vt.sh build/z3 build/z4
 	step sh relink-040-audio.sh build/z4 build/z5
 	step sh relink-040-paula.sh build/z5 build/z6
-	step python3 tools/stamp-rootcard.py build/z6 build/z7 --card 1 --unit 0
+	if [ -n "$ROOTCARD" ]; then
+		step python3 tools/stamp-rootcard.py build/z6 build/z7 --card $ROOTCARD --unit $ROOTUNIT
+	else
+		step cp build/z6 build/z7
+	fi
 	step python3 tools/patch-kernel-cacr.py build/z7 build/z8 a0c08000
 	step sh relink-040-random.sh build/z8 build/z9
 	S=build/z9
+elif [ -n "$ROOTCARD" ]; then
+	step python3 tools/stamp-rootcard.py $S build/g1-root --card $ROOTCARD --unit $ROOTUNIT
+	S=build/g1-root
 fi
 step sh relink-040-shm.sh $S build/s3-shm
 step sh relink-040-ksegtbl.sh build/s3-shm build/s4-ksg
@@ -312,6 +341,7 @@ serial=$SERIAL
 kvseg_mb=$KVSEG
 buildid=68040-$BUILDID
 nswap=$FNSWAP
+root=$ROOT
 base_sha256=$(sha "$BASE")
 base_code_sha256=$BNORM
 port_tree_sha256=$TREE
