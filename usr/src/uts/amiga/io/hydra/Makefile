@@ -1,4 +1,4 @@
-CFLAGS	= -O -D_KERNEL -DSVR40 -DSVR4 -I../../.. -I../../inc $(KDB)
+CFLAGS	= -O -D_KERNEL -DSVR40 -DSVR4 -I../../.. -I../../inc -I../dp8390 $(KDB)
 
 OBJ	= hydra.o
 
@@ -8,4 +8,4 @@ exp:	$(OBJ)
 clean:
 	-rm -f $(OBJ) exp
 
-hydra.o : hydra.h hydrauser.h ne2000.h ../kdb/kdebug.h
+hydra.o : hydrauser.h ../dp8390/dp8390.c ../dp8390/dp8390.h ../dp8390/dp8390reg.h

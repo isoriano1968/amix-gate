@@ -72,16 +72,35 @@ usr/
 
 ## Driver Architecture
 
-The driver is a STREAMS DLPI provider (`struct streamtab hydrainfo`) registered at cdevsw slot 47, using major/minor device `hya`. It follows the same pattern as the A2065 (`aen`) driver:
+The driver is a STREAMS DLPI provider (`struct streamtab hydrainfo`) registered at cdevsw slot 47, using major/minor device `hya`. It follows the same pattern as the A2065 (`aen`) driver.
 
-- **`hydraopen()`** - STREAMS open; calls `hydraautoconfig()` to detect the card, then `hydra_initialize()` to set it up
-- **`hydraautoconfig()`** - three-method card detection (runs once, cached):
-  1. `autocon(NE8390_BOARD_ID, ...)` - uses kernel's bootinfo autoconfig table with Zorro II address validation
-  2. Direct Zorro II I/O slot probe - reads MAC PROM at each 64 KB slot (0xE90000-0xEFFFFF)
-  3. Memory space probe - scans Zorro II memory space (0x200000-0x9FFFFF) at 64 KB steps
-- **`hydrawput()`** - STREAMS write-side put procedure, handles DLPI primitives (DL_INFO_REQ, DL_BIND_REQ, DL_UNITDATA_REQ, etc.)
-- **`hydraintr()`** - INT2 interrupt handler, registered in `int2_tbl[]`, processes RX/TX/error interrupts from the DP8390
-- **`setup_ne2000()`** - initializes the DP8390 registers, ring buffers, and physical address
+Since hydra-kit 0.3 the STREAMS/DLPI layer, the receive ring, transmit,
+overrun recovery and the diagnostic ioctls are the shared DP8390 core
+`../dp8390/dp8390.c`, which `hydra.c` includes after its Hydra backend (the
+X-Surf 100 driver `../xsurf100` uses the same core). `hydra.c` itself holds
+only what is Hydra-specific:
+
+- the NIC at board + 0xffe1, register *n* at + *n* * 2, with the chip-select
+  delay;
+- the 16 KB buffer RAM read and written directly, a longword at a time, at
+  the board base;
+- the station address PROM at board + 0xffc0 (every other byte), with the
+  DP8390 PAR registers as fallback;
+- AutoConfig (2121/1) with the Zorro II address check, the reset, and the
+  register-6 filter of the test ioctl;
+- the glue: `hydrainfo`, `hydraintr()` (level 2), `hydrainit()` (boot probe,
+  silent).
+
+The core fixes these bugs of hydra-kit 0.2 and earlier: the counter
+interrupt (CNT) read only CNTR0, so CNTR1/CNTR2 past 128 kept the level-2
+line asserted; trailer frames read up to 8 KB past the 1518-byte receive
+buffer (they are dropped now); a ring overrun (OVW) had no recovery (the
+DP8390 datasheet procedure now); a bad ring header reset BNRY but not CURR
+(it resynchronises to CURR now); the empty write service procedure left
+queued frames behind after a transmit error; DLPI acknowledgements were not
+sent when allocb failed (now the request's block is reused, or a bufcall
+waits); the ioctls did not check `b_cont` and its size, and the register and
+RAM tests did not need privilege (`drv_priv`).
 
 ## Building
 
@@ -96,7 +115,7 @@ The driver is compiled natively on the Amiga under AMIX. No cross-compiler is re
 
 ```sh
 su
-cd /usr/sys/amiga/driver/hydra
+cd /usr/sys/amiga/driver/hydra   # with ../dp8390 beside it
 make
 ```
 
@@ -155,8 +174,10 @@ has neither slot 47 nor `hydraintr` in its tables:
 - `cdevsw[47].d_str` -> `hydrainfo` (`port/src/patch_hydra_cdevsw.py`): the
   slot's `d_xhalt` relocation (to `nodev`, read by no kernel code) is moved to
   `d_str`, by symbol;
-- `int2_tbl[]`'s `aenintr` entry -> `hydra_int2` (`port/src/hydra_int2.s`,
-  `patch_hydra_int2.py`), which calls `aenintr` and then `hydraintr`;
+- `int2_tbl[]`'s `aenintr` entry -> the installer's level-2 chain
+  `amixdrv_int2` (amix-gate's `port/src/amixdrv_int2.s.in` and
+  `patch_int2.py`; the kit declares `intr=hydraintr`), which calls `aenintr`
+  and then every chosen driver's interrupt routine;
 - `hydrainit` booted through the driver chain `amixdrv_init` (amix-gate's
   `port/src/amixdrv_init.s.in` and `patch_io_init.py`).
 
