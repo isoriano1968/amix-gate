@@ -11,7 +11,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/tools/build-step.sh"
 IN="$1"; OUT="$2"
 [ -f "$IN" ] && [ -n "$OUT" ] || { echo "usage: $0 base-with-z3660 output"; exit 1; }
-RTG="${Z3660_RTG_SRC:-$HERE/../amix-z3660rtg/overlay/usr/sys/amiga/driver/zz9000}"
+RTG="${Z3660_RTG_SRC:-$HERE/../io/zz9000/overlay/usr/sys/amiga/driver/zz9000}"
 [ -f "$RTG/zz9000.c" ] || { echo "ERROR: zz9000.c not found in $RTG"; exit 1; }
 NM=m68k-linux-gnu-nm
 $NM "$IN" | grep -qE " T z3660queue$" || { echo "[FAIL] base has no Z3660 drivers -- use relink-040-z3660.sh output"; exit 1; }

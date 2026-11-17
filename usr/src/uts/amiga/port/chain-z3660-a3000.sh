@@ -12,11 +12,12 @@
 #      step 3: also the regions above it, i.e. the Z3 RAM pvmk's z3reloc
 #      moves to 0x20000000, and the RAM counted in anoninfo.ani_max)
 # 512 MB (after z3reloc, boot -m #256): BASE=build/a3k-kv32-ser (the page
-# array grows to ~10 MB) and Z3660_RTG_SRC=<amix-gate>/.../driver/zz9000;
+# array grows to ~10 MB); the RTG driver is ../io/zz9000 (Z3660_RTG_SRC);
 # built 2026-11-07 as build/z3l/m5-msp.
 # From $BASE, default build/a3k-kv16-ser (relink-040-kvseg.sh KVSEG_MB=16 + relink-040-serkeep.sh
-# on build/unix-040).  The driver sources come from the amix-z3660scsi and
-# amix-z3660net checkouts (branches zs05-amigaux, eth-amigaux-1.0.0-7).
+# on build/unix-040).  Z3660_SCSI_SRC/Z3660_NET_SRC (config.sh): ../io/z3660scsi and
+# ../io/z3660net src/ with their port/patches/ applied (= zs05, eth 1.0.0-7);
+# tools/amix-kernel-040 --variant z3660 does that preparation itself.
 # Outputs build/z3l/PREFIX-<stage>; never touches the existing images.  The
 # build-id block is per day: past it, stamp the last stage by hand.
 set -e
@@ -32,7 +33,7 @@ sh relink-040-vt.sh     $O/$P-int   $O/$P-con
 sh relink-040-audio.sh  $O/$P-con   $O/$P-aud
 sh relink-040-paula.sh  $O/$P-aud   $O/$P-paula2
 python3 tools/stamp-rootcard.py $O/$P-paula2 $O/$P-paula2-c1u0x --card 1 --unit 0
-python3 ../port-kernel/tools/patch-kernel-cacr.py $O/$P-paula2-c1u0x $O/$P-paula2-c1u0 a0c08000
+python3 tools/patch-kernel-cacr.py $O/$P-paula2-c1u0x $O/$P-paula2-c1u0 a0c08000
 sh relink-040-random.sh $O/$P-paula2-c1u0 $O/$P-rnd2
 sh relink-040-shm.sh    $O/$P-rnd2 $O/$P-shm
 sh relink-040-ksegtbl.sh $O/$P-shm $O/$P-ksg
