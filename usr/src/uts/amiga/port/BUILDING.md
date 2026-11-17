@@ -31,7 +31,7 @@ and `tools/check-env.sh` checks the same pin at pre-flight — so the requiremen
 rather than documented. The one release the pin knows:
 
 ```
-https://cdn.netbsd.org/pub/NetBSD/NetBSD-10.1/source/sets/syssrc.tgz
+http://archive.netbsd.org/pub/NetBSD-archive/NetBSD-10.1/source/sets/syssrc.tgz
 79497697 bytes
 sha256  76a600e703d2e964753323e264d3ec07d0c6cbe134648fc8f0f13ed9faaa1be4
 sha512  766ac21f33cfe0e701dfedb894fa07f36d811da1a12e979181e8fca7af4e627852680ce42a7b29e97dd3e2e402ddf9ae7bfba60c8d7dc6b8a3354d8ce8c06926
