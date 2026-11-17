@@ -32,7 +32,7 @@ PORT=$(cd "$HERE/../../../port" && pwd)
 . "$HERE/fetch-source.sh"
 kit_env
 OUT=${1:-$HERE/kit}
-VERSION=0.1
+VERSION=0.3
 
 B="$HERE/build/va2000kit030"; rm -rf "$B"; mkdir -p "$B"
 va2000_fetch "$B"

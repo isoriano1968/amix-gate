@@ -10,7 +10,9 @@
 #                           (port/include-modelb) with -DVA2000_KVA: registers
 #                           through dev_kvmap, framebuffer via hat_cm_fb_add,
 #                           Zorro II and Zorro III
-#   devkvmap040.o           port/src/devkvmap040.s: dev_kvmap/dev_kvunmap
+#   devkvmap040.o           port/src/devkvmap040.s: dev_kvmap/dev_kvunmap,
+#                           KIT.info provides=: left out by the relink when
+#                           the base has them (the z3660 variant, m6-msp)
 #   va2000_pad.o            pads the kernel's .data back to a multiple of 4
 #   patch_va2000_cdevsw.py  cdevsw[68] (by symbol, asserting nodev)
 #   patch_io_init.py        io_init[0] parinit -> amixdrv_init (port/src)
@@ -19,7 +21,9 @@
 #
 # Unlike relink-040-va2000.sh it does not wrap parinit (weaken + parinit_orig):
 # va2000init runs from the amixdrv_init chain like every kit's init.  The base
-# must be a port kernel (cputype) with hat_cm_fb_add and without dev_kvmap.
+# must be a port kernel (cputype) with hat_cm_fb_add; with or without
+# dev_kvmap (a kernel that has it keeps its own, devkvmap040.o is left out:
+# port/tools/kit-relink.sh, the installer's kernel.py).
 #
 # Kernel code is compiled with the gcc 2.7.2.3 cross compiler only.  Needs
 # AMIX_ROOT and m68k-cbm-sysv4-gcc on PATH, as make-kit-030.sh.
@@ -30,7 +34,7 @@ PORT=$(cd "$HERE/../../../port" && pwd)
 . "$HERE/fetch-source.sh"
 kit_env
 OUT=${1:-$HERE/kit-040}
-VERSION=0.1
+VERSION=0.3
 
 B="$HERE/build/va2000kit040"; rm -rf "$B"; mkdir -p "$B"
 va2000_fetch "$B"
@@ -58,8 +62,8 @@ cp "$B/va2000_040.o" "$B/devkvmap040.o" "$B/va2000_pad.o" "$HERE/src/patch_va200
 	"$KIT_IOINIT" "$KIT_RELOCS" "$OUT/"
 cp "$VA2000_TREE/src/LICENSE" "$OUT/LICENSE.va2000"
 kit_info "$OUT" id=va2000 version=$VERSION major=68 node=/dev/va2000 line=040 init=va2000init \
-	"entries=va2000init va2000open va2000close va2000read va2000write va2000ioctl va2000mmap dev_kvmap dev_kvunmap" \
-	streams=no
+	"entries=va2000init va2000open va2000close va2000read va2000write va2000ioctl va2000mmap" \
+	"provides=dev_kvmap dev_kvunmap" streams=no
 kit_sums "$OUT" va2000_040.o devkvmap040.o va2000_pad.o patch_va2000_cdevsw.py patch_io_init.py \
 	check_relink_relocs.py LICENSE.va2000 KIT.info
 rm -rf "$B"

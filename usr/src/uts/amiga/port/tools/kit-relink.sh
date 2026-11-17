@@ -12,12 +12,17 @@
 #     aenintr, then each kit's KIT.info intr= in order (only when a kit has
 #     one); assembled with m68k-cbm-sysv4-as;
 #  3. m68k-cbm-sysv4-ld -r BASE, every kit's *.o in KIT.sha256 order, the stubs;
+#     except an object whose global definitions are all in its kit's KIT.info
+#     provides= AND all defined in BASE already (va2000-040's devkvmap040.o
+#     in a kernel that has dev_kvmap, e.g. the z3660 variant): it is left
+#     out, and must have no .data (the kit's pad counts none for it).  Some
+#     but not all of them in BASE fails;
 #  4. every kit's patch_*.py in KIT.sha256 order, except patch_io_init.py and
 #     patch_int2.py;
 #  5. patch_int2.py OUT amixdrv_int2, once (when a kit has intr=);
 #  6. patch_io_init.py OUT amixdrv_init, once;
-#  7. checks: every KIT.info entries= symbol, init and intr, and amixdrv_init/
-#     amixdrv_int2, defined exactly once; nothing unresolved; .text and .data
+#  7. checks: every KIT.info entries= and provides= symbol, init and intr, and
+#     amixdrv_init/amixdrv_int2, defined exactly once; nothing unresolved; .text and .data
 #     contiguous; .data a multiple of 4; check_relink_relocs.py (the loader's
 #     relocation pass).
 # BASE is only read.  Needs m68k-cbm-sysv4-{as,ld} and m68k ELF binutils.
@@ -50,10 +55,28 @@ for K in "$@"; do
 	grep -q " KIT.info$" "$K/KIT.sha256" || { echo "[FAIL] $K: KIT.info not in KIT.sha256"; exit 1; }
 	(cd "$K" && sha256sum -c --quiet KIT.sha256) || { echo "[FAIL] $K: KIT.sha256"; exit 1; }
 	[ "$(info "$K" line)" = "$LINE" ] || { echo "[FAIL] $K: line=$(info "$K" line), not $LINE"; exit 1; }
-	for f in $(awk '$2 ~ /\.o$/ {print $2}' "$K/KIT.sha256"); do OBJS="$OBJS $K/$f"; done
+	PROV=$(info "$K" provides)
+	for f in $(awk '$2 ~ /\.o$/ {print $2}' "$K/KIT.sha256"); do
+		if [ -n "$PROV" ]; then
+			DEFS=$($NM "$K/$f" | awk 'NF==3 && $2 ~ /^[A-TV-Z]$/ {print $3}')
+			ALL=1 INBASE=0 NOTBASE=0
+			for d in $DEFS; do
+				case " $PROV " in *" $d "*) ;; *) ALL=0 ;; esac
+				if $NM "$BASE" | grep -qE " [TDBC] $d\$"; then INBASE=$((INBASE + 1)); else NOTBASE=$((NOTBASE + 1)); fi
+			done
+			if [ -n "$DEFS" ] && [ $ALL = 1 ] && [ $INBASE -gt 0 ]; then
+				[ $NOTBASE = 0 ] || { echo "[FAIL] $K/$f: base defines only some of" $DEFS; exit 1; }
+				DS=$($READELF -SW "$K/$f" | awk '{gsub(/[][]/,"")} $2==".data"{print $6}')
+				[ $(( 0x${DS:-0} )) -eq 0 ] || { echo "[FAIL] $K/$f has .data: cannot be left out"; exit 1; }
+				echo "[*] $f left out: the base defines" $DEFS
+				continue
+			fi
+		fi
+		OBJS="$OBJS $K/$f"
+	done
 	i=$(info "$K" init); [ -z "$i" ] || INITS="$INITS $i"
 	r=$(info "$K" intr); [ -z "$r" ] || INTRS="$INTRS $r"
-	ENTRIES="$ENTRIES $(info "$K" entries) $i $r"
+	ENTRIES="$ENTRIES $(info "$K" entries) $PROV $i $r"
 	for e in $(info "$K" entries); do
 		$NM "$BASE" | grep -qE " [TDBC] $e\$" && { echo "[FAIL] base already has $e"; exit 1; }
 	done
