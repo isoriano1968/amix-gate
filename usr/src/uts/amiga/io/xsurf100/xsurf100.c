@@ -72,6 +72,12 @@
 #define DP_STOP		0x80
 #define DP_DCR		(NE_DCR_FT1 | NE_DCR_LS | NE_DCR_WTS)	/* 0x49 */
 #define DP_RCR		(0x40 | NE_RCR_AB | NE_RCR_AM)
+/* The AX88796B runs without DCR BOS (0x49) and stores the 4-byte receive
+** ring header as status, next page, count low, count high (the order of
+** Linux's e8390_pkt_hdr), not next page first as the Hydra's DP8390 with
+** BOS does: read with the core's next-first order, every frame was
+** dropped as a bad next page (header 01 48 40 00 with CURR 0x48). */
+#define DP_HDR_RSR_FIRST
 
 typedef xsurf100_status_t	dp_status_t;
 typedef xsurf100_test_t		dp_test_t;

@@ -21,6 +21,9 @@
 **   DP_RAM_START      first page of the card's buffer RAM (test ioctls)
 **   DP_DCR            the Data Configuration Register value in operation
 **   DP_RCR            the Receive Configuration Register value (AB|AM|...)
+**   DP_HDR_RSR_FIRST  (optional) the receive ring header starts with the
+**                     status, then the next page: a chip without DCR BOS
+**                     (AX88796B); undefined, next page first (DP8390, BOS)
 ** and the types dp_status_t, dp_test_t, dp_config_t: its user header's
 ** status/test/config structs, which must have the fields of hydrauser.h.
 **

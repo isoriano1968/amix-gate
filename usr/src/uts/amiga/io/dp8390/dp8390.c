@@ -912,8 +912,17 @@ dp_board_t *board;
 	    dp_resync(board);
 	    return;
 	}
+	/* the ring header: next page, receive status, byte count low, high,
+	 * as a DP8390 with DCR BOS stores it (the Hydra); without BOS the
+	 * AX88796B of the X-Surf 100 stores status first (Linux's
+	 * e8390_pkt_hdr order), so its backend defines DP_HDR_RSR_FIRST */
+#ifdef DP_HDR_RSR_FIRST
+	rsr = hdr[0];
+	next = hdr[1];
+#else
 	next = hdr[0];
 	rsr = hdr[1];
+#endif
 	count = ((unsigned int)hdr[3] << 8) | hdr[2];
 	board->status.last_ring_page = this;
 	board->status.last_ring_next = next;

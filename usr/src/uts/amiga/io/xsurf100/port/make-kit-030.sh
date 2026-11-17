@@ -33,7 +33,7 @@ CORE=$(cd "$HERE/../../dp8390" && pwd)
 . "$PORT/tools/kit-lib.sh"
 kit_env
 OUT=${1:-$HERE/kit}
-VERSION=0.1
+VERSION=0.2
 
 B="$HERE/build/xsurf100kit"; rm -rf "$B"; mkdir -p "$B"
 cp "$SRC/xsurf100.c" "$SRC/xsurf100user.h" "$CORE/dp8390.c" "$CORE/dp8390.h" "$CORE/dp8390reg.h" "$B/"
