@@ -19,9 +19,17 @@
 # The reference is the /stand/unix of AMIX SVR4 2.1c as distributed.  Whether every 2.1c
 # installation carries this exact image is NOT established -- so a mismatch asks for a report
 # rather than assuming the user is wrong.
+#
+# One difference IS established: the AMIX installation writes the size of the UNIX_Swap
+# partition into swapfile.nswap (.data swapfile+0x98, 4 bytes).  The public 2.1c
+# kernels/2.1c/unix (61440 blocks) and a 2.1p2a installation (409600) differ there and nowhere
+# else.  So an image whose sha256 with those 4 bytes set to 0 (tools/kernel-nswap.py) is
+# AMIX_STOCK_CODE_SHA256 is the same code and is accepted; its nswap stays as it was.
 
 # AMIX SVR4 2.1c /stand/unix.  Every acceptance run in this project was built from it.
 AMIX_STOCK_SHA256=7d26cb6f04991be5776d9e5361259b20b413d97e3da33bf88e6f312e7be2ec23
+# The same image with swapfile.nswap set to 0: every 2.1c installation's /stand/unix.
+AMIX_STOCK_CODE_SHA256=fa124e6503eb13131fb470057d355c45ee91ca167865956b1f9e9f10b6bad523
 
 verify_stock() {
 	_vs_file="$1"
@@ -35,6 +43,11 @@ verify_stock() {
 
 	_vs_got=$(sha256sum "$_vs_file" | cut -d' ' -f1)
 	[ "$_vs_got" = "$AMIX_STOCK_SHA256" ] && { echo "[*] stock kernel verified: $_vs_file"; return 0; }
+	_vs_code=$(python3 "$(cd "$(dirname "$0")" && pwd)/tools/kernel-nswap.py" "$_vs_file" 2>/dev/null) || _vs_code=
+	if [ "${_vs_code%% *}" = "$AMIX_STOCK_CODE_SHA256" ]; then
+		echo "[*] stock kernel verified: $_vs_file (2.1c code, swapfile.nswap ${_vs_code#* } blocks)"
+		return 0
+	fi
 
 	if [ "${AMIX_ALLOW_UNKNOWN_STOCK:-0}" = "1" ]; then
 		echo "[!] ==================================================================="
