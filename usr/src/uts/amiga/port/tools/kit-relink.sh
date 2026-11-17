@@ -8,13 +8,18 @@
 # The kits in the order given are the chain order: graphics before network.
 #  1. every kit's files against its KIT.sha256 (KIT.info listed too);
 #  2. amixdrv_init.s from src/amixdrv_init.s.in: jsr parinit, then each kit's
-#     KIT.info init= in order; assembled with m68k-cbm-sysv4-as;
-#  3. m68k-cbm-sysv4-ld -r BASE, every kit's *.o in KIT.sha256 order, the stub;
-#  4. every kit's patch_*.py in KIT.sha256 order, except patch_io_init.py;
-#  5. patch_io_init.py OUT amixdrv_init, once;
-#  6. checks: every KIT.info entries= symbol and init, and amixdrv_init, defined
-#     exactly once; nothing unresolved; .text and .data contiguous; .data a
-#     multiple of 4; check_relink_relocs.py (the loader's relocation pass).
+#     KIT.info init= in order; amixdrv_int2.s from src/amixdrv_int2.s.in:
+#     aenintr, then each kit's KIT.info intr= in order (only when a kit has
+#     one); assembled with m68k-cbm-sysv4-as;
+#  3. m68k-cbm-sysv4-ld -r BASE, every kit's *.o in KIT.sha256 order, the stubs;
+#  4. every kit's patch_*.py in KIT.sha256 order, except patch_io_init.py and
+#     patch_int2.py;
+#  5. patch_int2.py OUT amixdrv_int2, once (when a kit has intr=);
+#  6. patch_io_init.py OUT amixdrv_init, once;
+#  7. checks: every KIT.info entries= symbol, init and intr, and amixdrv_init/
+#     amixdrv_int2, defined exactly once; nothing unresolved; .text and .data
+#     contiguous; .data a multiple of 4; check_relink_relocs.py (the loader's
+#     relocation pass).
 # BASE is only read.  Needs m68k-cbm-sysv4-{as,ld} and m68k ELF binutils.
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -39,7 +44,7 @@ fi
 $NM "$BASE" | grep -qE " T amixdrv_init$" && { echo "[FAIL] base already has a driver chain (amixdrv_init)"; exit 1; }
 T=$(mktemp -d "${TMPDIR:-/tmp}/kit-relink.XXXXXX")
 trap 'rm -rf "$T"' EXIT INT TERM
-OBJS=; INITS=; ENTRIES=; IOP=
+OBJS=; INITS=; INTRS=; ENTRIES=; IOP=; I2P=
 for K in "$@"; do
 	[ -f "$K/KIT.sha256" ] && [ -f "$K/KIT.info" ] || { echo "[FAIL] $K: no KIT.sha256/KIT.info"; exit 1; }
 	grep -q " KIT.info$" "$K/KIT.sha256" || { echo "[FAIL] $K: KIT.info not in KIT.sha256"; exit 1; }
@@ -47,14 +52,17 @@ for K in "$@"; do
 	[ "$(info "$K" line)" = "$LINE" ] || { echo "[FAIL] $K: line=$(info "$K" line), not $LINE"; exit 1; }
 	for f in $(awk '$2 ~ /\.o$/ {print $2}' "$K/KIT.sha256"); do OBJS="$OBJS $K/$f"; done
 	i=$(info "$K" init); [ -z "$i" ] || INITS="$INITS $i"
-	ENTRIES="$ENTRIES $(info "$K" entries) $i"
+	r=$(info "$K" intr); [ -z "$r" ] || INTRS="$INTRS $r"
+	ENTRIES="$ENTRIES $(info "$K" entries) $i $r"
 	for e in $(info "$K" entries); do
 		$NM "$BASE" | grep -qE " [TDBC] $e\$" && { echo "[FAIL] base already has $e"; exit 1; }
 	done
 	[ -n "$IOP" ] || [ ! -f "$K/patch_io_init.py" ] || IOP=$K/patch_io_init.py
+	[ -n "$I2P" ] || [ ! -f "$K/patch_int2.py" ] || I2P=$K/patch_int2.py
 	echo "[*] kit $(info "$K" id) $(info "$K" version): major $(info "$K" major), $(info "$K" node)"
 done
 [ -n "$IOP" ] || IOP=$KIT_IOINIT
+[ -n "$I2P" ] || I2P=$KIT_INT2
 if [ -n "$INITS" ]; then
 	J=$(for i in $INITS; do printf '\\tjsr\\t%s\\n' "$i"; done)
 	sed "s/^@INITS@\$/$J/" "$KIT_STUB" | sed '/^$/d' > "$T/amixdrv_init.s"
@@ -62,12 +70,24 @@ if [ -n "$INITS" ]; then
 	OBJS="$OBJS $T/amixdrv_init.o"
 	echo "[*] amixdrv_init: parinit,$(echo $INITS | sed 's/ /, /g; s/^/ /')"
 fi
+if [ -n "$INTRS" ]; then
+	$NM "$BASE" | grep -qE " T amixdrv_int2$" && { echo "[FAIL] base already has a level-2 chain (amixdrv_int2)"; exit 1; }
+	J=$(for r in $INTRS; do printf '\\tmovel\\t%%sp@(4),%%sp@-\\n\\tjsr\\t%s\\n\\taddql\\t\\&4,%%sp\\n' "$r"; done)
+	sed "s/^@INTRS@\$/$J/" "$KIT_INT2STUB" | sed '/^$/d' > "$T/amixdrv_int2.s"
+	m68k-cbm-sysv4-as -o "$T/amixdrv_int2.o" "$T/amixdrv_int2.s"
+	OBJS="$OBJS $T/amixdrv_int2.o"
+	echo "[*] amixdrv_int2: aenintr,$(echo $INTRS | sed 's/ /, /g; s/^/ /')"
+fi
 m68k-cbm-sysv4-ld -r -o "$OUT" "$BASE" $OBJS
 for K in "$@"; do
-	for p in $(awk '$2 ~ /^patch_.*\.py$/ && $2 != "patch_io_init.py" {print $2}' "$K/KIT.sha256"); do
+	for p in $(awk '$2 ~ /^patch_.*\.py$/ && $2 != "patch_io_init.py" && $2 != "patch_int2.py" {print $2}' "$K/KIT.sha256"); do
 		echo "[*] $p"; python3 "$K/$p" "$OUT"
 	done
 done
+if [ -n "$INTRS" ]; then
+	echo "[*] patch_int2.py amixdrv_int2"; python3 "$I2P" "$OUT" amixdrv_int2
+	ENTRIES="$ENTRIES amixdrv_int2"
+fi
 if [ -n "$INITS" ]; then
 	echo "[*] patch_io_init.py amixdrv_init"; python3 "$IOP" "$OUT" amixdrv_init
 	ENTRIES="$ENTRIES amixdrv_init"

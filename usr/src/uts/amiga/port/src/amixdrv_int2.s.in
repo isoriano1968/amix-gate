@@ -1,0 +1,34 @@
+| amixdrv_int2.s -- the level-2 interrupt chain of the drivers linked into
+| this kernel.
+|
+| Generated from amixdrv_int2.s.in (amix-gate uts/amiga/port/src) by the AMIX
+| Installer, or by a relink script, for the drivers chosen: the line @INTRS@
+| becomes, per driver that has a level-2 interrupt routine (KIT.info intr=),
+| in the kits' order,
+|	movel	%sp@(4),%sp@-
+|	jsr	<intr>
+|	addql	&4,%sp
+| Assemble with m68k-cbm-sysv4-as, link it after the driver objects, then run
+| `patch_int2.py KERNEL amixdrv_int2`.
+|
+| The level-2 dispatcher (amiga/ml/ttrap.s p2int) jsr's every entry of
+| int2_tbl[] = { aciaaintr, jbintr, a2091intr, a3091intr, aenintr, 0 }; the
+| table has no spare slot, so patch_int2.py retargets the one relocation of
+| its aenintr entry to amixdrv_int2.  aenintr (the A2065, by symbol: whatever
+| aenintr is in this kernel) runs first, exactly as before, then each chosen
+| driver's routine.  p2int's argument (sp@(4), a struct pcb *) is passed on
+| to each, p2int ignores the return value; %a2 (p2int's table pointer) and
+| every other register the C convention keeps are kept by the C callees.
+| Every routine must return quickly when its board is absent or quiet: the
+| level-2 line is shared by CIA-A, the SCSI controllers and every Zorro card.
+| .text stays a multiple of 4 bytes, so the kernel's .data follows it directly.
+
+	.text
+	.globl	amixdrv_int2
+amixdrv_int2:
+	movel	%sp@(4),%sp@-
+	jsr	aenintr
+	addql	&4,%sp
+@INTRS@
+	rts
+	.align	4

@@ -10,15 +10,25 @@
 #   check_relink_relocs.py  the loader's relocation check of the result
 #   amixdrv_init.s.in       the driver chain stub: @INITS@ -> one `jsr <init>`
 #                           per chosen driver, graphics before network
-#   KIT.sha256              the three, in this order
+#   patch_int2.py           int2_tbl's aenintr entry -> amixdrv_int2, run once
+#                           after every kit's own patch_*.py, before
+#                           patch_io_init.py, when a chosen kit has intr=
+#   amixdrv_int2.s.in       the level-2 interrupt chain stub: aenintr, then
+#                           @INTRS@ -> per chosen driver with KIT.info intr=,
+#                           in the kits' order:
+#                             movel %sp@(4),%sp@- / jsr <intr> / addql &4,%sp
+#   KIT.sha256              the five, in this order
 #
 # The same patch_io_init.py and check_relink_relocs.py are in every driver
-# kit (same bytes, same hashes); nothing here is compiled.
+# kit, patch_int2.py in every kit with intr= (same bytes, same hashes);
+# nothing here is compiled.
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=${1:-$HERE/kit-tools}
 rm -rf "$OUT"; mkdir -p "$OUT"
-cp "$HERE/src/patch_io_init.py" "$HERE/src/check_relink_relocs.py" "$HERE/src/amixdrv_init.s.in" "$OUT/"
-(cd "$OUT" && sha256sum patch_io_init.py check_relink_relocs.py amixdrv_init.s.in > KIT.sha256)
+cp "$HERE/src/patch_io_init.py" "$HERE/src/check_relink_relocs.py" "$HERE/src/amixdrv_init.s.in" \
+	"$HERE/src/patch_int2.py" "$HERE/src/amixdrv_int2.s.in" "$OUT/"
+(cd "$OUT" && sha256sum patch_io_init.py check_relink_relocs.py amixdrv_init.s.in \
+	patch_int2.py amixdrv_int2.s.in > KIT.sha256)
 echo "[OK] kit tools in $OUT"
 cat "$OUT/KIT.sha256"

@@ -111,7 +111,12 @@ The kit (version 0.2) holds `rtgfb_030.o`, `rtgfb_pad.o`,
 installer writes one chain stub for all the drivers chosen, from
 `port/src/amixdrv_init.s.in` in amix-gate's port tree, and runs
 `patch_io_init.py KERNEL amixdrv_init` once, after every kit's own
-`patch_*.py`. `port/tools/kit-relink.sh BASE OUT KIT...` does the same steps
+`patch_*.py`. A network kit whose driver takes the level-2 interrupt also
+has `intr=<symbol>` in `KIT.info` and ships `patch_int2.py`: the installer
+writes one level-2 chain stub, `amixdrv_int2` (`aenintr`, then each kit's
+`intr=` routine, from `port/src/amixdrv_int2.s.in`), and runs
+`patch_int2.py KERNEL amixdrv_int2` once, before `patch_io_init.py`.
+`port/tools/kit-relink.sh BASE OUT KIT...` does the same steps
 from the shell, for tests. The same holds for the zz9000, hydra and va2000
 kits (`io/<driver>/port/make-kit-030.sh`).
 
@@ -138,6 +143,7 @@ The numbers already in use are:
 | 50 | sad |
 | 51 | zen0 |
 | 53 | paula |
+| 56 | X-Surf 100 (xsf0) |
 | 67 | Xsvga |
 | 68 | asokero's VA2000 |
 

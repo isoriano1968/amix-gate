@@ -20,6 +20,9 @@
 KIT_RELOCS="$PORT/src/check_relink_relocs.py"
 KIT_IOINIT="$PORT/src/patch_io_init.py"
 KIT_STUB="$PORT/src/amixdrv_init.s.in"
+# the level-2 interrupt chain: kits with KIT.info intr= ship KIT_INT2
+KIT_INT2="$PORT/src/patch_int2.py"
+KIT_INT2STUB="$PORT/src/amixdrv_int2.s.in"
 
 kit_env() {
 	if [ -f "$PORT/tools/config-load.sh" ] && [ -f "$PORT/config.sh" ]; then
@@ -62,14 +65,17 @@ kit_check_030() {
 }
 
 # kit_pad OBJ... PAD: PAD gets the .data bytes that bring the objects' .data
-# to a multiple of 4, with section alignment 1 (it must add exactly that)
+# to a multiple of 4 (each object's .data placed at its section alignment, as
+# ld does), with section alignment 1 (it must add exactly that)
 kit_pad() {
 	_sum=0; _pad=
 	for _o in "$@"; do _pad=$_o; done
 	for _o in "$@"; do
 		[ "$_o" = "$_pad" ] && break
-		_s=$($READELF -SW "$_o" | awk '{gsub(/[][]/,"")} $2==".data"{print $6}')
-		_sum=$(( _sum + 0x${_s:-0} ))
+		# each object's .data starts at its own alignment, even when empty
+		_l=$($READELF -SW "$_o" | awk '{gsub(/[][]/,"")} $2==".data"{print $6 ":" $NF}')
+		_s=${_l%%:*}; _al=${_l##*:}
+		_sum=$(( (_sum + ${_al:-1} - 1) / ${_al:-1} * ${_al:-1} + 0x${_s:-0} ))
 	done
 	printf '\t.data\n\t.space %d\n' $(( (4 - _sum % 4) % 4 )) > "$_pad.s"
 	m68k-cbm-sysv4-as -o "$_pad" "$_pad.s"
@@ -91,4 +97,50 @@ kit_sums() {
 	(cd "$_dir" && sha256sum "$@" > KIT.sha256)
 	_n=$(ls "$_dir" | grep -vc '^KIT.sha256$')
 	[ "$_n" -eq $# ] || { echo "[FAIL] $_dir has files KIT.sha256 does not list"; exit 1; }
+}
+
+# kit_modelb_sysroot DIR: the Model-B header set for line=040 objects in DIR
+# (the cross compiler's sysroot mirrored, sys/immu.h and sys/param.h from
+# port/include-modelb, as src/mk_modelb_sysroot.sh does), proven by the
+# geometry probe compiling through it and not through the stock sysroot.
+# Sets KIT_SYSROOT and KIT_CF040: -I$KIT_SYSROOT/usr/include FIRST, then
+# AMIX_KERNEL_CFLAGS with -m68040.  First, because AMIX_KERNEL_CFLAGS carries
+# -I$AMIX_ROOT/usr/include and -I$AMIX_ROOT/usr/sys, which hold the stock
+# sys/immu.h and sys/param.h: a compiler wrapper that adds AMIX_SYSROOT's
+# headers with -idirafter (amix-userland developer/gcc-27) searches those
+# -I dirs before the Model-B set, and the probe then fails.  Every line=040
+# compile (the probe and the driver objects) uses KIT_CF040 with
+# AMIX_SYSROOT=$KIT_SYSROOT.
+kit_modelb_sysroot() {
+	_gcc=$(command -v m68k-cbm-sysv4-gcc)
+	_real=$(cd "$(dirname "$_gcc")/.." && pwd)/m68k-cbm-sysv4/sysroot
+	[ -d "$_real/usr/include/sys" ] || { echo "no cross sysroot at $_real" >&2; exit 1; }
+	KIT_SYSROOT="$1/sysroot-modelb"; mkdir -p "$KIT_SYSROOT/usr/include/sys"
+	for _e in "$_real"/usr/*; do [ "$(basename "$_e")" = include ] || ln -s "$_e" "$KIT_SYSROOT/usr/"; done
+	for _e in "$_real"/usr/include/*; do [ "$(basename "$_e")" = sys ] || ln -s "$_e" "$KIT_SYSROOT/usr/include/"; done
+	for _e in "$_real"/usr/include/sys/*; do ln -s "$_e" "$KIT_SYSROOT/usr/include/sys/"; done
+	for _h in immu param; do
+		rm -f "$KIT_SYSROOT/usr/include/sys/$_h.h"
+		ln -s "$_real/usr/include/sys/$_h.h" "$KIT_SYSROOT/usr/include/sys/${_h}_stock.h"
+		cp "$PORT/include-modelb/sys/$_h.h" "$KIT_SYSROOT/usr/include/sys/"
+	done
+	_cf=$(echo "$AMIX_KERNEL_CFLAGS" | sed 's/-m68020/-m68040/')
+	KIT_CF040="-I$KIT_SYSROOT/usr/include $_cf"
+	AMIX_SYSROOT="$KIT_SYSROOT" m68k-cbm-sysv4-gcc $KIT_CF040 -c "$PORT/src/modelb_geom_probe.c" \
+		-o "$1/probe.o" || { echo "[FAIL] the Model-B geometry probe does not compile through $KIT_SYSROOT"; exit 1; }
+	# the negative check: the same flags without the Model-B set must fail
+	if AMIX_SYSROOT="$_real" m68k-cbm-sysv4-gcc $_cf -c "$PORT/src/modelb_geom_probe.c" \
+		-o /dev/null 2>/dev/null; then
+		echo "[FAIL] the geometry probe compiles against the stock sysroot too: it proves nothing"; exit 1; fi
+	rm -f "$1/probe.o"
+	echo "[OK] Model-B headers (port/include-modelb) in the compile"
+}
+
+# kit_check_040 OBJ: no 2 KB page shift (port/src/check_page_geometry.sh) and
+# no 64-bit mul/div form (the 68060 traps them: vector 61)
+kit_check_040() {
+	OBJDUMP=$OBJDUMP sh "$PORT/src/check_page_geometry.sh" "$1"
+	if $OBJDUMP -d "$1" | grep -E "(mul|div)[su]l[.a-z]*\s+[^,]*,%d[0-7]:%d[0-7]"; then
+		echo "[FAIL] $(basename "$1") has 64-bit mul/div forms (060 vector 61)"; exit 1; fi
+	echo "[OK] $(basename "$1"): no 2 KB page shift, no 64-bit mul/div"
 }
