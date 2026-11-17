@@ -1,0 +1,104 @@
+040/060 line: noncacheable board mapping above VSECT1 (dev_kvmap)
+
+With autoconfig_rtg YES the Z3660 board sits at 0x50000000 on an A3000,
+above VSECT1, where the sptalloc arm maps it writethrough-cacheable,
+which the driver itself calls unsupported with a live data cache. Under
+-DZ3660_KVMAP (relink-040-z3660.sh) the register and frame windows are
+mapped with the port's dev_kvmap (NCS for the registers, NC for the
+frames; nothing there is cached, so the line ops stay disarmed on that
+arm), unmapped with dev_kvunmap, and the cache maintenance is armed from
+cputype (40/60) unless set by hand. Built and linked; not yet exercised
+on hardware (the A3000 tests so far had no network configured).
+
+---
+diff --git a/src/z3660eth.c b/src/z3660eth.c
+index e1cdcf4..d6e670e 100644
+--- a/src/z3660eth.c
++++ b/src/z3660eth.c
+@@ -83,6 +83,24 @@
+ extern int	autocon();
+ extern caddr_t	sptalloc();
+ extern void	sptfree();
++#ifdef Z3660_KVMAP
++/*
++ * 040/060 line (relink-040-z3660.sh defines Z3660_KVMAP and links the port's
++ * src/devkvmap040.s): a board at or above VSECT1 -- autoconfig_rtg YES puts it
++ * at 0x50000000 on an A3000 -- is mapped with explicit noncacheable classes
++ * (dev_kvmap, as the VA2000 driver does) instead of sptalloc's writethrough-
++ * cacheable leaves.  Nothing in those windows is ever cached, so the line ops
++ * stay disarmed there and are not needed.  cputype: the port's CPU class.
++ */
++extern caddr_t	dev_kvmap();
++extern void	dev_kvunmap();
++/* the port's cputype is a long (src/cputype060.s); sys/systm.h still declares
++ * the SVR4 short, so it is reached under its own name */
++extern long	z3660_cputype __asm__("cputype");
++#define ZZ_CM_NCS	0x40		/* registers: noncacheable, serialized */
++#define ZZ_CM_NC	0x60		/* frame window: noncacheable */
++#define ZZ_KVMAPPED	2		/* spt_mapped: the dev_kvmap arm */
++#endif
+ extern int	timeout();
+ extern void	bcopy(), bzero();
+ 
+@@ -318,6 +336,12 @@ int board_index;
+     z3660eth_dtt0 = z3660eth_rd_dtt0();
+     z3660eth_dtt1 = z3660eth_rd_dtt1();
+     z3660eth_cacr = z3660eth_rd_cacr();
++#ifdef Z3660_KVMAP
++    if (z3660eth_direct_map == 0 && info->spt_mapped == ZZ_KVMAPPED) {
++	z3660eth_ci_ok = 1;		/* noncacheable leaves, PFNs asserted */
++	return 0;			/* nothing cached: no line ops needed */
++    }
++#endif
+ 
+     bad  = z3660eth_ci_span(base, base + ZZ_REGS_BYTES);
+     bad |= z3660eth_ci_span(base + ZZ_RXBACKLOG_OFF, base + ZZ_WINDOW_TOP);
+@@ -530,6 +554,12 @@ int board_index;
+ 
+     if (info->regs)
+ 	return 0;
++#ifdef Z3660_KVMAP
++    /* arm the line ops for the loader's CPU class unless set by hand
++     * (the direct-map arm needs them on real silicon) */
++    if (z3660eth_cache == 0 && (z3660_cputype == 40 || z3660_cputype == 60))
++	z3660eth_cache = z3660_cputype;
++#endif
+     if (info->map_verdict) {		/* AB-04: probed before and failed */
+ 	if (!z3660eth_reprobe)
+ 	    return info->map_verdict;
+@@ -563,11 +593,19 @@ int board_index;
+ 			phystokv((paddr_t)base + ZZ_RXBACKLOG_OFF);
+     } else {
+ 	z3660eth_direct_map = 0;
++#ifdef Z3660_KVMAP
++	info->spt_mapped = ZZ_KVMAPPED;	/* from here every failure must unmap */
++	info->regs = (volatile unsigned char *)dev_kvmap(bp,
++			(unsigned long)ZZ_REGS_BYTES, ZZ_CM_NCS, 0);
++	info->frame = (volatile unsigned char *)dev_kvmap(bp + ZZ_RXBACKLOG_OFF,
++			(unsigned long)ZZ_FRAME_BYTES, ZZ_CM_NC, 0);
++#else
+ 	info->spt_mapped = 1;		/* from here every failure must unmap */
+ 	info->regs = (volatile unsigned char *)sptalloc(ZZ_REGS_PAGES, PG_V,
+ 			phystopfn((paddr_t)base), 0);
+ 	info->frame = (volatile unsigned char *)sptalloc(ZZ_FRAME_PAGES, PG_V,
+ 			phystopfn((paddr_t)base + ZZ_RXBACKLOG_OFF), 0);
++#endif
+     }
+     if (info->regs == 0 || info->frame == 0) {
+ 	/*
+@@ -630,6 +668,15 @@ static void
+ z3660eth_unmap(info)
+ z3660eth_info_t *info;
+ {
++#ifdef Z3660_KVMAP
++    if (info->spt_mapped == ZZ_KVMAPPED) {
++	if (info->regs)
++	    dev_kvunmap((caddr_t)info->regs, (unsigned long)ZZ_REGS_BYTES);
++	if (info->frame)
++	    dev_kvunmap((caddr_t)info->frame, (unsigned long)ZZ_FRAME_BYTES);
++	info->spt_mapped = 0;
++    }
++#endif
+     if (info->spt_mapped) {
+ 	if (info->regs) {
+ 	    sptfree((caddr_t)info->regs, ZZ_REGS_PAGES, 0);

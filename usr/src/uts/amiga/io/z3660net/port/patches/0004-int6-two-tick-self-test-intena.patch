@@ -1,0 +1,94 @@
+static INT6: a two-tick self-test, and level 6 turned on in INTENA
+
+AMIX leaves EXTER off in INTENA (0x4829 on the A3000), so p6int never ran
+and the self-test could not pass.  Switching INT6 receive on now enables
+EXTER and gives it back as it was when switching off.  The self-test is
+spread over two poll ticks: the clock is CIA-B's, so the tick can run at
+level 6, where a software EXTER waits until it returns.
+
+On the A3000 (Z3660, firmware with PR 33): INT6 and the level-2 drain run
+one for one (12469 / 12319); ping from a PC on Wi-Fi 8.4-11 ms on average
+with 1.8 ms jitter, against 20.9 ms and 21.8 ms polled (the Wi-Fi alone
+7.2 ms).  Bulk TCP with the default 4 KB window is unchanged (~200-300
+KB/s: window over round trip); larger windows lose frames, cause open.
+
+---
+diff --git a/src/z3660eth.c b/src/z3660eth.c
+index ffc3527..18c47c4 100644
+--- a/src/z3660eth.c
++++ b/src/z3660eth.c
+@@ -2373,29 +2373,56 @@ int board_index;
+ /*
+  * A static kernel: the handlers are wired by the relink, not attached, and
+  * the switch is z3660eth_intr in /dev/kmem, looked at in every poll tick (and
+- * level-2 drain): 6 turns INT6 receive on after the level-6 self-test (a
+- * software EXTER, polled here: level 6 passes the tick's IPL), 0 turns it
+- * off again.  The poll tick drains every tick in both modes.
++ * level-2 drain): 6 turns INT6 receive on after the level-6 self-test, 0 off
++ * again.  The poll tick drains every tick in both modes.
++ *
++ * The self-test takes two ticks: the clock is CIA-B's, so the tick itself can
++ * run at level 6, where a software EXTER waits until it returns (a spin
++ * inside the tick, as the module's open does, never sees it).  One tick
++ * raises EXTER with the test flag set; the next one looks whether p6int's
++ * call reached the driver's handler in between.
+  */
++static int z3660eth_l6_waited;		/* ticks the self-test has waited */
++static int z3660eth_exter_was;		/* EXTER in INTENA before INT6 receive */
++#define AMIGA_INTENA		0xDFF09A	/* Paula INTENA (write), INTENAR at 0xDFF01C */
++#define AMIGA_INTENAR		0xDFF01C
++#define SET_INTENA(bits)	(*(volatile unsigned short *)AMIGA_INTENA = (unsigned short)(bits))
++
+ static void
+ z3660eth_intr_switch(board_index)
+ int board_index;
+ {
+     z3660eth_board_t *board = &z3660eth_board[board_index];
+     z3660eth_info_t *info = &board->z3660eth_info;
+-    int i;
+ 
+     if (info->regs == 0 || board->z3660eth_status.board_state != Z3660ETH_BOARD_RUNNING)
+ 	return;
+     if (z3660eth_intr == 6 && z3660eth_intr_mode != 6) {
+-	z3660eth_l2_test = 0;
+-	z3660eth_l6_test = 1;
+-	RAISE_INTREQ(INTREQ_EXTER);
+-	for (i = 0; i < Z3660ETH_SELFTEST_SPIN && z3660eth_l6_test; i++)
+-	    ;
++	if (!z3660eth_l6_waited) {		/* first tick: raise it */
++	    /*
++	     * AMIX leaves level 6 off (INTENA EXTER clear: INTENAR 0x4829 on
++	     * the A3000), so p6int never ran.  Turn it on, keeping what it was,
++	     * and give it back when INT6 receive goes off.  CIA-B's interrupts
++	     * come through p6int then too, to the stock aciabintr, which the
++	     * wrapper calls first.
++	     */
++	    z3660eth_exter_was = *(volatile unsigned short *)AMIGA_INTENAR & INTREQ_EXTER;
++	    z3660eth_l2_test = 0;
++	    z3660eth_l6_test = 1;
++	    z3660eth_l6_waited = 1;
++	    RAISE_INTREQ(INTREQ_EXTER);
++	    if (!z3660eth_exter_was)
++		SET_INTENA(INTREQ_SETCLR | INTREQ_EXTER);
++	    return;
++	}
++	if (z3660eth_l6_test && ++z3660eth_l6_waited <= 3)
++	    return;				/* not yet: up to three ticks */
++	z3660eth_l6_waited = 0;
+ 	if (z3660eth_l6_test) {
+ 	    z3660eth_l6_test = 0;
+ 	    z3660eth_intr = 0;
++	    if (!z3660eth_exter_was)
++		SET_INTENA(INTREQ_EXTER);	/* back as it was */
+ 	    cmn_err(CE_NOTE, "zen: INT6 self-test failed (p6int not wired?); polled");
+ 	    return;
+ 	}
+@@ -2410,6 +2437,8 @@ int board_index;
+ 	Z3660ETH_CONFIG(info->regs, ZZ_CONFIG_DISABLE);
+ 	z3660eth_int_pending = 0;
+ 	z3660eth_intr_mode = 0;
++	if (!z3660eth_exter_was)
++	    SET_INTENA(INTREQ_EXTER);		/* level 6 off again, as AMIX had it */
+ 	cmn_err(CE_NOTE, "zen: INT6 receive off; polled");
+     }
+ }

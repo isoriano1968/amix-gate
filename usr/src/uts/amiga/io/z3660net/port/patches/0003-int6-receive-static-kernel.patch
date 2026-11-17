@@ -1,0 +1,262 @@
+INT6 receive in a static kernel (-DZ3660ETH_STATIC_INTR); drain again after re-enabling
+
+The module's interrupt path (int6, int2, rx_work, the ring resync) is now
+also built into a static kernel with -DZ3660ETH_STATIC_INTR.  There is no
+intr_attach: the 040/060 port's relink-040-z3660intr.sh points p6int's
+call at z3660eth_p6 and an int2_tbl slot at z3660eth_p2, which call the
+handler that was there first (z3660eth_p6_next, z3660eth_p2_next, set by
+the relink).  The switch is z3660eth_intr in /dev/kmem, looked at in
+every poll tick: 6 runs the level-6 self-test and enables INT6 receive,
+0 turns it off; the poll tick drains in both modes.  Without the define
+the static driver is byte for byte as before (.text and .data compared).
+
+Both forms: after re-enabling the board's interrupt, rx_work drains once
+more.  The firmware raises INT6 at once only for the first frame in an
+empty ring (rxkick) and for frames left after a strobe (reraise), both
+only while the interrupt is on; frames that came during the masked drain
+waited for the nag, about 60 a second.  Measured in pvmk net -i on the
+A3000: 60 -> 170-200 interrupts a second at 1000-2000 frames/s.
+
+---
+diff --git a/src/z3660eth.c b/src/z3660eth.c
+index b1d5509..ffc3527 100644
+--- a/src/z3660eth.c
++++ b/src/z3660eth.c
+@@ -125,12 +125,27 @@ extern void	bcopy(), bzero();
+ 
+ extern char *panicstr;
+ 
++/*
++ * The INT6 receive path: the module's (intr_attach), or a static kernel's
++ * whose relink wires z3660eth_p6 into p6int and z3660eth_p2 into int2_tbl
++ * (-DZ3660ETH_STATIC_INTR, relink-040-z3660intr.sh in the 040/060 port).
++ */
++#if defined(Z3660ETH_MODULE) || defined(Z3660ETH_STATIC_INTR)
++#define Z3660ETH_INTR
++#endif
++
+ void z3660eth_autoconfig();
+ #ifndef Z3660ETH_MODULE
+ void z3660ethinit();
+ void z3660ethintr();
+-#else
++#endif
++#ifdef Z3660ETH_INTR
+ static void z3660eth_rx_work();
++#endif
++#ifdef Z3660ETH_STATIC_INTR
++static void z3660eth_intr_switch();
++#endif
++#ifdef Z3660ETH_MODULE
+ static void z3660eth_intr_start();
+ #endif
+ static void z3660eth_poll();
+@@ -139,7 +154,7 @@ static void z3660eth_tx_drain();
+ static void toss_packet_up_stream();
+ static void z3660eth_rx_want();
+ static int  z3660eth_rx_backlog_full();
+-#ifdef Z3660ETH_MODULE
++#ifdef Z3660ETH_INTR
+ static int  z3660eth_rx_wedged();
+ #endif
+ static int  z3660ethopen(), z3660ethclose(), z3660ethwput(), z3660ethwsrv();
+@@ -208,7 +223,7 @@ unsigned long z3660eth_spt_freed;	/* kernel-VA pages returned by sptfree() */
+  */
+ unsigned long z3660eth_rx_holds, z3660eth_rx_resumed;
+ unsigned long z3660eth_rx_force_slots, z3660eth_rx_force_ticks;
+-#ifdef Z3660ETH_MODULE
++#ifdef Z3660ETH_INTR
+ /*
+  * Ring resyncs (z3660eth_rx_wedged), kmem-readable: how many times the drain
+  * stepped the firmware cursor past a slot it had already consumed, and the
+@@ -217,10 +232,10 @@ unsigned long z3660eth_rx_force_slots, z3660eth_rx_force_ticks;
+ unsigned long z3660eth_rx_resyncs, z3660eth_rx_resync_last;
+ #endif
+ 
+-#ifdef Z3660ETH_MODULE
++#ifdef Z3660ETH_INTR
+ /*
+- * Module form only (kernel/dlm C3-6 section 2): the interrupt path the static
+- * kernels never had.  The parameters come from the manifest through _load:
++ * The interrupt path (the module form, kernel/dlm C3-6 section 2, and a static
++ * kernel built with Z3660ETH_STATIC_INTR).  The parameters come from the manifest through _load:
+  *   z3660eth_intr    0 = polled (the default), 6 = the INT6 chain
+  *   z3660eth_intrl2  with intr=6: 1 = the drain runs in a level-2 handler the
+  *                    level-6 handler raises through PORTS, 0 = in the poll tick
+@@ -1092,7 +1107,7 @@ register queue_t *q;
+ 	}
+ 	if (info->regs)
+ 	    Z3660ETH_CONFIG(info->regs, ZZ_CONFIG_DISABLE);
+-#ifdef Z3660ETH_MODULE
++#ifdef Z3660ETH_INTR
+ 	z3660eth_int_on = 0;		/* after the board's interrupt is off */
+ 	z3660eth_int_pending = 0;
+ #endif
+@@ -1341,7 +1356,7 @@ unsigned short serial;
+     return s == (unsigned short)(serial + ahead);
+ }
+ 
+-#ifdef Z3660ETH_MODULE
++#ifdef Z3660ETH_INTR
+ /*
+  * The cursor's slot carries the serial of the frame the driver consumed last
+  * (`serial'): the ring is empty -- or the firmware and the driver disagree, and
+@@ -1398,7 +1413,7 @@ int board_index;
+     unsigned long off;
+     unsigned short serial;
+     int len, loop = 0, want, ready;
+-#ifdef Z3660ETH_MODULE
++#ifdef Z3660ETH_INTR
+     int resynced = 0;
+ #endif
+ 
+@@ -1428,7 +1443,7 @@ int board_index;
+ 	z3660eth_inval((unsigned long)slot, (unsigned long)ZZ_RX_FRAME_PAD);
+ 	serial = (slot[2] << 8) | slot[3];
+ 	if (serial == info->last_serial) {
+-#ifdef Z3660ETH_MODULE
++#ifdef Z3660ETH_INTR
+ 	    /* intr=6 only, once per drain: step past it, deliver nothing */
+ 	    if (z3660eth_intr_mode == 6 && !resynced &&
+ 		z3660eth_rx_wedged(info, off, serial)) {
+@@ -1524,7 +1539,7 @@ caddr_t arg;
+ 	return;
+ 
+     if (board->z3660eth_status.board_state == Z3660ETH_BOARD_RUNNING) {
+-#ifndef Z3660ETH_MODULE
++#ifndef Z3660ETH_INTR
+ 	z3660eth_drain(board_index);
+ #else
+ 	z3660eth_rx_work(board_index);	/* the drain, and intr=6's re-enable */
+@@ -2125,7 +2140,7 @@ z3660ethinit()
+ }
+ #endif /* the module's z3660eth_load does this */
+ 
+-#ifdef Z3660ETH_MODULE
++#ifdef Z3660ETH_INTR
+ /* ----------------------------------------------------------------------------
+  * The module form (kernel/dlm docs/contracts/C3-6-driver-to-module.md, version 1,
+  * section 2).  Built with -DZ3660ETH_MODULE, once per kernel line (k30, k46);
+@@ -2248,6 +2263,9 @@ int board_index;
+     z3660eth_board_t *board = &z3660eth_board[board_index];
+     z3660eth_info_t *info = &board->z3660eth_info;
+ 
++#ifdef Z3660ETH_STATIC_INTR
++    z3660eth_intr_switch(board_index);
++#endif
+     if (!z3660eth_int_pending) {
+ 	z3660eth_drain(board_index);
+ 	return;
+@@ -2258,6 +2276,15 @@ int board_index;
+ 	board->z3660eth_status.board_state == Z3660ETH_BOARD_RUNNING) {
+ 	z3660eth_int_on = 1;		/* before the enable: see z3660eth_int6 */
+ 	Z3660ETH_CONFIG(info->regs, ZZ_CONFIG_ENABLE);
++	/*
++	 * Again, now that it is on.  The firmware raises INT6 at once only for
++	 * the first frame in an empty ring (rxkick) and for frames left after a
++	 * strobe (reraise), and both only while the interrupt is enabled: what
++	 * came during the drain above waits otherwise for the nag, about 60 a
++	 * second, no better than the poll (measured in pvmk net -i, 2026-11-05:
++	 * 60 -> 170-200 interrupts a second at 1000-2000 frames/s).
++	 */
++	z3660eth_drain(board_index);
+     }
+ }
+ 
+@@ -2275,6 +2302,7 @@ int board_index;
+  * process or the idle loop takes it.
+  * 0, or an errno with nothing left attached.
+  */
++#ifdef Z3660ETH_MODULE
+ static int
+ z3660eth_intr_setup(board)
+ z3660eth_board_t *board;
+@@ -2339,7 +2367,88 @@ int board_index;
+     Z3660ETH_CONFIG(info->regs, ZZ_CONFIG_ENABLE);
+     splx(s);
+ }
++#endif	/* Z3660ETH_MODULE */
+ 
++#ifdef Z3660ETH_STATIC_INTR
++/*
++ * A static kernel: the handlers are wired by the relink, not attached, and
++ * the switch is z3660eth_intr in /dev/kmem, looked at in every poll tick (and
++ * level-2 drain): 6 turns INT6 receive on after the level-6 self-test (a
++ * software EXTER, polled here: level 6 passes the tick's IPL), 0 turns it
++ * off again.  The poll tick drains every tick in both modes.
++ */
++static void
++z3660eth_intr_switch(board_index)
++int board_index;
++{
++    z3660eth_board_t *board = &z3660eth_board[board_index];
++    z3660eth_info_t *info = &board->z3660eth_info;
++    int i;
++
++    if (info->regs == 0 || board->z3660eth_status.board_state != Z3660ETH_BOARD_RUNNING)
++	return;
++    if (z3660eth_intr == 6 && z3660eth_intr_mode != 6) {
++	z3660eth_l2_test = 0;
++	z3660eth_l6_test = 1;
++	RAISE_INTREQ(INTREQ_EXTER);
++	for (i = 0; i < Z3660ETH_SELFTEST_SPIN && z3660eth_l6_test; i++)
++	    ;
++	if (z3660eth_l6_test) {
++	    z3660eth_l6_test = 0;
++	    z3660eth_intr = 0;
++	    cmn_err(CE_NOTE, "zen: INT6 self-test failed (p6int not wired?); polled");
++	    return;
++	}
++	z3660eth_intr_mode = 6;
++	z3660eth_int_pending = 0;
++	z3660eth_int_on = 1;
++	Z3660ETH_CONFIG(info->regs, ZZ_CONFIG_ENABLE);
++	cmn_err(CE_NOTE, "zen: INT6 receive on, drain at %s", z3660eth_intrl2 ?
++	    "level 2" : "the poll tick");
++    } else if (z3660eth_intr != 6 && z3660eth_intr_mode == 6) {
++	z3660eth_int_on = 0;
++	Z3660ETH_CONFIG(info->regs, ZZ_CONFIG_DISABLE);
++	z3660eth_int_pending = 0;
++	z3660eth_intr_mode = 0;
++	cmn_err(CE_NOTE, "zen: INT6 receive off; polled");
++    }
++}
++
++/*
++ * What the relink puts in place of the stock handlers: p6int's call of the
++ * CIA-B handler and an int2_tbl entry come here, and the handler that was
++ * there runs first, as before.  Which one that is, the relink writes into
++ * these pointers (its relocation is retargeted with the site's), so another
++ * relink step that took the int2_tbl slot first (the Hydra driver) is kept.
++ */
++extern int aciabintr(), aenintr();
++int (*z3660eth_p6_next)() = aciabintr;
++int (*z3660eth_p2_next)() = aenintr;
++
++int
++z3660eth_p6(a, b)
++char *a, *b;
++{
++    int r = (*z3660eth_p6_next)(a, b);
++
++    (void)z3660eth_int6((char *)&z3660eth_board[0]);
++    return r;
++}
++
++int
++z3660eth_p2(a, b)
++char *a, *b;
++{
++    int r = (*z3660eth_p2_next)(a, b);
++
++    (void)z3660eth_int2((char *)&z3660eth_board[0]);
++    return r;
++}
++#endif	/* Z3660ETH_STATIC_INTR */
++
++#endif	/* Z3660ETH_INTR */
++
++#ifdef Z3660ETH_MODULE
+ /*
+  * One "name=value" of the manifest's parameter string (names separated by
+  * spaces; 0 when there are none), as a non-negative decimal; `dflt' (the

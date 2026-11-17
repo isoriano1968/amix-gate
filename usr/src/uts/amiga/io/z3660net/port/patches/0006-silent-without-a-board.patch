@@ -1,0 +1,109 @@
+Silent without a board: no console line from a machine without a Z3660
+
+A machine without the board is normal (the AMIX Installer links the driver
+into any 040/060 port kernel the user picks it for), so the probe's "no
+Z3660 ethernet found" note is printed only for a board that is there:
+AutoConfig lists it and its MAC registers do not answer, or the mapping or
+the cache check refused it.  No AutoConfig entry, an ECS/OCS machine, a bus
+error at the fixed window, or an unanswered fixed window (nothing found) say
+nothing; -DZ3660ETH_DEBUG prints every verdict as before.  The verdict and
+the errno (ENXIO) are cached as before.
+
+---
+--- a/src/z3660eth.c
++++ b/src/z3660eth.c
+@@ -165,6 +165,9 @@
+ static int  z3660eth_map(), z3660eth_initialize();
+ static void z3660eth_unmap();
+ static int  z3660eth_absent();
++#define ZZ_ABS_QUIET	0	/* z3660eth_absent: no board, no console line */
++#define ZZ_ABS_MAC	1	/* append the MAC register words */
++#define ZZ_ABS_SAY	2	/* a board is there: one console line */
+ 
+ static struct module_info z3660eth_minfo =
+ {
+@@ -750,7 +753,7 @@
+     z3660eth_info_t *info = &board->z3660eth_info;
+     long base, size;
+     unsigned long hi, lo, bp;
+-    int e;
++    int e, listed = ZZ_ABS_SAY;		/* AutoConfig lists the board */
+ 
+     if (info->regs)
+ 	return 0;
+@@ -769,11 +772,12 @@
+ 
+     if (!autocon(Z3660_PROD, board_index, &base, &size)) {
+ 	if (board_index != 0)
+-	    return z3660eth_absent(board_index, ENXIO, "no board", 0);
++	    return z3660eth_absent(board_index, ENXIO, "no board", ZZ_ABS_QUIET);
+ 	if ((((*(volatile unsigned short *)VPOSR) >> 8) & 0x7F) < 0x22)
+ 	    /* ECS/OCS build box -- no Z3660 here */
+-	    return z3660eth_absent(board_index, ENXIO, "not AGA", 0);
++	    return z3660eth_absent(board_index, ENXIO, "not AGA", ZZ_ABS_QUIET);
+ 	base = Z3660_FIXED;		/* AGA: probe the fixed combo window */
++	listed = ZZ_ABS_QUIET;		/* nothing found yet: no console line */
+ 	/*
+ 	 * No AutoConfig entry vouches for this address: on an A4000 without
+ 	 * a Z3660 it is empty Zorro III space, and a plain read there is a
+@@ -783,7 +787,7 @@
+ 	 */
+ 	if (bprobe((caddr_t)phystokv((paddr_t)base + ZZ_ETH_MAC_HI), -1))
+ 	    return z3660eth_absent(board_index, ENXIO,
+-				   "bus error at the fixed window", 0);
++				   "bus error at the fixed window", ZZ_ABS_QUIET);
+     }
+ 
+     info->board_base = base;
+@@ -842,7 +846,7 @@
+      */
+     if ((e = z3660eth_ci_check(board_index)) != 0)
+ 	return z3660eth_absent(board_index, e, "cache-inhibit check refused",
+-			       0);
++			       ZZ_ABS_SAY);
+ 
+     /* verify the firmware ethernet register file answers (open bus => absent) */
+     Z3660ETH_RDA(info->regs, ZZ_ETH_MAC_HI, hi);	/* ZS-05: the predecessor */
+@@ -850,7 +854,8 @@
+     z3660eth_machi = hi;
+     z3660eth_maclo = lo;
+     if (!z3660eth_machi_ok(hi))		/* open bus / not a Z3660 window */
+-	return z3660eth_absent(board_index, ENXIO, "MAC reads", 1);
++	return z3660eth_absent(board_index, ENXIO, "MAC reads",
++			       listed | ZZ_ABS_MAC);
+ 
+     info->paddress[0] = (unsigned char)(hi >> 8);
+     info->paddress[1] = (unsigned char)hi;
+@@ -908,13 +913,16 @@
+  * A failure verdict: unmap, cache errno e for this board so later opens return
+  * it without mapping or probing, and say so on the console ONCE (per verdict).
+  * The line keeps the "zen: no Z3660 ethernet found" prefix bench logs grep for.
+- * showmac: append the two MAC register words the probe read.
++ * how: ZZ_ABS_SAY for a board that is there (AutoConfig lists it, or the
++ * mapping or cache check refused one), ZZ_ABS_QUIET for a machine without a
++ * Z3660, which is normal and says nothing (every line with -DZ3660ETH_DEBUG);
++ * ZZ_ABS_MAC appends the two MAC register words the probe read.
+  */
+ static int
+-z3660eth_absent(board_index, e, why, showmac)
++z3660eth_absent(board_index, e, why, how)
+ int board_index, e;
+ char *why;
+-int showmac;
++int how;
+ {
+     z3660eth_info_t *info = &z3660eth_board[board_index].z3660eth_info;
+ 
+@@ -922,7 +930,11 @@
+     z3660eth_present = 0;
+     z3660eth_map_fails++;
+     info->map_verdict = e;
+-    if (showmac)
++#ifndef Z3660ETH_DEBUG
++    if (!(how & ZZ_ABS_SAY))
++	return e;
++#endif
++    if (how & ZZ_ABS_MAC)
+ 	cmn_err(CE_NOTE,
+ 	    "zen: no Z3660 ethernet found (%s 0x%x 0x%x); " Z3660ETH_FAILS " %d",
+ 	    why, z3660eth_machi, z3660eth_maclo, e);

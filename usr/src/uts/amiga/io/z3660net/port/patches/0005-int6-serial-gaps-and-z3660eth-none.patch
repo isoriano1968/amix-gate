@@ -1,0 +1,53 @@
+INT6: count serial gaps (rx_skipped), and z3660eth_none for a slot of its own
+
+z3660eth_rx_skipped counts the frames the firmware numbered but the drain
+never saw (ring overwritten or tail-dropped).  On the A3000 it stays 0
+even when larger TCP windows collapse throughput to ~47 KB/s: the board's
+ring loses nothing, the loss is elsewhere.  z3660eth_none is the empty
+predecessor for a kernel whose int2_tbl slot the drain owns alone.
+
+---
+diff --git a/src/z3660eth.c b/src/z3660eth.c
+index 18c47c4..35b3a98 100644
+--- a/src/z3660eth.c
++++ b/src/z3660eth.c
+@@ -230,6 +230,12 @@ unsigned long z3660eth_rx_force_slots, z3660eth_rx_force_ticks;
+  * last one as (slot byte offset in the ring) | (serial gap at slot 0, else 0).
+  */
+ unsigned long z3660eth_rx_resyncs, z3660eth_rx_resync_last;
++/*
++ * Frames the firmware numbered but the drain never saw: gaps in the slot
++ * serials (the ring overwritten, or tail-dropped, before the drain came).
++ * kmem-readable; in pvmk's net the same count matched the frames lost.
++ */
++unsigned long z3660eth_rx_skipped;
+ #endif
+ 
+ #ifdef Z3660ETH_INTR
+@@ -1458,6 +1464,10 @@ int board_index;
+ 	    break;			/* went with a firmware backlog reset) */
+ 	}
+ 
++#ifdef Z3660ETH_INTR
++	if (info->last_serial && (unsigned short)(serial - info->last_serial) != 1)
++	    z3660eth_rx_skipped += (unsigned short)(serial - info->last_serial - 1);
++#endif
+ 	len = (slot[0] << 8) | slot[1];
+ 	board->z3660eth_status.last_serial = serial;
+ 	board->z3660eth_status.last_rx_len = len;
+@@ -2451,6 +2461,15 @@ int board_index;
+  * relink step that took the int2_tbl slot first (the Hydra driver) is kept.
+  */
+ extern int aciabintr(), aenintr();
++
++/* a predecessor that does nothing: the relink's choice for int2_tbl slot 4
++   in a kernel without the boards that slot served (A2065, Hydra) */
++int
++z3660eth_none()
++{
++    return 0;
++}
++
+ int (*z3660eth_p6_next)() = aciabintr;
+ int (*z3660eth_p2_next)() = aenintr;
+ 

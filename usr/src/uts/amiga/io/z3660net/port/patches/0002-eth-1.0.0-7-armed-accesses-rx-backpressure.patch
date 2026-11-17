@@ -1,0 +1,1269 @@
+eth 1.0.0-7: the amigaux z3660eth driver, with the 040/060 board mapping
+
+src/z3660eth.c and .h are amigaux z3660eth 1.0.0-7 (ZS-05 armed accesses,
+resync of a wedged RX ring) with our dev_kvmap mapping (patch 0001) kept; its
+cache hunk placed by hand.  Booted on the A3000 with a Z3660 (68060)
+2026-11-04 in unix.z3-vt2, now the default kernel.
+
+---
+diff --git a/src/z3660eth.c b/src/z3660eth.c
+index d6e670e..b1d5509 100644
+--- a/src/z3660eth.c
++++ b/src/z3660eth.c
+@@ -23,10 +23,18 @@
+  * RX delivery: the firmware raises the receive interrupt as Amiga INT6/EXTER,
+  * for which Amix has NO driver hook (only int2_tbl, walked at level 2).  So this
+  * driver DRAINS the backlog from a clock-level timeout() poll callout by default
+- * (z3660eth_poll -> z3660eth_drain).  z3660ethintr() is provided for a future
++ * (z3660eth_poll -> z3660eth_drain), and from the read service procedure when
++ * a full upstream queue held a frame in the backlog (RX backpressure, at
++ * z3660eth_drain).  z3660ethintr() is provided for a future
+  * interrupt-driven path (int2_tbl via board-mod, or a p6int/int6_tbl change) but
+  * is not wired into kernel.c.  TX is synchronous and needs no interrupt.
+  *
++ * Built with -DZ3660ETH_MODULE the same source is the loadable module (kernel/dlm
++ * C3-6; the section at the end of this file): if_attach instead of the ifstats
++ * link, and an optional INT6 receive path whose level-6 handler only
++ * acknowledges, masks and flags, the drain staying at IPL 4.  z3660ethintr()
++ * and z3660ethinit() are not in the module.
++ *
+  * Cache coherency, 030 line: the eth windows are CACHEABLE (AMIX section 0 is
+  * mapped with cache-inhibit clear -- see the mapping note above z3660eth_map())
+  * and per-page cache-inhibit is impossible whichever way the board is mapped:
+@@ -42,19 +50,21 @@
+  *
+  * Line-granular 040/060 maintenance and the attach-time free-ride assert live
+  * below, gated by z3660eth_cache (0 = off, the shipping default; 40/60 poked
+- * through /dev/kmem).  On the 030 line nothing of it is reachable, which is the
++ * through /dev/kmem), in the static driver only: the module form leaves it out.  On the 030 line nothing of it is reachable, which is the
+  * proven aen/z3660 no-flush behaviour, correct there because the 030 data cache
+  * is effectively off in every validated config.
+  * See docs/BLIZZARD-F3.md and ETHERNET-SCOPING.md sections 5/10.
+  *
+- * Detection mirrors z3660.c exactly: autocon(0x144B0001) first; on a miss, and
+- * only on AGA (VPOSR>=0x22, so the ECS build box never touches it), probe the
+- * fixed combo base 0x10000000 and verify the firmware MAC register answers.  On
++ * Detection mirrors z3660.c: autocon(0x144B0001) first; on a miss, and only on
++ * AGA (VPOSR>=0x22, so the ECS build box never touches it), probe the fixed
++ * combo base 0x10000000 -- one bprobe byte read first, so the empty Zorro III
++ * space of a box without a Z3660 is a caught bus error and ENXIO -- and verify
++ * the firmware MAC register answers.  On
+  * the WinUAE build box (which emulates an a2065, not the Z3660 GEM) detection
+  * misses and open() returns ENXIO -- the compile/link/boot/register gate.
+  *
+  * Refs: hydra-amix aen/aen.c + hydra/hydra.c (STREAMS/DLPI skeleton),
+- *       amix-z3660scsi/src/z3660.c (Z3660 mailbox/sptalloc idiom), ETHERNET-SCOPING.md.
++ *       ../z3660scsi/src/z3660.c (Z3660 mailbox/sptalloc idiom), ETHERNET-SCOPING.md.
+  */
+ #include "sys/types.h"
+ #include "sys/param.h"
+@@ -79,6 +89,11 @@
+ #include "sys/sockio.h"
+ #include "net/if.h"
+ #include "z3660eth.h"
++#ifdef Z3660ETH_MODULE
++#include "sys/conf.h"		/* struct cdevsw, for struct mod_drv_data */
++#include "sys/moddefs.h"	/* the ABI kit's wrapper (kernel/dlm C3-1, C3-6) */
++#include "sys/amixddi.h"	/* the kit's DDI v1: if_attach, intr_attach, ... */
++#endif
+ 
+ extern int	autocon();
+ extern caddr_t	sptalloc();
+@@ -111,13 +126,24 @@ extern void	bcopy(), bzero();
+ extern char *panicstr;
+ 
+ void z3660eth_autoconfig();
++#ifndef Z3660ETH_MODULE
+ void z3660ethinit();
+ void z3660ethintr();
++#else
++static void z3660eth_rx_work();
++static void z3660eth_intr_start();
++#endif
+ static void z3660eth_poll();
+ static void z3660eth_drain();
+ static void z3660eth_tx_drain();
+ static void toss_packet_up_stream();
++static void z3660eth_rx_want();
++static int  z3660eth_rx_backlog_full();
++#ifdef Z3660ETH_MODULE
++static int  z3660eth_rx_wedged();
++#endif
+ static int  z3660ethopen(), z3660ethclose(), z3660ethwput(), z3660ethwsrv();
++static int  z3660ethrsrv();
+ static void z3660ethioctl(), z3660eth_ioc_nak();
+ static int  z3660eth_ioc_arg();
+ static int  z3660ethproto(), z3660ethxmit();
+@@ -132,7 +158,7 @@ static struct module_info z3660eth_minfo =
+ 
+ static struct qinit z3660ethrinit =
+ {
+-    NULL, NULL, z3660ethopen, z3660ethclose, NULL, &z3660eth_minfo, NULL,
++    NULL, z3660ethrsrv, z3660ethopen, z3660ethclose, NULL, &z3660eth_minfo, NULL,
+ };
+ 
+ static struct qinit z3660ethwinit =
+@@ -145,19 +171,21 @@ struct streamtab z3660ethinfo =		/* goes in cdevsw[].d_str */
+     &z3660ethrinit, &z3660ethwinit, NULL, NULL,
+ };
+ 
+-extern struct ifstats *ifstats;
++#ifndef Z3660ETH_MODULE
++extern struct ifstats *ifstats;	/* the module uses if_attach (sys/amixddi.h) */
++#endif
+ 
+ static z3660eth_board_t z3660eth_board[Z3660ETH_MAXBOARDS];
+ static int z3660eth_number_of_boards;
+ static int z3660eth_autoconfigured;
+ 
+ /* diagnostics (read via /dev/mem on real HW, like z3660.c) */
+-unsigned long z3660eth_board_phys, z3660eth_last_rc, z3660eth_last_off, z3660eth_machi, z3660eth_maclo;
++unsigned long z3660eth_board_phys, z3660eth_machi, z3660eth_maclo;
+ unsigned char z3660eth_present;
+ unsigned char z3660eth_direct_map;	/* 1 = section-0 identity, 0 = sptalloc'd */
+ 
+ /*
+- * AB-04 (2026-09-27): a failed probe is remembered per board (info->map_verdict)
++ * Since 2026-09-27 a failed probe is remembered per board (info->map_verdict)
+  * so later opens neither map nor probe again, and it prints ONE console line.
+  * z3660eth_reprobe is the re-probe knob: poke it nonzero through /dev/kmem and
+  * the next open forgets one cached verdict and probes afresh (the knob clears
+@@ -168,9 +196,133 @@ long z3660eth_reprobe;
+ unsigned long z3660eth_map_fails;	/* probes that ended in a failure verdict */
+ unsigned long z3660eth_spt_freed;	/* kernel-VA pages returned by sptfree() */
+ 
+-#define WRLONG(base,off,val) (*(volatile unsigned long *)((base) + (off)) = (unsigned long)(val))
+-#define RDLONG(base,off)     (*(volatile unsigned long *)((base) + (off)))
++/*
++ * RX backpressure counters (z3660eth_drain), kmem-readable; the status struct
++ * is the GET_STATUS ABI and stays as it is.
++ *   rx_holds        drains that stopped with a frame left in the ring
++ *   rx_resumed      drains run by the read service procedure (back-enabled)
++ *   rx_force_slots  frames released past Z3660ETH_RX_HOLD_SLOTS
++ *   rx_force_ticks  frames released past Z3660ETH_RX_HOLD_TICKS
++ * A forced frame still goes to every stream that can take it; each stream that
++ * cannot is counted in couldnt_put, which has no other source now.
++ */
++unsigned long z3660eth_rx_holds, z3660eth_rx_resumed;
++unsigned long z3660eth_rx_force_slots, z3660eth_rx_force_ticks;
++#ifdef Z3660ETH_MODULE
++/*
++ * Ring resyncs (z3660eth_rx_wedged), kmem-readable: how many times the drain
++ * stepped the firmware cursor past a slot it had already consumed, and the
++ * last one as (slot byte offset in the ring) | (serial gap at slot 0, else 0).
++ */
++unsigned long z3660eth_rx_resyncs, z3660eth_rx_resync_last;
++#endif
++
++#ifdef Z3660ETH_MODULE
++/*
++ * Module form only (kernel/dlm C3-6 section 2): the interrupt path the static
++ * kernels never had.  The parameters come from the manifest through _load:
++ *   z3660eth_intr    0 = polled (the default), 6 = the INT6 chain
++ *   z3660eth_intrl2  with intr=6: 1 = the drain runs in a level-2 handler the
++ *                    level-6 handler raises through PORTS, 0 = in the poll tick
++ * z3660eth_intr_mode is what runs: 6 only after intr_attach and the self-test
++ * passed.  int_on and int_pending are the only state the level-6 handler
++ * shares with the lower levels, and only under the board's own mask (the
++ * comment above z3660eth_int6).
++ */
++long z3660eth_intr, z3660eth_intrl2 = 1, z3660eth_intr_mode;
++static int z3660eth_intr_tried;
++static volatile int z3660eth_int_on;		/* the board's ETH interrupt is enabled */
++static volatile int z3660eth_int_pending;	/* level 6 masked it: drain, then re-enable */
++static volatile int z3660eth_l6_test, z3660eth_l2_test;	/* the attach self-test */
++unsigned long z3660eth_int6_n, z3660eth_int2_n;		/* claims, kmem-readable */
++#endif
++
++/*
++ * The tail of a probe-failure console line.  The static driver probes at open
++ * and again later; the module probes once, in _load, and a failure there means
++ * the module is not kept (C3-6 section 1.1: a console line per refusal).
++ */
++#ifdef Z3660ETH_MODULE
++#define Z3660ETH_FAILS	"module not loaded, errno"
++#define Z3660ETH_RETRY	"module not loaded"
++#else
++#define Z3660ETH_FAILS	"opens fail errno"
++#define Z3660ETH_RETRY	"will retry"
++#endif
++
++static unsigned char z3660eth_bcast[ETH_ADDRESS_SIZE] = {
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++};
++
++/* ----------------------------------------------------------------------------
++ * ZS-05 -- the address-capture rule (Z3660 FPGA, real-CPU path; 2026-10-26;
++ * kernel/drivers/z3660scsi 90d03ae is the reference, its NOTES.md 2026-10-26).
++ *
++ * The FPGA captures a register access's address for the ARM (rtg.c
++ * rtg_thread(): zaddr = gpio & 0x1FFFFF) and on back-to-back cycles samples
++ * RISING address bits too early: the access is delivered at (previous address
++ * AND this address), silently, and the ARM services it there, a write with
++ * whatever its DDR mirror holds for that cell.  In this driver: the INT6
++ * acknowledge R $1A8 -> W $104 lands at $100 = REG_ZZ_MODE ("[RTG] Error mode:
++ * 255" on both boxes, the acknowledge lost); the drain's R $1A4 -> W $194
++ * lands at $184 = ACC_OP, silently, and the ETH_RX strobe is lost (one of the
++ * two ways into the wedge 1.0.0-4 resyncs past).  Every pair: NOTES.md.
++ *
++ * RULE: every board register access is issued right after a read of an offset
++ * that has no bit the access's offset lacks, with nothing in between -- then
++ * the AND is the access's own address.  The macros below are the only way this
++ * driver touches a board register; each is ONE asm block run with the IPL
++ * raised to 7 for its two to four instructions, so no interrupt handler's board
++ * access (this driver's own INT6, z3660scsi's piscsi mailbox) or exception
++ * stacking can land between the arming read and the access.
++ *
++ *   Z3660ETH_WRA(regs, arm, off, val)     read arm, write off
++ *   Z3660ETH_WRV(regs, off, val, res)     read off, write off, nop, read off
++ *   Z3660ETH_RDA(regs, off, res)          read off (discarded), read off
++ *
++ * The arms, each side-effect free in the fork, in stock firmware and in the
++ * amiberry model (rtg.c read_rtg_register(): pure reads; amiberry
++ * eth_reg_read()):
++ *   CONFIG $104 (write-only)  armed by RX_ADDR $1A4 (the cursor, a pure read)
++ *   ETH_RX $194 (write-only)  armed by MAC_LO  $19C ($1A4/$1AC lack bit $10)
++ *   ETH_TX $190               armed by itself (the send result); WRV reads
++ *                             the result in the same block, so it is never
++ *                             a read with an arbitrary predecessor either
++ * RDA is for the reads whose predecessor is arbitrary or rises (the MAC probe,
++ * the drain cursor, INT_STATUS): its arming read may itself be misdelivered,
++ * which costs nothing, and the read that counts follows its own address.
++ *
++ * The ETH_TX write is the synchronous ~1 ms trigger; IPL 7 across it delays
++ * no interrupt that would otherwise be taken: none is taken inside a bus
++ * cycle, and the block restores SR right after the result read.
++ * ------------------------------------------------------------------------- */
++#define ZZ_ARM_CONFIG	ZZ_ETH_RX_ADDR	/* $1A4 covers $104 */
++#define ZZ_ARM_ETH_RX	ZZ_ETH_MAC_LO	/* $19C covers $194 */
++#if (ZZ_CONFIG & ~ZZ_ARM_CONFIG) != 0 || (ZZ_ETH_RX & ~ZZ_ARM_ETH_RX) != 0
++#error "z3660eth: an offset has a bit its arming register lacks (ZS-05)"
++#endif
+ 
++#define Z3660ETH_WRA(r_, a_, o_, x_) do { unsigned long z_sr_, z_t_;		\
++	__asm__ __volatile__("mov.w %%sr,%0\n\tor.w &0x700,%%sr\n\tmov.l (%2),%1\n\tmov.l %4,(%3)\n\tmov.w %0,%%sr" \
++	    : "=&d" (z_sr_), "=&d" (z_t_)					\
++	    : "a" ((r_) + (a_)), "a" ((r_) + (o_)), "d" ((unsigned long)(x_))	\
++	    : "memory"); } while (0)
++#define Z3660ETH_WRV(r_, o_, x_, res_) do { unsigned long z_sr_, z_t_;		\
++	__asm__ __volatile__("mov.w %%sr,%0\n\tor.w &0x700,%%sr\n\tmov.l (%2),%1\n\tmov.l %3,(%2)\n\tnop\n\tmov.l (%2),%1\n\tmov.w %0,%%sr" \
++	    : "=&d" (z_sr_), "=&d" (z_t_)					\
++	    : "a" ((r_) + (o_)), "d" ((unsigned long)(x_)) : "memory");	\
++	(res_) = z_t_; } while (0)
++#define Z3660ETH_RDA(r_, o_, res_) do { unsigned long z_sr_, z_t_;		\
++	__asm__ __volatile__("mov.w %%sr,%0\n\tor.w &0x700,%%sr\n\tmov.l (%2),%1\n\tmov.l (%2),%1\n\tmov.w %0,%%sr" \
++	    : "=&d" (z_sr_), "=&d" (z_t_)					\
++	    : "a" ((r_) + (o_)) : "memory");				\
++	(res_) = z_t_; } while (0)
++
++/* the board's interrupt control, and the RX strobe: always armed */
++#define Z3660ETH_CONFIG(r_, x_)	Z3660ETH_WRA((r_), ZZ_ARM_CONFIG, ZZ_CONFIG, (x_))
++#define Z3660ETH_RX_STROBE(r_)	Z3660ETH_WRA((r_), ZZ_ARM_ETH_RX, ZZ_ETH_RX, 1)
++
++#ifndef Z3660ETH_MODULE
+ /* ----------------------------------------------------------------------------
+  * BLIZZARD F3-M0 -- the 040/060 gate, and the free ride asserted instead of
+  * silently depended on.  Full argument in docs/BLIZZARD-F3.md.
+@@ -495,6 +647,33 @@ z3660eth_sync()
+     Z3660ETH_NOP();
+     z3660eth_sync_n++;
+ }
++#else	/* Z3660ETH_MODULE */
++/*
++ * The module form leaves the 040/060 cache block out: no manifest parameter
++ * sets z3660eth_cache and /dev/kmem cannot reach the module's copy, so it could
++ * never arm.  The calls in the shared code stay, as no-ops; a cache= parameter
++ * would bring the block back.
++ */
++#define z3660eth_ci_check(b)	0
++#define z3660eth_push(va, len)	((void)0)
++#define z3660eth_inval(va, len)	((void)0)
++#define z3660eth_sync()		((void)0)
++#endif	/* Z3660ETH_MODULE */
++
++/*
++ * Is hi a MAC_HI word the firmware can return?  It puts MAC bytes 0 and 1 in
++ * the low half and nothing above, and a station address is unicast (byte 0,
++ * bit 0 clear) and not 00:00.  An open bus reads 0xFF or 0x00 in every lane,
++ * a partly floating one a mix of the two; none of them passes.  The address
++ * itself is a firmware setting, so no vendor prefix is checked.
++ * module/test-mac.sh runs this text on the host.
++ */
++static int
++z3660eth_machi_ok(hi)
++unsigned long hi;
++{
++    return (hi & 0xFFFF0000) == 0 && (hi & 0x0100) == 0 && (hi & 0xFFFF) != 0;
++}
+ 
+ /* ----------------------------------------------------------------------------
+  * Discovery + mapping.  Fills board->z3660eth_info {board_base, regs, frame,
+@@ -560,7 +739,7 @@ int board_index;
+     if (z3660eth_cache == 0 && (z3660_cputype == 40 || z3660_cputype == 60))
+ 	z3660eth_cache = z3660_cputype;
+ #endif
+-    if (info->map_verdict) {		/* AB-04: probed before and failed */
++    if (info->map_verdict) {		/* probed before and failed */
+ 	if (!z3660eth_reprobe)
+ 	    return info->map_verdict;
+ 	z3660eth_reprobe = 0;
+@@ -574,6 +753,16 @@ int board_index;
+ 	    /* ECS/OCS build box -- no Z3660 here */
+ 	    return z3660eth_absent(board_index, ENXIO, "not AGA", 0);
+ 	base = Z3660_FIXED;		/* AGA: probe the fixed combo window */
++	/*
++	 * No AutoConfig entry vouches for this address: on an A4000 without
++	 * a Z3660 it is empty Zorro III space, and a plain read there is a
++	 * bus error.  One byte read with the fault caught first; the window
++	 * is below VSECT1, so the physical address is the kernel VA.  A pure
++	 * read: the RDA probe below re-arms its own address.
++	 */
++	if (bprobe((caddr_t)phystokv((paddr_t)base + ZZ_ETH_MAC_HI), -1))
++	    return z3660eth_absent(board_index, ENXIO,
++				   "bus error at the fixed window", 0);
+     }
+ 
+     info->board_base = base;
+@@ -618,7 +807,8 @@ int board_index;
+ 	if (!info->nomem_said) {
+ 	    info->nomem_said = 1;
+ 	    cmn_err(CE_NOTE,
+-		"zen: no Z3660 ethernet found (kernel VA map failed); will retry");
++		"zen: no Z3660 ethernet found (kernel VA map failed); "
++		Z3660ETH_RETRY);
+ 	}
+ 	return ENOMEM;
+     }
+@@ -634,11 +824,11 @@ int board_index;
+ 			       0);
+ 
+     /* verify the firmware ethernet register file answers (open bus => absent) */
+-    hi = RDLONG(info->regs, ZZ_ETH_MAC_HI);
+-    lo = RDLONG(info->regs, ZZ_ETH_MAC_LO);
++    Z3660ETH_RDA(info->regs, ZZ_ETH_MAC_HI, hi);	/* ZS-05: the predecessor */
++    Z3660ETH_RDA(info->regs, ZZ_ETH_MAC_LO, lo);	/* is anyone's; $198->$19C rises */
+     z3660eth_machi = hi;
+     z3660eth_maclo = lo;
+-    if (hi == 0xFFFFFFFF || (hi & 0xFFFF) == 0)	/* open bus / not a Z3660 window */
++    if (!z3660eth_machi_ok(hi))		/* open bus / not a Z3660 window */
+ 	return z3660eth_absent(board_index, ENXIO, "MAC reads", 1);
+ 
+     info->paddress[0] = (unsigned char)(hi >> 8);
+@@ -655,8 +845,8 @@ int board_index;
+ /*
+  * Undo z3660eth_map()'s mapping.  THE RULE: map, probe, free on failure.  The
+  * sptalloc arm draws from sptmap, a fixed kernel-VA resource map that nothing
+- * else returns pages to; before AB-04 every failed probe kept 1 + ZZ_FRAME_PAGES
+- * pages (33 at NBPP 4096, 65 at 2048); on the AB-04 rig S99zen's 16 boot-time
++ * else returns pages to; before 2026-09-27 every failed probe kept 1 + ZZ_FRAME_PAGES
++ * pages (33 at NBPP 4096, 65 at 2048); on the emulator S99zen's 16 boot-time
+  * opens left 18 free sptmap pages (549 without S99zen), so raw I/O and big kmem
+  * pools slept forever on Km_BigWanted.
+  * flag 0 = unmap only: these are board pages, never page[] frames to release.
+@@ -713,11 +903,11 @@ int showmac;
+     info->map_verdict = e;
+     if (showmac)
+ 	cmn_err(CE_NOTE,
+-	    "zen: no Z3660 ethernet found (%s 0x%x 0x%x); opens fail errno %d",
++	    "zen: no Z3660 ethernet found (%s 0x%x 0x%x); " Z3660ETH_FAILS " %d",
+ 	    why, z3660eth_machi, z3660eth_maclo, e);
+     else
+ 	cmn_err(CE_NOTE,
+-	    "zen: no Z3660 ethernet found (%s); opens fail errno %d", why, e);
++	    "zen: no Z3660 ethernet found (%s); " Z3660ETH_FAILS " %d", why, e);
+     return e;
+ }
+ 
+@@ -758,6 +948,7 @@ int board_index;
+     }
+ 
+     info->last_serial = 0;		/* firmware's first serial is 1 */
++    info->rx_held = 0;
+     info->tx_busy = 0;
+ 
+     bzero((caddr_t)&board->z3660eth_status, sizeof(board->z3660eth_status));
+@@ -775,13 +966,16 @@ int board_index;
+      * writing 0 keeps the full datapath AND clears any pending INT6 (rtg.c:1168-9).
+      * Interrupt-driven RX is a future board-mod / int6_tbl option (ETHERNET-SCOPING Q1).
+      */
+-    WRLONG(info->regs, ZZ_CONFIG, ZZ_CONFIG_DISABLE);
++    Z3660ETH_CONFIG(info->regs, ZZ_CONFIG_DISABLE);
+ 
+     if (!info->poll_running) {
+ 	info->poll_running = 1;
+ 	info->poll_id = timeout(z3660eth_poll, (caddr_t)(long)board_index,
+ 				Z3660ETH_POLL_TICKS);
+     }
++#ifdef Z3660ETH_MODULE
++    z3660eth_intr_start(board_index);	/* intr=6: attach once, self-test, enable */
++#endif
+     return 0;
+ }
+ 
+@@ -859,12 +1053,14 @@ cred_t *credp;
+     zp->q = q;
+     splx(s);
+ 
++#ifndef Z3660ETH_MODULE
+     if (!board->ifstats.ifs_name) {
+ 	board->ifstats.ifs_name = "zen";
+ 	board->ifstats.ifs_mtu = Z3660ETH_MTU;
+ 	board->ifstats.ifs_next = ifstats;
+ 	ifstats = &board->ifstats;
+     }
++#endif				/* the module's _load did if_attach() */
+     board->ifstats.ifs_unit = board_index;
+     board->ifstats.ifs_active = 1;
+     board->if_flags = IFF_BROADCAST | IFF_NOTRAILERS | IFF_RUNNING;
+@@ -895,7 +1091,11 @@ register queue_t *q;
+ 	    untimeout(info->poll_id);
+ 	}
+ 	if (info->regs)
+-	    WRLONG(info->regs, ZZ_CONFIG, ZZ_CONFIG_DISABLE);
++	    Z3660ETH_CONFIG(info->regs, ZZ_CONFIG_DISABLE);
++#ifdef Z3660ETH_MODULE
++	z3660eth_int_on = 0;		/* after the board's interrupt is off */
++	z3660eth_int_pending = 0;
++#endif
+ 	board->z3660eth_status.board_state = Z3660ETH_BOARD_RESET;
+ 	board->ifstats.ifs_active = 0;
+     }
+@@ -1022,11 +1222,14 @@ mblk_t *mp;
+     z3660eth_push((unsigned long)info->txwin, (unsigned long)pktsize);
+     z3660eth_sync();
+ 
+-    /* trigger: synchronous, ~1ms -- NOT at raised spl */
+-    WRLONG(info->regs, ZZ_ETH_TX, pktsize);
+-    z3660eth_sync();		/* the result load must not pass the trigger store */
+-    rc = RDLONG(info->regs, ZZ_ETH_TX);
+-    z3660eth_last_rc = rc;
++    /*
++     * trigger: synchronous, ~1ms -- no spl section around it.  ZS-05: armed by
++     * a read of ETH_TX itself, the result read in the same block after a nop
++     * (the barrier z3660eth_sync() gave here: the result load must not pass
++     * the trigger store); IPL 7 for the block's instructions only, which
++     * delays no interrupt (see the ZS-05 comment).
++     */
++    Z3660ETH_WRV(info->regs, ZZ_ETH_TX, pktsize, rc);
+ 
+     info->tx_busy = 0;			/* release: volatile store, after the rc load */
+ 
+@@ -1047,8 +1250,143 @@ mblk_t *mp;
+ /* ----------------------------------------------------------------------------
+  * RX backlog drain.  Re-reads ZZ_ETH_RX_ADDR every iteration (the cursor only
+  * advances on the ZZ_ETH_RX strobe), breaks on the serial sentinel, strobes to
+- * free each slot.  Callable from the poll callout OR a future ISR.
++ * free each slot.  Callable from the poll callout, the read service procedure
++ * (masked to the callout's IPL 4 there) OR a future ISR.
++ *
++ * BACKPRESSURE.  A frame is never freed because an upstream queue is full.  The
++ * verdict (z3660eth_rx_want) comes from the header alone, BEFORE the slot is
++ * released: if a stream that wants the frame cannot take it now, the drain stops
++ * and leaves the frame, and everything behind it, in the firmware backlog.  The
++ * failed canput() marks that upstream queue QWANTW; when it drains, STREAMS
++ * back-enables our read queue and z3660ethrsrv resumes here, usually within the
++ * same tick, and otherwise the next poll tick does.  Freeing the frame instead
++ * (the old shape) lost every frame past the upstream queue's high-water mark in
++ * one drain: on metal 4 in 5 datagrams at 1600/s and the TCP push's retransmits.
++ *
++ * The hold is bounded (z3660eth.h, Z3660ETH_RX_HOLD_*): past either guard the
++ * frame goes to every stream that can take it and is dropped for the rest
++ * (couldnt_put), so a stuck stream cannot wedge the interface and the firmware
++ * backlog never reaches the TX staging frame or its whole-backlog discard
++ * because of a hold.
+  * ------------------------------------------------------------------------- */
++
++/*
++ * Which streams want this frame -- the same demux as toss_packet_up_stream --
++ * and which of them can take it now.  Bit j stands for stream j.  canput() on a
++ * full queue also sets QWANTW there, which is what back-enables z3660ethrsrv.
++ * Reads only the header (`packet' holds Z3660ETH_RX_PEEK bytes at this point).
++ */
++static void
++z3660eth_rx_want(board_index, packet, wantp, readyp)
++int board_index;
++unsigned char *packet;
++int *wantp, *readyp;
++{
++    z3660eth_board_t *board = &z3660eth_board[board_index];
++    z3660eth_t *zp = board->z3660eth;
++    ether_header_t *eh = (ether_header_t *)packet;
++    int j, want = 0, ready = 0;
++
++    for (j = 0; j < Z3660ETH_MAXDEV; j++, zp++) {
++	if (!zp->q)
++	    continue;
++	if (!(zp->flags & Z3660ETH_RAW_DATA)) {
++	    if (zp->sap != eh->ether_type)
++		continue;
++	    if (bcmp((char *)eh->ether_dhost,
++		     (char *)board->z3660eth_info.paddress, ETH_ADDRESS_SIZE) &&
++		bcmp((char *)eh->ether_dhost,
++		     (char *)z3660eth_bcast, ETH_ADDRESS_SIZE))
++		continue;
++	}
++	want |= 1 << j;
++	if (canput(zp->q->q_next))
++	    ready |= 1 << j;
++    }
++    *wantp = want;
++    *readyp = ready;
++}
++
++/*
++ * Has the firmware backlog reached Z3660ETH_RX_HOLD_SLOTS slots?  `off' is the
++ * cursor (the held frame's slot) and `serial' its serial.  The backlog is linear
++ * and restarts at slot 0 only when the driver has caught up, so slot k of this
++ * round carries serial (serial + k - head); a slot left over from an earlier
++ * round carries an older one.  One header read at the limit slot answers it.
++ */
++static int
++z3660eth_rx_backlog_full(info, off, serial)
++z3660eth_info_t *info;
++unsigned long off;
++unsigned short serial;
++{
++    /*
++     * Byte offsets, and the slot distance counted by stepping: a divide or
++     * shift by 11 (the 2048-byte slot stride) trips the 060 port's page-
++     * geometry gate, which cannot tell a slot stride from a page size.
++     */
++    unsigned long o = off - ZZ_RXBACKLOG_OFF;
++    unsigned long lim = (Z3660ETH_RX_HOLD_SLOTS - 1) * ZZ_FRAME_SIZE;
++    unsigned short ahead = 0;
++    volatile unsigned char *p;
++    unsigned short s;
++
++    if (o >= lim)
++	return 1;
++    for (; o < lim; o += ZZ_FRAME_SIZE)
++	ahead++;			/* at most Z3660ETH_RX_HOLD_SLOTS - 1 */
++    p = info->frame + lim;
++    z3660eth_inval((unsigned long)p, (unsigned long)ZZ_RX_FRAME_PAD);
++    s = (p[2] << 8) | p[3];
++    return s == (unsigned short)(serial + ahead);
++}
++
++#ifdef Z3660ETH_MODULE
++/*
++ * The cursor's slot carries the serial of the frame the driver consumed last
++ * (`serial'): the ring is empty -- or the firmware and the driver disagree, and
++ * then the drain would read "empty" for ever while the firmware fills the
++ * other 31 slots and tail-drops (A4000D metal: "backlog 32 fetched 0").
++ * Two ways in, both a frame the firmware still counts as unfetched:
++ *   - the ETH_RX strobe for that frame never reached ethernet_receive_frame;
++ *   - the catch-up in ethernet_receive_frame (10c7501 ethernet.c:734-744)
++ *     resets the backlog and only then writes the released serial into slot 0;
++ *     an RX interrupt in between lands a new frame in slot 0, whose serial is
++ *     then overwritten with the old one.
++ * Empty exists only at slot 0 (the firmware moves the cursor to a slot k > 0
++ * only onto a frame), so at k > 0 this is always the lost strobe.  At slot 0
++ * slot 1 decides: a frame there is serial + 1 (lost strobe) or serial + 2 (the
++ * overwritten frame was serial + 1); a slot left from an earlier round is
++ * older.  Slot 0 is read again after slot 1: the firmware writes slot 0 before
++ * slot 1 in a round, so a frame landing between the reads is seen there.
++ */
++static int
++z3660eth_rx_wedged(info, off, serial)
++z3660eth_info_t *info;
++unsigned long off;
++unsigned short serial;
++{
++    volatile unsigned char *p;
++    unsigned short gap;
++
++    if (off != ZZ_RXBACKLOG_OFF) {
++	z3660eth_rx_resync_last = off - ZZ_RXBACKLOG_OFF;
++	return 1;
++    }
++    p = info->frame + ZZ_FRAME_SIZE;
++    z3660eth_inval((unsigned long)p, (unsigned long)ZZ_RX_FRAME_PAD);
++    gap = (unsigned short)(((p[2] << 8) | p[3]) - serial);
++    if (gap != 1 && gap != 2)
++	return 0;
++    p = info->frame;
++    z3660eth_inval((unsigned long)p, (unsigned long)ZZ_RX_FRAME_PAD);
++    if ((unsigned short)((p[2] << 8) | p[3]) != serial)
++	return 0;
++    z3660eth_rx_resync_last = gap;
++    return 1;
++}
++#endif
++
+ static void
+ z3660eth_drain(board_index)
+ int board_index;
+@@ -1059,15 +1397,17 @@ int board_index;
+     volatile unsigned char *slot;
+     unsigned long off;
+     unsigned short serial;
+-    int len, loop = 0;
++    int len, loop = 0, want, ready;
++#ifdef Z3660ETH_MODULE
++    int resynced = 0;
++#endif
+ 
+     if (info->regs == 0)
+ 	return;
+     board->z3660eth_status.drain_calls++;
+ 
+     while (++loop <= 256) {
+-	off = RDLONG(info->regs, ZZ_ETH_RX_ADDR);
+-	z3660eth_last_off = off;
++	Z3660ETH_RDA(info->regs, ZZ_ETH_RX_ADDR, off);	/* ZS-05: W $194 -> R $1A4 rises */
+ 
+ 	if (off < ZZ_RXBACKLOG_OFF ||
+ 	    off >= ZZ_RXBACKLOG_OFF + ZZ_RX_MAX_SLOTS * ZZ_FRAME_SIZE) {
+@@ -1087,8 +1427,21 @@ int board_index;
+ 	 */
+ 	z3660eth_inval((unsigned long)slot, (unsigned long)ZZ_RX_FRAME_PAD);
+ 	serial = (slot[2] << 8) | slot[3];
+-	if (serial == info->last_serial)
+-	    break;			/* ring drained */
++	if (serial == info->last_serial) {
++#ifdef Z3660ETH_MODULE
++	    /* intr=6 only, once per drain: step past it, deliver nothing */
++	    if (z3660eth_intr_mode == 6 && !resynced &&
++		z3660eth_rx_wedged(info, off, serial)) {
++		resynced = 1;
++		z3660eth_rx_resyncs++;
++		Z3660ETH_RX_STROBE(info->regs);
++		z3660eth_sync();
++		continue;
++	    }
++#endif
++	    info->rx_held = 0;		/* ring drained (a held frame, if any, */
++	    break;			/* went with a firmware backlog reset) */
++	}
+ 
+ 	len = (slot[0] << 8) | slot[1];
+ 	board->z3660eth_status.last_serial = serial;
+@@ -1099,7 +1452,8 @@ int board_index;
+ 	    board->z3660eth_status.rx_errors++;
+ 	    board->ifstats.ifs_ierrors++;
+ 	    info->last_serial = serial;
+-	    WRLONG(info->regs, ZZ_ETH_RX, 1);
++	    info->rx_held = 0;
++	    Z3660ETH_RX_STROBE(info->regs);
+ 	    z3660eth_sync();
+ 	    continue;				/* payload never read: no invalidate */
+ 	}
+@@ -1110,12 +1464,38 @@ int board_index;
+ 	 * and the slot's unused tail -- both device-written, never CPU-written,
+ 	 * so the invalidate can discard nothing.  rxbuff[] and the mblk it feeds
+ 	 * are NOT maintained: single alias, CPU only, never seen by the device.
++	 * The header comes first, for the verdict; the rest only if a stream
++	 * takes the frame (a frame nobody wants is never copied in full).
+ 	 */
+ 	z3660eth_inval((unsigned long)(slot + ZZ_RX_FRAME_PAD), (unsigned long)len);
+-	bcopy((caddr_t)(slot + ZZ_RX_FRAME_PAD), (caddr_t)rxbuff, len);
++	bcopy((caddr_t)(slot + ZZ_RX_FRAME_PAD), (caddr_t)rxbuff,
++	      min(len, Z3660ETH_RX_PEEK));
++	z3660eth_rx_want(board_index, rxbuff, &want, &ready);
++
++	if (want & ~ready) {
++	    /* a stream that wants it is full: hold, unless a guard has tripped */
++	    if (!info->rx_held || info->rx_hold_serial != serial) {
++		info->rx_held = 1;
++		info->rx_hold_serial = serial;
++		info->rx_hold_since = (long)lbolt;
++	    }
++	    if (z3660eth_rx_backlog_full(info, off, serial))
++		z3660eth_rx_force_slots++;
++	    else if ((long)lbolt - info->rx_hold_since >= Z3660ETH_RX_HOLD_TICKS)
++		z3660eth_rx_force_ticks++;
++	    else {
++		z3660eth_rx_holds++;
++		break;				/* leave it in the ring */
++	    }
++	}
++
++	if ((want & ready) && len > Z3660ETH_RX_PEEK)
++	    bcopy((caddr_t)(slot + ZZ_RX_FRAME_PAD + Z3660ETH_RX_PEEK),
++		  (caddr_t)(rxbuff + Z3660ETH_RX_PEEK), len - Z3660ETH_RX_PEEK);
+ 
+ 	info->last_serial = serial;
+-	WRLONG(info->regs, ZZ_ETH_RX, 1);	/* advance/free the slot */
++	info->rx_held = 0;
++	Z3660ETH_RX_STROBE(info->regs);	/* advance/free the slot (ZS-05: armed) */
+ 	z3660eth_sync();		/* next cursor read must not pass the strobe */
+ 
+ 	board->z3660eth_status.packets_received++;
+@@ -1127,7 +1507,7 @@ int board_index;
+ 	 * a one-frame probe shows trailing FCS, subtract ETH_CRC_LEN here.  The
+ 	 * scoping verdict is "do NOT subtract by default" -- delivered as-is.
+ 	 */
+-	toss_packet_up_stream(rxbuff, board_index, len);
++	toss_packet_up_stream(rxbuff, board_index, len, ready);
+     }
+ }
+ 
+@@ -1144,13 +1524,47 @@ caddr_t arg;
+ 	return;
+ 
+     if (board->z3660eth_status.board_state == Z3660ETH_BOARD_RUNNING) {
++#ifndef Z3660ETH_MODULE
+ 	z3660eth_drain(board_index);
++#else
++	z3660eth_rx_work(board_index);	/* the drain, and intr=6's re-enable */
++#endif
+ 	z3660eth_tx_drain(board_index);
+     }
+     if (info->poll_running)
+ 	info->poll_id = timeout(z3660eth_poll, arg, Z3660ETH_POLL_TICKS);
+ }
+ 
++/*
++ * Read service procedure.  Nothing is ever queued on the read side: STREAMS
++ * back-enables this queue when an upstream queue that refused a frame (the
++ * canput in z3660eth_rx_want) has drained below its low-water mark, and this
++ * resumes the drain then, instead of a tick later.  It runs from queuerun,
++ * outside the poll callout, so the drain is masked here to the callout's own
++ * IPL 4: the two drainers never interleave on the ring, rxbuff or last_serial.
++ * Holding IPL 4 across the drain is what the callout does already.
++ */
++static int
++z3660ethrsrv(q)
++queue_t *q;
++{
++    z3660eth_t *zp = (z3660eth_t *)q->q_ptr;
++    z3660eth_board_t *board;
++    int s;
++
++    if (zp == NULL || panicstr)
++	return 0;
++    board = &z3660eth_board[zp->board_index];
++    s = splz3660eth();
++    if (board->z3660eth_status.board_state == Z3660ETH_BOARD_RUNNING &&
++	board->z3660eth_info.rx_held) {
++	z3660eth_rx_resumed++;
++	z3660eth_drain(zp->board_index);
++    }
++    splx(s);
++    return 0;
++}
++
+ /*
+  * Drain frames deferred by xmit (txwin-busy).  Mirrors hydra transmit_interrupt.
+  *
+@@ -1188,10 +1602,12 @@ int board_index;
+  * kernel.c by default -- AMIX has no level-6 driver hook; see Q1).  Polls the
+  * firmware INT_STATUS, acks ETH, and drains.
+  *
+- * WARNING: shares the static rxbuff in z3660eth_drain with the poll callout.  If
+- * this ISR is ever registered (int2_tbl via board-mod, or an int6_tbl change),
+- * DISABLE the poll first -- do not run both drainers concurrently.
++ * WARNING: shares the static rxbuff in z3660eth_drain with the poll callout and
++ * z3660ethrsrv.  If this ISR is ever registered (int2_tbl via board-mod, or an
++ * int6_tbl change), DISABLE the poll first and check that z3660ethrsrv's mask
++ * still covers its level -- do not run two drainers concurrently.
+  */
++#ifndef Z3660ETH_MODULE
+ void
+ z3660ethintr()
+ {
+@@ -1206,13 +1622,17 @@ z3660ethintr()
+ 
+ 	if (board->z3660eth_status.board_state == Z3660ETH_BOARD_RUNNING &&
+ 	    info->regs != 0) {
+-	    if (RDLONG(info->regs, ZZ_INT_STATUS) & ZZ_INT_ETH) {
+-		WRLONG(info->regs, ZZ_CONFIG, ZZ_CONFIG_ACK_ETH);
++	    unsigned long st;
++
++	    Z3660ETH_RDA(info->regs, ZZ_INT_STATUS, st);
++	    if (st & ZZ_INT_ETH) {
++		Z3660ETH_CONFIG(info->regs, ZZ_CONFIG_ACK_ETH);
+ 		z3660eth_drain(i);
+ 	    }
+ 	}
+     }
+ }
++#endif /* !Z3660ETH_MODULE: the module's level-6 handler is z3660eth_int6 */
+ 
+ /* ----------------------------------------------------------------------------
+  * DLPI protocol engine -- the seven primitives, copied from hydra (Style-1
+@@ -1383,6 +1803,12 @@ mblk_t *mp;
+  * (header + payload); z3660eth_drain has already range-checked it to
+  * [ETH_HEADER_SIZE, MAX_BUFFER_LENGTH], so `length` below is in [0, 1504].
+  *
++ * `ready` is z3660eth_rx_want's verdict, taken before the slot was released:
++ * bit j set = stream j can take the frame.  The drain releases a frame with a
++ * clear bit for a stream that wants it only past a hold guard, so couldnt_put
++ * counts exactly those.  The payload in `packet` is present only when some
++ * wanting stream is ready; nothing here reads it otherwise.
++ *
+  * NO TRAILER DECODE -- deliberately.  The stock aen/hydra ancestor decoded the
+  * 4.2BSD trailer encapsulation (ethertype 0x1000..0x1010) here; that arm was
+  * inherited verbatim and has been DELETED because it was doubly unsafe:
+@@ -1400,18 +1826,15 @@ mblk_t *mp;
+  * unchanged.  Do not reintroduce a decode arm.
+  * ------------------------------------------------------------------------- */
+ static void
+-toss_packet_up_stream(packet, board_index, count)
++toss_packet_up_stream(packet, board_index, count, ready)
+ char *packet;
+-int board_index, count;
++int board_index, count, ready;
+ {
+     int j, length;
+     unsigned short sap;
+     z3660eth_board_t *board = &z3660eth_board[board_index];
+     z3660eth_info_t *info = &board->z3660eth_info;
+     z3660eth_t *zp = board->z3660eth;
+-    static unsigned char broadcast_address[6] = {
+-	0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+-    };
+     ether_header_t *packet_header = (ether_header_t *)packet;
+     int sap_matched = 0;
+ 
+@@ -1429,7 +1852,7 @@ int board_index, count;
+ 	    continue;
+ 
+ 	if (zp->flags & Z3660ETH_RAW_DATA) {
+-	    if (canput(zp->q->q_next)) {
++	    if (ready & (1 << j)) {
+ 		if ((mp = allocb(count, BPRI_MED)) != NULL) {
+ 		    mp->b_datap->db_type = M_DATA;
+ 		    bcopy((caddr_t)packet, (caddr_t)mp->b_wptr, count);
+@@ -1445,12 +1868,12 @@ int board_index, count;
+ 	    if (bcmp((char *)packet_header->ether_dhost,
+ 		     (char *)info->paddress, ETH_ADDRESS_SIZE) &&
+ 		bcmp((char *)packet_header->ether_dhost,
+-		     (char *)broadcast_address, sizeof(broadcast_address))) {
++		     (char *)z3660eth_bcast, sizeof(z3660eth_bcast))) {
+ 		board->z3660eth_status.rx_not_for_us++;
+ 		continue;
+ 	    }
+ 
+-	    if (canput(zp->q->q_next)) {
++	    if (ready & (1 << j)) {
+ 		if ((mp = allocb(sizeof(union DL_primitives) +
+ 				 (2 * ETH_ADDRESS_SIZE), BPRI_MED)) != NULL &&
+ 		    (mp->b_cont = allocb(length, BPRI_MED)) != NULL) {
+@@ -1694,8 +2117,373 @@ mblk_t *mp;
+  * GEM-less WinUAE build box boots cleanly and open() simply ENXIOs.  Provided
+  * for completeness / future use.
+  */
++#ifndef Z3660ETH_MODULE
+ void
+ z3660ethinit()
+ {
+     z3660eth_autoconfig();
+ }
++#endif /* the module's z3660eth_load does this */
++
++#ifdef Z3660ETH_MODULE
++/* ----------------------------------------------------------------------------
++ * The module form (kernel/dlm docs/contracts/C3-6-driver-to-module.md, version 1,
++ * section 2).  Built with -DZ3660ETH_MODULE, once per kernel line (k30, k46);
++ * without it this file is the static driver, byte for byte.  The ABI kit's
++ * mkmod adds .moddata (module/Master) and modfix the section type.
++ *
++ *   class=boot, unload=never, majors=c:51: the core registers major 51 from
++ *   z3660eth_drvdata; no code here touches cdevsw.  The interface goes on the
++ *   stock list with if_attach(), never by linking into ifstats.
++ *
++ * INTERRUPTS.  Polled stays the default (intr=0): the poll callout drains, as in
++ * the static driver.  With intr=6 the first open attaches z3660eth_int6 to the
++ * level-6 chain (and z3660eth_int2 to the level-2 chain when intrl2=1), raises
++ * the chain once from software as a self-test, and only then enables the
++ * board's ETH interrupt.  Any failure leaves it polled.
++ *
++ * THE LEVEL-6 RULE (C3-6 section 1.3).  No spl masks level 6 in these kernels
++ * (spl5-spl7 raise to 4), so z3660eth_int6 calls no DDI function: it reads
++ * INT_STATUS, writes ZZ_CONFIG_DISABLE (which both acknowledges the ETH
++ * interrupt and masks it: the firmware clears it and stops re-raising,
++ * rtg.c REG_ZZ_CONFIG), records int_pending, and with intrl2 raises PORTS
++ * (INTREQ = SETCLR|PORTS).  The drain runs at IPL 4: in the level-2 handler
++ * under splz3660eth(), or in the next poll tick (itself at IPL 4).  Either way
++ * z3660eth_rx_work clears int_pending and re-enables the board.  int_pending is
++ * set only with the board's interrupt already off, so the lower half reads and
++ * clears it under the board's mask.  A frame that arrives while the interrupt
++ * is off is not lost: the firmware re-raises while the backlog is non-empty
++ * (rtg.c ethernet_thread), and the poll tick drains every tick in all modes.
++ * With intr=6 the drain also resyncs a ring whose cursor slot carries the
++ * serial it consumed last while the firmware holds a backlog
++ * (z3660eth_rx_wedged, above z3660eth_drain).
++ * ------------------------------------------------------------------------- */
++
++#define Z3660ETH_MAJOR		51	/* = .moddata majors=c:51, the registry's */
++#define AMIGA_INTREQ		0xDFF09C	/* Paula INTREQ, identity-mapped (like VPOSR) */
++#define INTREQ_SETCLR		0x8000
++#define INTREQ_EXTER		0x2000	/* level 6 */
++#define INTREQ_PORTS		0x0008	/* level 2 */
++#define Z3660ETH_SELFTEST_SPIN	200000	/* polls of the level-6 test flag */
++#define Z3660ETH_SELFTEST_TICKS	4	/* one-tick sleeps for the level-2 flag */
++
++#define RAISE_INTREQ(bits) \
++	(*(volatile unsigned short *)AMIGA_INTREQ = (unsigned short)(INTREQ_SETCLR | (bits)))
++
++/*
++ * Level 6, called on every INT6 (CIA-B and the firmware alike) with the board
++ * as its argument.  NO DDI CALL, NO spl, NO STREAMS: board registers and this
++ * driver's own variables only.  Returns nonzero only when this board raised it.
++ */
++static int
++z3660eth_int6(arg)
++char *arg;
++{
++    z3660eth_board_t *board = (z3660eth_board_t *)arg;
++    volatile unsigned char *regs = board->z3660eth_info.regs;
++    unsigned long st;
++
++    if (z3660eth_l6_test) {		/* the self-test's software EXTER */
++	if (z3660eth_intrl2) {
++	    z3660eth_l2_test = 1;	/* set before l6_test clears: no gap */
++	    RAISE_INTREQ(INTREQ_PORTS);
++	}
++	z3660eth_l6_test = 0;
++	return 1;
++    }
++    if (regs == 0)
++	return 0;
++    Z3660ETH_RDA(regs, ZZ_INT_STATUS, st);	/* ZS-05: the predecessor is anyone's */
++    if (st == 0xFFFFFFFF || (st & ZZ_INT_ETH) == 0)
++	return 0;
++    Z3660ETH_CONFIG(regs, ZZ_CONFIG_DISABLE);	/* acknowledge and mask (armed) */
++    if (z3660eth_int_on) {
++	z3660eth_int_on = 0;
++	z3660eth_int_pending = 1;
++	z3660eth_int6_n++;
++	if (z3660eth_intrl2)
++	    RAISE_INTREQ(INTREQ_PORTS);
++    }
++    return 1;
++}
++
++/*
++ * Level 2, called on every PORTS interrupt: returns at once unless the level-6
++ * handler left work.  The drain runs at IPL 4 (splz3660eth), as the poll
++ * callout and z3660ethrsrv run it, so the three never interleave.
++ */
++static int
++z3660eth_int2(arg)
++char *arg;
++{
++    z3660eth_board_t *board = (z3660eth_board_t *)arg;
++    int s;
++
++    if (z3660eth_l2_test) {
++	z3660eth_l2_test = 0;
++	return 1;
++    }
++    if (!z3660eth_int_pending)
++	return 0;
++    s = splz3660eth();
++    if (board->z3660eth_status.board_state == Z3660ETH_BOARD_RUNNING) {
++	z3660eth_int2_n++;
++	z3660eth_rx_work(0);
++    } else
++	z3660eth_int_pending = 0;	/* closed: the next open re-enables */
++    splx(s);
++    return 1;
++}
++
++/*
++ * The RX lower half, at IPL 4 (the poll callout, or z3660eth_int2).  A set
++ * int_pending means the level-6 handler has already turned the board's
++ * interrupt off, so it is cleared here under the board's mask, the backlog is
++ * drained, and then the interrupt goes back on.  A clear one is a plain drain.
++ */
++static void
++z3660eth_rx_work(board_index)
++int board_index;
++{
++    z3660eth_board_t *board = &z3660eth_board[board_index];
++    z3660eth_info_t *info = &board->z3660eth_info;
++
++    if (!z3660eth_int_pending) {
++	z3660eth_drain(board_index);
++	return;
++    }
++    z3660eth_int_pending = 0;
++    z3660eth_drain(board_index);
++    if (z3660eth_intr_mode == 6 && info->regs &&
++	board->z3660eth_status.board_state == Z3660ETH_BOARD_RUNNING) {
++	z3660eth_int_on = 1;		/* before the enable: see z3660eth_int6 */
++	Z3660ETH_CONFIG(info->regs, ZZ_CONFIG_ENABLE);
++    }
++}
++
++/*
++ * intr=6, once per module life: attach the handlers and raise the chain from
++ * software (INTREQ EXTER, as the firmware's INT6 arrives; p6int acknowledges
++ * it and calls the stock CIA-B handler first, as on every firmware INT6).
++ * The test passes when the level-6 handler took its flag and, with intrl2,
++ * the level-2 handler took the one it raised.  Process context, the board's
++ * interrupt off, and IPL 4: the stock qattach() calls a driver's open with
++ * SR = 0x2400.  Level 6 passes IPL 4, so its flag is polled; the PORTS the
++ * level-6 handler raises waits for the IPL to drop, so the open sleeps a
++ * tick at a time (the stock delay(): timeout, then sleep, at IPL 4, which
++ * holds off the level-2 clock, so the wakeup cannot come first) and the next
++ * process or the idle loop takes it.
++ * 0, or an errno with nothing left attached.
++ */
++static int
++z3660eth_intr_setup(board)
++z3660eth_board_t *board;
++{
++    int e, i, s;
++
++    if ((e = intr_attach(6, z3660eth_int6, (char *)board, "z3660eth")) != 0) {
++	cmn_err(CE_NOTE, "zen: level-6 attach failed (errno %d); polled", e);
++	return e;
++    }
++    if (z3660eth_intrl2 &&
++	(e = intr_attach(2, z3660eth_int2, (char *)board, "z3660eth")) != 0) {
++	(void)intr_detach(6, z3660eth_int6, (char *)board);
++	cmn_err(CE_NOTE, "zen: level-2 attach failed (errno %d); polled", e);
++	return e;
++    }
++    z3660eth_l2_test = 0;
++    z3660eth_l6_test = 1;
++    RAISE_INTREQ(INTREQ_EXTER);
++    for (i = 0; i < Z3660ETH_SELFTEST_SPIN; i++)
++	if (!z3660eth_l6_test)
++	    break;
++    for (i = 0; !z3660eth_l6_test && z3660eth_l2_test &&
++	i < Z3660ETH_SELFTEST_TICKS; i++) {
++	s = splz3660eth();
++	(void)timeout(wakeup, (caddr_t)&z3660eth_l2_test, 1);
++	(void)sleep((caddr_t)&z3660eth_l2_test, PZERO - 1);
++	splx(s);
++    }
++    if (z3660eth_l6_test || z3660eth_l2_test) {
++	z3660eth_l6_test = z3660eth_l2_test = 0;
++	if (z3660eth_intrl2)
++	    (void)intr_detach(2, z3660eth_int2, (char *)board);
++	(void)intr_detach(6, z3660eth_int6, (char *)board);
++	cmn_err(CE_NOTE, "zen: interrupt self-test failed; polled");
++	return EIO;
++    }
++    cmn_err(CE_NOTE, "zen: INT6 receive, drain at %s", z3660eth_intrl2 ?
++	"level 2" : "the poll tick");
++    return 0;
++}
++
++/* From z3660eth_initialize (first open, after the poll is armed). */
++static void
++z3660eth_intr_start(board_index)
++int board_index;
++{
++    z3660eth_board_t *board = &z3660eth_board[board_index];
++    z3660eth_info_t *info = &board->z3660eth_info;
++    int s;
++
++    if (z3660eth_intr == 6 && !z3660eth_intr_tried) {
++	z3660eth_intr_tried = 1;
++	if (z3660eth_intr_setup(board) == 0)
++	    z3660eth_intr_mode = 6;
++    }
++    if (z3660eth_intr_mode != 6 || info->regs == 0)
++	return;
++    s = splz3660eth();			/* against z3660eth_int2 and the tick */
++    z3660eth_int_pending = 0;
++    z3660eth_int_on = 1;		/* before the enable: see z3660eth_int6 */
++    Z3660ETH_CONFIG(info->regs, ZZ_CONFIG_ENABLE);
++    splx(s);
++}
++
++/*
++ * One "name=value" of the manifest's parameter string (names separated by
++ * spaces; 0 when there are none), as a non-negative decimal; `dflt' (the
++ * .moddata default) when the name is absent or its value is not a number.
++ */
++static long
++z3660eth_param(params, name, dflt)
++char *params, *name;
++long dflt;
++{
++    char *p = params, *n;
++    long v;
++
++    if (p == 0)
++	return dflt;
++    while (*p) {
++	while (*p == ' ')
++	    p++;
++	for (n = name; *n && *p == *n; n++, p++)
++	    ;
++	if (*n == 0 && *p == '=') {
++	    p++;
++	    if (*p < '0' || *p > '9')
++		return dflt;
++	    for (v = 0; *p >= '0' && *p <= '9'; p++)
++		v = v * 10 + (*p - '0');
++	    return (*p == 0 || *p == ' ') ? v : dflt;
++	}
++	while (*p && *p != ' ')
++	    p++;
++    }
++    return dflt;
++}
++
++/*
++ * _load: once, process context, before the core installs the cdevsw row.  Finds
++ * and maps the board as the first open of the static driver does, turns its
++ * interrupt off and puts zen on the interface list, the last step and its only
++ * registration.  ENXIO without a board.  Every nonzero return prints one "zen:"
++ * line naming the reason (z3660eth_map prints its own) and leaves nothing:
++ * z3660eth_map unmaps its own failures, and nothing is armed or attached yet.
++ */
++int
++z3660eth_load(params)
++char *params;
++{
++    z3660eth_board_t *board = &z3660eth_board[0];
++    z3660eth_info_t *info = &board->z3660eth_info;
++    int e;
++
++    z3660eth_intr = z3660eth_param(params, "intr", 0L);
++    z3660eth_intrl2 = z3660eth_param(params, "intrl2", 1L);
++    if (z3660eth_intr != 0 && z3660eth_intr != 6) {
++	cmn_err(CE_NOTE, "zen: intr=%d is not 0 or 6; polled", (int)z3660eth_intr);
++	z3660eth_intr = 0;
++    }
++    if (z3660eth_intrl2 != 0 && z3660eth_intrl2 != 1)
++	z3660eth_intrl2 = 1;
++
++    z3660eth_autoconfigured = 1;	/* z3660eth_autoconfig() is this, here */
++    if ((e = z3660eth_map(0)) != 0) {
++	z3660eth_autoconfigured = 0;
++	return e;
++    }
++    Z3660ETH_CONFIG(info->regs, ZZ_CONFIG_DISABLE);
++
++    board->ifstats.ifs_name = "zen";
++    board->ifstats.ifs_mtu = Z3660ETH_MTU;
++    board->ifstats.ifs_unit = 0;
++    board->ifstats.ifs_active = 0;
++    if ((e = if_attach(&board->ifstats)) != 0) {
++	cmn_err(CE_NOTE, "zen: if_attach failed (errno %d); module not loaded", e);
++	z3660eth_unmap(info);
++	z3660eth_present = 0;
++	z3660eth_autoconfigured = 0;
++	return e;
++    }
++    z3660eth_number_of_boards = 1;
++    return 0;
++}
++
++/*
++ * unload=never: the core never unloads the module on request (its unload
++ * entry is gated on unload=allowed).  It does call _unload when a linkage
++ * fails to install after _load succeeded (dlm_core.c lf_fail), before any
++ * open can have happened: then everything _load did is undone here, in
++ * reverse order, so the core's registration backstop finds nothing.
++ * Anything an open started (a stream, the poll, the interrupt chain) is EBUSY.
++ */
++int
++z3660eth_unload()
++{
++    z3660eth_board_t *board = &z3660eth_board[0];
++    z3660eth_info_t *info = &board->z3660eth_info;
++    int n;
++
++    if (info->poll_running || z3660eth_intr_mode == 6)
++	return EBUSY;
++    for (n = 0; n < Z3660ETH_MAXDEV; n++)
++	if (board->z3660eth[n].q)
++	    return EBUSY;
++    if (info->regs)
++	Z3660ETH_CONFIG(info->regs, ZZ_CONFIG_DISABLE);
++    if (z3660eth_number_of_boards)
++	(void)if_detach(&board->ifstats);
++    z3660eth_number_of_boards = 0;
++    z3660eth_unmap(info);
++    info->map_verdict = 0;
++    z3660eth_present = 0;
++    z3660eth_autoconfigured = 0;
++    return 0;
++}
++
++/*
++ * _halt (stage 4 on): no sleep, interrupts perhaps off.  The board's interrupt
++ * off at the board, and the poll stopped (untimeout never sleeps).
++ */
++void
++z3660eth_halt()
++{
++    z3660eth_info_t *info = &z3660eth_board[0].z3660eth_info;
++
++    if (info->regs)
++	Z3660ETH_CONFIG(info->regs, ZZ_CONFIG_DISABLE);
++    z3660eth_int_on = 0;
++    if (info->poll_running) {
++	info->poll_running = 0;
++	untimeout(info->poll_id);
++    }
++}
++
++/*
++ * The STREAMS row: d_str only.  The function entries are 0, which the core
++ * reads as nodev (nodev itself is not DDI); d_open/d_close are the core's
++ * trampolines.  drv_cmajor is the .moddata major.
++ */
++struct mod_drv_data z3660eth_drvdata[] = {
++    {
++	{ 0 }, 0, 0,
++	{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, (struct tty *)0, &z3660ethinfo, (int *)0 },
++	Z3660ETH_MAJOR, 1,
++    },
++};
++
++MOD_DRV_WRAPPER(z3660eth, z3660eth_load, z3660eth_unload, z3660eth_halt,
++		"Z3660 ethernet (zen)");
++#endif /* Z3660ETH_MODULE */
+diff --git a/src/z3660eth.h b/src/z3660eth.h
+index 1ed6cf2..43b1d09 100644
+--- a/src/z3660eth.h
++++ b/src/z3660eth.h
+@@ -166,7 +166,7 @@ typedef struct ether_header ether_header_t;
+  * AMIX has none and no-opped them; that was wrong -- the UNDEF seen in the first
+  * kernel link came from not including inline.h, and until gcc-cross-amix 7a1d727
+  * (-Dvolatile=__volatile__) the -traditional cross build would have deleted the
+- * asm anyway (review T-9).  On this kernel spl5/spl6/spl7/spltty/splhi all map
++ * asm anyway (a code review).  On this kernel spl5/spl6/spl7/spltty/splhi all map
+  * to _spl4, i.e. SR = 0x2400 (inline.h:239-251): IPL 4, which blocks the level-2
+  * CIA-A clock and therefore every callout, including the RX poll.
+  *
+@@ -182,10 +182,26 @@ typedef struct ether_header ether_header_t;
+ 
+ #define Z3660ETH_POLL_TICKS	1	/* RX poll period (clock ticks) */
+ 
++/*
++ * RX backpressure (z3660eth_drain).  A received frame is never freed because
++ * an upstream queue is full: it stays in the firmware backlog and the drain
++ * stops there, to resume from the read service procedure (back-enabled when
++ * the upstream queue drains) or the next poll tick.  Two guards bound the hold,
++ * and only past one of them is a frame dropped for a stream that cannot take
++ * it (couldnt_put):
++ *   HOLD_SLOTS  the firmware backlog is linear and resets only when the driver
++ *               catches up; slot 32 is the TX staging frame and slot 64 makes
++ *               the firmware discard the whole backlog.  Once the backlog
++ *               reaches this many slots the drain catches up instead of holding.
++ *   HOLD_TICKS  a stream that takes nothing for this long is stuck, not slow.
++ * RX_PEEK is the part of a frame copied before the verdict (the ethernet header,
++ * rounded up so the payload copy keeps its alignment).
++ */
++#define Z3660ETH_RX_HOLD_SLOTS	24
++#define Z3660ETH_RX_HOLD_TICKS	(HZ / 2)
++#define Z3660ETH_RX_PEEK	16
++
+ #define blklen(bp)		((bp)->b_wptr - (bp)->b_rptr)
+-#ifndef DELAY
+-#define DELAY(x)		{ int _d = (x) * 100; while (_d--) ; }
+-#endif
+ 
+ /* ---- per-stream state (one per opened minor/SAP) ---- */
+ typedef struct
+@@ -206,6 +222,9 @@ typedef struct
+     volatile u_char	*txwin;		/* frame + ZZ_TXWIN_OFF */
+     unsigned char	 paddress[6];	/* station MAC */
+     unsigned short	 last_serial;	/* RX ring drain cursor (firmware serial) */
++    unsigned short	 rx_hold_serial; /* serial of the frame left in the ring */
++    unsigned char	 rx_held;	/* a frame is held at the ring head */
++    long		 rx_hold_since;	/* lbolt when rx_hold_serial was first held */
+     volatile int	 tx_busy;	/* serialises the single txwin */
+     int			 poll_id;	/* timeout() id for the RX poll callout */
+     int			 poll_running;
