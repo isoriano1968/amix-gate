@@ -120,6 +120,17 @@ writes one level-2 chain stub, `amixdrv_int2` (`aenintr`, then each kit's
 from the shell, for tests. The same holds for the zz9000, hydra and va2000
 kits (`io/<driver>/port/make-kit-030.sh`).
 
+For the 68040/68060 port kernels (amix-gate `tools/amix-kernel-040`, generic
+or z3660), `port/make-kit-040.sh` builds `port/kit-040` (`line=040`, same
+version): `rtgfb_040.o` compiled `-m68040` against the Model-B headers with
+`-DRTGFB_KVA` (the driver's own register accesses, monitor switch and chip
+id, through a `dev_kvmap` mapping noncacheable-serialised, made once at
+attach) and `-DRTGFB_FB_NC` (`hat_cm_fb_add`, which every port kernel has),
+plus `devkvmap040.o` declared `provides=dev_kvmap dev_kvunmap`: the relink
+leaves it out when the base kernel has `dev_kvmap` (the z3660 variant) or
+when an earlier kit brought the same object (va2000-040). The 030 kit is
+byte-identical with or without these changes.
+
 ## On the machine
 
 As root, once:

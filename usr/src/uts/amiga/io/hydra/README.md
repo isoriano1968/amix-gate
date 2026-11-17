@@ -183,6 +183,14 @@ has neither slot 47 nor `hydraintr` in its tables:
 
 The kit lands in `port/kit` (gitignored).
 
+`port/make-kit-040.sh` builds the same kit for the 68040/68060 port kernels
+(`port/kit-040`, `KIT.info` `line=040`, same version): `hydra.c` and the
+DP8390 core compiled `-m68040` against the Model-B headers (4 KB pages). The
+Hydra is a Zorro II board, inside the port kernel's identity-mapped low 1 GB
+(noncacheable), so it needs no `dev_kvmap` and takes no kernel VA, as the
+X-Surf 100 in Zorro II on the same kernel. `port/tools/kit-relink.sh` links
+it into the generic and the z3660 port kernels like the other 040 kits.
+
 ## hya Control Utility
 
 The `hya` tool (in `usr/sys/amiga/driver/hydra/hya/`) is a user-space utility for checking Hydra board presence and reading configuration. It is modeled after the `aen` tool for the A2065 card.

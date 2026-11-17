@@ -27,8 +27,13 @@
  *
  * Cache class.  The register board stays an ordinary unmanaged device page,
  * which the 68040/68060 port kernels map noncacheable-serialised: the VGA
- * index/data pairs must reach the chip in order.  The framebuffer is written
- * by the CPU and by the card's BitBLT engine behind the CPU's back, so it
+ * index/data pairs must reach the chip in order.  The driver's own register
+ * accesses (monitor switch, chip id) go, on those kernels, through a kernel
+ * mapping of the register board made once at attach with dev_kvmap()
+ * noncacheable-serialised (-DRTGFB_KVA, the kit-040 build; dev_kvmap comes
+ * from the kit's devkvmap040.o or from a kernel that has it), not through
+ * the identity-mapped low 1 GB, which is noncacheable but not serialised.
+ * The framebuffer is written by the CPU and by the card's BitBLT engine behind the CPU's back, so it
  * must not be cached either; on port kernels that have the cache-class
  * selector (hat_cm_fb_add, built with -DRTGFB_FB_NC) it is registered
  * noncacheable-not-serialised, so that the 68060's store buffer can drain
@@ -53,6 +58,15 @@
 extern int autocon();
 #ifdef RTGFB_FB_NC
 extern int hat_cm_fb_add();
+#endif
+#ifdef RTGFB_KVA
+/* port/src/devkvmap040.s: an MMIO window in kernel VA with an explicit
+ * cache class (0x40 noncacheable-serialised); flags bit 0 = NOSLEEP */
+extern char *dev_kvmap();
+#define RTGFB_CM_NCS    0x40
+#define RTGFB_REGS(bp)  ((bp)->reg_kva)
+#else
+#define RTGFB_REGS(bp)  ((bp)->reg_phys)
 #endif
 
 #define RTGFB_MAXBOARDS 1
@@ -96,6 +110,9 @@ struct rtgfb_board {
 	int             monitor;        /* SVGAMONITORSWITCH_*                 */
 	int             looked;         /* the AutoConfig table was searched   */
 	char           *name;           /* the model found                     */
+#ifdef RTGFB_KVA
+	unsigned long   reg_kva;        /* the register board in kernel VA     */
+#endif
 };
 
 static struct rtgfb_board rtgfb_boards[RTGFB_MAXBOARDS];
@@ -119,7 +136,7 @@ int which;
 
 	if (!bp->bt || !(bp->bt->flags & RTGFB_F_MONSW))
 		return;
-	r = (volatile unsigned char *)bp->reg_phys;
+	r = (volatile unsigned char *)RTGFB_REGS(bp);
 	if (bp->bt->board == RTGFB_BOARD_PICASSO2) {
 		if (which == SVGAMONITORSWITCH_SVGA)
 			r[RTGFB_P2_SW_CARD] = 0xff;
@@ -141,7 +158,7 @@ struct rtgfb_board *bp;
 	volatile unsigned char *r;
 	int crt, id;
 
-	r = (volatile unsigned char *)bp->reg_phys;
+	r = (volatile unsigned char *)RTGFB_REGS(bp);
 	crt = (r[0x3cc] & 1) ? 0x3d4 : 0x3b4;
 	r[crt] = 0x27;
 	id = r[crt + 1] >> 2;
@@ -195,6 +212,17 @@ int unit;
 			    (unsigned int)mb, (unsigned int)ms);
 			continue;
 		}
+#ifdef RTGFB_KVA
+		/* NOSLEEP: rtgfbinit runs from the boot driver chain; kept for
+		 * good (a mapping may outlive any one open) */
+		bp->reg_kva = (unsigned long)dev_kvmap((unsigned long)rb,
+		    (unsigned long)rs, RTGFB_CM_NCS, 1);
+		if (!bp->reg_kva) {
+			printf("rtgfb: %s registers at 0x%x: no kernel mapping\n",
+			    bt->name, (unsigned int)rb);
+			continue;
+		}
+#endif
 		bp->reg_phys = (unsigned long)rb;
 		bp->reg_size = (unsigned long)rs;
 		bp->mem_phys = (unsigned long)mb;

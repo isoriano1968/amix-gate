@@ -16,7 +16,11 @@
 #     provides= AND all defined in BASE already (va2000-040's devkvmap040.o
 #     in a kernel that has dev_kvmap, e.g. the z3660 variant): it is left
 #     out, and must have no .data (the kit's pad counts none for it).  Some
-#     but not all of them in BASE fails;
+#     but not all of them in BASE fails.  Likewise an object whose provides=
+#     definitions an EARLIER kit's object already brought (va2000-040 and
+#     rtgfb-040 both carry devkvmap040.o): left out when it is the same
+#     object byte for byte (sha256), a different one fails, and so does a
+#     partial overlap;
 #  4. every kit's patch_*.py in KIT.sha256 order, except patch_io_init.py and
 #     patch_int2.py;
 #  5. patch_int2.py OUT amixdrv_int2, once (when a kit has intr=); in the
@@ -51,7 +55,7 @@ fi
 $NM "$BASE" | grep -qE " T amixdrv_init$" && { echo "[FAIL] base already has a driver chain (amixdrv_init)"; exit 1; }
 T=$(mktemp -d "${TMPDIR:-/tmp}/kit-relink.XXXXXX")
 trap 'rm -rf "$T"' EXIT INT TERM
-OBJS=; INITS=; INTRS=; ENTRIES=; IOP=; I2P=
+OBJS=; INITS=; INTRS=; ENTRIES=; IOP=; I2P=; GOT=
 for K in "$@"; do
 	[ -f "$K/KIT.sha256" ] && [ -f "$K/KIT.info" ] || { echo "[FAIL] $K: no KIT.sha256/KIT.info"; exit 1; }
 	grep -q " KIT.info$" "$K/KIT.sha256" || { echo "[FAIL] $K: KIT.info not in KIT.sha256"; exit 1; }
@@ -72,6 +76,26 @@ for K in "$@"; do
 				[ $(( 0x${DS:-0} )) -eq 0 ] || { echo "[FAIL] $K/$f has .data: cannot be left out"; exit 1; }
 				echo "[*] $f left out: the base defines" $DEFS
 				continue
+			fi
+			if [ -n "$DEFS" ] && [ $ALL = 1 ]; then
+				SUM=$(sha256sum < "$K/$f" | cut -d' ' -f1)
+				HAVE=0 NEW=0 SAME=1
+				for d in $DEFS; do
+					case " $GOT " in
+					*" $d "*) HAVE=$((HAVE + 1))
+						[ "$(cat "$T/prov.$d")" = "$SUM" ] || SAME=0 ;;
+					*) NEW=$((NEW + 1)) ;;
+					esac
+				done
+				if [ $HAVE -gt 0 ]; then
+					[ $NEW = 0 ] || { echo "[FAIL] $K/$f: an earlier kit brought only some of" $DEFS; exit 1; }
+					[ $SAME = 1 ] || { echo "[FAIL] $K/$f: an earlier kit brought" $DEFS "in a different object"; exit 1; }
+					DS=$($READELF -SW "$K/$f" | awk '{gsub(/[][]/,"")} $2==".data"{print $6}')
+					[ $(( 0x${DS:-0} )) -eq 0 ] || { echo "[FAIL] $K/$f has .data: cannot be left out"; exit 1; }
+					echo "[*] $f left out: an earlier kit brought the same object (" $DEFS ")"
+					continue
+				fi
+				for d in $DEFS; do echo "$SUM" > "$T/prov.$d"; GOT="$GOT $d"; done
 			fi
 		fi
 		OBJS="$OBJS $K/$f"
