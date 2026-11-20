@@ -2,7 +2,7 @@
 """stamp-rootcard.py -- move a 040-line kernel's root and swap device from the A3000 SCSI
 (card 0, c6d0s1/c6d0s2) to another card/unit, e.g. the Z3660 piscsi controller (card 1).
 
-Local stand-in (isoriano, 2026-10-16) for tools/stamp-card1.py, whose kerntools import
+Local stand-in (2026-10-16) for tools/stamp-card1.py, whose kerntools import
 (tools/kernel-rootdev-stamp.py) is not in the public amix-kerntools.  Same two fields, same
 arithmetic, same write discipline:
 

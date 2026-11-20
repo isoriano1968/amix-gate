@@ -34,7 +34,7 @@ Everything else below is amix-z3660rtg's own README, unchanged.
 ## This fork: the Z3660 RTG target (amix-z3660rtg)
 
 This is a fork of [isoriano1968/zz9000-amix](https://github.com/isoriano1968/amix-gate/tree/main/usr/src/uts/amiga/io/zz9000)
-(MIT, Ignacio Soriano; `LICENSE` is upstream's, unchanged; see `NOTICE` for this fork's
+(MIT, isoriano1968; `LICENSE` is upstream's, unchanged; see `NOTICE` for this fork's
 additions). It adds the Z3660 accelerator's onboard RTG as a second target. The registers stay
 ZZ9000-compatible, `/dev/zz9000` stays at major 49 and the ioctl ABI does not change. The Z3660
 identity and windows are behind one switch, `-DZZ9K_TARGET_Z3660` (see `DESIGN.md`). The

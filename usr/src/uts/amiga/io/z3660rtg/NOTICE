@@ -3,7 +3,7 @@ amix-z3660rtg
 
 This repository is a fork of isoriano1968/zz9000-amix
 (https://github.com/isoriano1968/zz9000-amix), MIT licence,
-Copyright (c) 2026 Ignacio Soriano. LICENSE is upstream's, unchanged.
+Copyright (c) 2026 isoriano1968. LICENSE is upstream's, unchanged.
 
 The Z3660 RTG target, the x11/ kit, the bench tools and the documentation
 added in this fork are Copyright (c) 2026 Jussi Alanärä and are released

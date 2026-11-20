@@ -1,7 +1,7 @@
 #!/bin/sh
 # relink-040-zz9000.sh -- add the Z3660 RTG driver (amix-z3660rtg, zz9000.c with
 # -DZZ9K_TARGET_Z3660) to a kernel that already carries the Z3660 SCSI/net drivers.
-# Local script (isoriano, 2026-10-16), the shape given in amix-z3660rtg DESIGN.md 11.2:
+# Local script (2026-10-16), the shape given in amix-z3660rtg DESIGN.md 11.2:
 #   cdevsw[49] -> zz9000*, a second parinit wrapper chained over the z3660 one,
 #   Model-B sysroot, page-geometry check, no 64-bit mul/div in the object (vector 61).
 #   usage: sh relink-040-zz9000.sh build/unix-040-z3660 build/unix-040-z3660-rtg

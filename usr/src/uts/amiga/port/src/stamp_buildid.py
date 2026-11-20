@@ -99,7 +99,7 @@ def next_seq(builddir, today):
     return seq
 
 def next_stamp_minute(builddir, now):
-    """Our block (isoriano, seq 100+): the build id is the build time, MMDD-hhmm.
+    """Our block (seq 100+): the build id is the build time, MMDD-hhmm.
 
     A per-day counter of 16 ran out in a busy day (2026-11-06/07); a time stamp does not.
     Unique per build directory: the last minute used is kept in .build-stamp, and a second
@@ -125,7 +125,7 @@ def main():
     builddir = os.path.dirname(path) or '.'
     lo, hi = seq_block()
     if lo >= 100:
-        # local (isoriano): " 68040-MMDD-hhmm" -- 4+4 digits, never the upstream 6+2 shape
+        # local: " 68040-MMDD-hhmm" -- 4+4 digits, never the upstream 6+2 shape
         t = next_stamp_minute(builddir, datetime.datetime.now())
         field = t.strftime(" 68040-%m%d-%H%M").encode()
     else:
